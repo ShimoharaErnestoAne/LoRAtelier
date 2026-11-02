@@ -13,7 +13,7 @@ The license is the [PolyForm Noncommercial License 1.0.0](https://polyformprojec
 **Additional terms**
 
 1. Above all, do not use this software to infringe the copyright or other rights of others.
-2. You may use this software only for personal hobby purposes. Any other purpose, including research, education, use by organizations or work, is not permitted.
+2. You may use this software only as an individual, for personal hobby purposes. You may not use it for research, education, work or similar purposes, or within companies, schools or other organizations.
 3. Do not publish or distribute anything you make with this software (LoRAs, images, captions and so on). However, you may publish things made only from material you hold the rights to (such as your own drawings or your own photos).
 4. If you distribute this software, pass these terms along with it.
 5. If you do not follow these terms, your permission to use this software ends.
@@ -100,7 +100,7 @@ Sources and licenses: `LICENSES.md`
 **追加の条件**
 
 1. 大前提として、他人の著作権やその他の権利を侵害することに、このソフトを使わないでください。
-2. このソフトは、個人の趣味の目的でだけ使えます。研究・教育・団体での使用や仕事など、それ以外の目的では使えません。
+2. このソフトは、個人が趣味で使う場合にだけ使えます。研究・教育・仕事などの目的で使うことや、会社・学校などの団体で使うことはできません。
 3. このソフトで作ったもの（LoRA・画像・説明文など）を公開・配布しないでください。ただし、自分が権利を持つ素材（自分で描いた絵、自分で撮った写真など）だけを使って作ったものは、公開できます。
 4. このソフトを配布するときは、この条件も一緒に渡してください。
 5. これらの条件を守らなかった場合、このソフトを使う許可はなくなります。
