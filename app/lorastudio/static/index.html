@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRAtelier</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/" data-act="home">LoRAtelier</a>
+  <div class="crumbs" id="crumbs"></div>
+  <div class="spacer"></div>
+  <div class="jobpill" id="jobpill" hidden></div>
+  <div class="aipill" id="aipill" hidden></div>
+  <a class="iconbtn" href="#/" title="LoRA を作るプロジェクトの一覧">LoRA作成</a>
+  <a class="iconbtn" href="#/jobs" title="登録したタスクと GPU の実行順">ジョブ</a>
+  <a class="iconbtn" href="#/i2t" title="画像からプロンプトを作る（i2t）">画像からプロンプト</a>
+  <a class="iconbtn" href="#/gen" title="モデル・LoRA・プロンプトを試す">画像生成</a>
+  <a class="iconbtn" href="#/loras" title="LoRA ごとの呼び出し語と強さ">LoRA 設定</a>
+  <a class="iconbtn" href="#/help" title="使い方">ヘルプ</a>
+  <a class="iconbtn" href="#/settings" title="モデルと環境の設定">設定</a>
+</header>
+<main id="main"></main>
+<div id="dropveil" hidden><div>ここに画像をドロップして追加</div></div>
+<div id="toasts"></div>
+<div id="lightbox" hidden><button class="lb-nav lb-prev" aria-label="前の画像">‹</button><img alt=""><button class="lb-nav lb-next" aria-label="次の画像">›</button><div class="lb-cap"></div></div>
+<script src="/static/app.js"></script>
+<script src="/static/i2t.js"></script>
+</body>
+</html>

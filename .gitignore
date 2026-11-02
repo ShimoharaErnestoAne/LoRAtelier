@@ -1,0 +1,26 @@
+# 公開するものだけを並べる（それ以外はすべて対象外）
+/*
+!/.gitignore
+!/app/
+!/engines/
+!/envs/
+!/LICENSE
+!/LICENSES.md
+!/README.md
+!/readme.txt
+!/setup_env.py
+!/setup.bat
+!/start.bat
+!/start_intranet.bat
+!/engines.lock.json
+
+/engines/*
+!/engines/i2t/
+!/engines/patches/
+!/engines/bundled/
+/envs/*
+!/envs/*.lock.txt
+
+__pycache__/
+.pytest_cache/
+*.pyc

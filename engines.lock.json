@@ -1,0 +1,69 @@
+{
+  "python": "3.11",
+  "engines": {
+    "sd-scripts": {
+      "url": "https://github.com/kohya-ss/sd-scripts.git",
+      "commit": "690ea7f96c23182352ec63def76d431c6120bd2f",
+      "license": "Apache-2.0"
+    },
+    "musubi-tuner": {
+      "url": "https://github.com/kohya-ss/musubi-tuner.git",
+      "commit": "f8a1b03794a49239a3539015075f5123d6c07d66",
+      "license": "Apache-2.0"
+    },
+    "ComfyUI": {
+      "url": "https://github.com/comfyanonymous/ComfyUI.git",
+      "commit": "b9b290e43f1eb379946dfeb013faf9bbefa1a618",
+      "license": "GPL-3.0 (separate process, not linked)"
+    },
+    "ComfyUI-ppm": {
+      "url": "https://github.com/pamparamm/ComfyUI-ppm.git",
+      "commit": "543dbe3c16ceff63a193df8aa3a8f2e4a1859815",
+      "license": "AGPL-3.0-or-later (ComfyUI custom node in its own process; its unmodified source + LICENSE ship in engines/bundled/ComfyUI-ppm)",
+      "optional": true,
+      "path": "engines/ComfyUI/custom_nodes/ComfyUI-ppm",
+      "env": "comfy",
+      "used_for": "NegPip（マイナスの強さ・MOSS-Image の強調）、左右で描き分ける（Attention Couple）、白飛びを抑える（RescaleCFGPost）、スケジューラー ays / gits。2026-10-26 の版はこの ComfyUI（10-19）より新しい部分（MOSS-Image Edit）が読めないため、10-23 の版"
+    },
+    "ComfyUI-Moss-Image-Edit-Native": {
+      "url": "https://github.com/PedroMarinhoDev/ComfyUI-Moss-Image-Edit-Native.git",
+      "commit": "d5cd7b2a8a5045a9026e306345117cdbdce986f7",
+      "license": "GPL-3.0 (ComfyUI custom node in its own process; its unmodified source + LICENSE ship in engines/bundled/ComfyUI-Moss-Image-Edit-Native, without the README pictures and sample images)",
+      "optional": true,
+      "path": "engines/ComfyUI/custom_nodes/ComfyUI-Moss-Image-Edit-Native",
+      "env": "comfy",
+      "used_for": "MOSS-Image の編集用 LoRA（chinoll Moss-Image-Edit、akhaliq MOSS-Image-Edit-HQ）で、元画像をプロンプトの指示どおりに編集する。この ComfyUI（10-18）には MOSS の参照画像の仕組みがないため、このパックが ComfyUI のモデルに足す"
+    },
+    "ComfyUI-GGUF": {
+      "url": "https://github.com/leejet/ComfyUI-GGUF.git",
+      "commit": "edd981b10e107d3b8f58e16c498f2d08f631bc47",
+      "license": "Apache-2.0",
+      "optional": true,
+      "path": "engines/ComfyUI/custom_nodes/ComfyUI-GGUF",
+      "env": "comfy",
+      "pip": [
+        "gguf==0.17.1"
+      ],
+      "patch": "engines/patches/comfyui_gguf_qwen_image21.py",
+      "used_for": "Qwen-Image-2512 / 2.1 の GGUF 生成"
+    },
+    "musubi-tuner-qwen21": {
+      "url": "https://github.com/kohya-ss/musubi-tuner.git",
+      "commit": "9702b25aa9b57b32020ce513ff79b7d2143ec664",
+      "license": "Apache-2.0",
+      "optional": true,
+      "used_for": "Qwen-Image-2.1 の学習。dev ブランチで PR #1145 を取り込んだ commit（2026-10-12）。固定版 f8a1b03 から依存関係の変更はない"
+    },
+    "sd-scripts-moss": {
+      "url": "https://github.com/kohya-ss/sd-scripts.git",
+      "commit": "04ca541746b7667b27eab230db067579f682895e",
+      "license": "Apache-2.0",
+      "optional": true,
+      "env": "train",
+      "pip": [
+        "triton-windows==3.4.0.post21"
+      ],
+      "used_for": "MOSS-Image の学習（試験導入）。sd-scripts v0.12.1。requirements.txt は固定版 690ea7f と同一のため学習環境を共用。triton-windows は ConvRot INT8 の高速化用（torch 2.8 に対応する版）"
+    }
+  }
+}
