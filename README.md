@@ -8,7 +8,15 @@
 
 **This software comes with no warranty. Use it at your own risk. The author is not responsible for anything that results from its use.**
 
-The license is the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (full text in `LICENSE`). For any noncommercial purpose, such as personal hobbies, research, schools or nonprofit organizations, you may freely use, modify and share it. Commercial use is not allowed. Making LoRAs or images with this tool to sell them or to use them for work also counts as commercial use and is not allowed.
+The license is the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) with the additional terms below (full text in `LICENSE`). The additional terms take precedence over PolyForm.
+
+**Additional terms**
+
+1. You may use this software only for personal hobby purposes. Any other purpose, including research, education, use by organizations or work, is not permitted.
+2. Do not publish or distribute anything you make with this software (LoRAs, images, captions and so on). However, you may publish things made only from material you hold the rights to (such as your own drawings or your own photos).
+3. Do not use this software to infringe the copyright or other rights of others.
+4. If you distribute this software, pass these terms along with it.
+5. If you do not follow these terms, your permission to use this software ends.
 
 The existing code and models it uses follow their own terms (`LICENSES.md`). The bundled ComfyUI custom nodes (`engines/bundled`) keep their original licenses (AGPL-3.0 / GPL-3.0).
 
@@ -87,7 +95,15 @@ Sources and licenses: `LICENSES.md`
 
 **このソフトは無保証です。自己責任で使ってください。使用によって生じたことについて、作者は責任を負いません。**
 
-ライセンスは [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) です（全文は `LICENSE`）。営利目的でなければ、個人の趣味・研究・学校・非営利団体などで、自由に使い、改造し、配ることができます。営利目的の使用はできません。このツールで LoRA や画像を作って売ったり、仕事に使ったりすることも、営利目的の使用にあたるため許可していません。
+ライセンスは [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) に、次の追加の条件を加えたものです（全文は `LICENSE`）。追加の条件は PolyForm より優先します。
+
+**追加の条件**
+
+1. このソフトは、個人の趣味の目的でだけ使えます。研究・教育・団体での使用や仕事など、それ以外の目的では使えません。
+2. このソフトで作ったもの（LoRA・画像・説明文など）を公開・配布しないでください。ただし、自分が権利を持つ素材（自分で描いた絵、自分で撮った写真など）だけを使って作ったものは、公開できます。
+3. 他人の著作権やその他の権利を侵害することに、このソフトを使わないでください。
+4. このソフトを配布するときは、この条件も一緒に渡してください。
+5. これらの条件を守らなかった場合、このソフトを使う許可はなくなります。
 
 使っている既存のコードとモデルは、それぞれの利用条件に従います（`LICENSES.md`）。同梱している ComfyUI のカスタムノード（`engines/bundled`）は、それぞれ元のライセンス（AGPL-3.0 / GPL-3.0）のままです。
 

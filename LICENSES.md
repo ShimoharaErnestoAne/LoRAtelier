@@ -6,7 +6,7 @@
 
 | 名称 | 用途 | ライセンス | 組み込み方 |
 |---|---|---|---|
-| i2t（作者: ShimoharaErnestoAne。LoRAtelier と同じ） | 「画像からプロンプト」（`engines/i2t/` に版を固定して同梱、解析用環境で実行） | PolyForm Noncommercial 1.0.0（LoRAtelier と同じ） | 同梱の訳の辞書 `assets/tags_ja.json` は WD Tagger v3 のタグ一覧（Apache-2.0, SmilingWolf）を Index-Translate-2B（Apache-2.0, IndexTeam）で訳し、手直ししたもの。実行時に取得するモデル（WD14 タガー、DeepGHS の人物検出・年代判定、RTMPose-s）はそれぞれの利用条件に従う |
+| i2t（作者: ShimoharaErnestoAne。LoRAtelier と同じ） | 「画像からプロンプト」（`engines/i2t/` に版を固定して同梱、解析用環境で実行） | PolyForm Noncommercial 1.0.0 と追加の条件（LoRAtelier と同じ） | 同梱の訳の辞書 `assets/tags_ja.json` は WD Tagger v3 のタグ一覧（Apache-2.0, SmilingWolf）を Index-Translate-2B（Apache-2.0, IndexTeam）で訳し、手直ししたもの。実行時に取得するモデル（WD14 タガー、DeepGHS の人物検出・年代判定、RTMPose-s）はそれぞれの利用条件に従う |
 | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) | SDXL / Anima の LoRA 学習 | Apache-2.0 | 別プロセスで実行（`engines.lock.json` の commit に固定） |
 | [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) | Qwen-Image・Z-Image の LoRA 学習（Krea 2 用の部分は積み残し） | Apache-2.0 | 別プロセスで実行（commit 固定） |
 | [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) dev ブランチ | Qwen-Image-2.1 の LoRA 学習 | Apache-2.0 | PR #1145 を取り込んだ commit（9702b25）に固定。Qwen-Image-2.1 学習用ファイルを追加したときだけ取得します |

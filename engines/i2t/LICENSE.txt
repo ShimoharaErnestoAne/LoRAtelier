@@ -1,6 +1,6 @@
 Required Notice: Copyright (c) 2026 ShimoharaErnestoAne (https://github.com/ShimoharaErnestoAne/LoRAtelier)
 
-この i2t の写しは LoRAtelier の一部です。LoRAtelier と同じ PolyForm Noncommercial License 1.0.0 で提供します。全文は LoRAtelier の一番上のフォルダーにある LICENSE を見てください。
+この i2t の写しは LoRAtelier の一部です。LoRAtelier と同じ条件（PolyForm Noncommercial License 1.0.0 と追加の条件）で提供します。全文は LoRAtelier の一番上のフォルダーにある LICENSE を見てください。
 
 ---
 同梱・取得するライブラリとモデルのライセンスは、LoRAtelier の LICENSES.md を参照してください。
