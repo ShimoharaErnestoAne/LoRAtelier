@@ -15,8 +15,17 @@ The license is the [PolyForm Noncommercial License 1.0.0](https://polyformprojec
 1. Above all, do not use this software to infringe the copyright or other rights of others.
 2. You may use this software only as an individual, for personal hobby purposes. You may not use it for research, education, work or similar purposes, or within companies, schools or other organizations.
 3. Do not publish or distribute anything you make with this software (LoRAs, images, captions and so on). However, you may publish things made only from material you hold the rights to (such as your own drawings or your own photos).
-4. If you distribute this software, pass these terms along with it.
-5. If you do not follow these terms, your permission to use this software ends.
+4. Only when you make a LoRA yourself from illustrations you drew yourself, you may publish it and use it commercially, as an exception to 2 and 3. When you publish it, write the license somewhere on what you publish (anywhere is fine, such as its description).
+5. If you distribute this software, pass these terms along with it.
+6. If you do not follow these terms, your permission to use this software ends.
+
+**Why this software exists**
+
+LoRAtelier was made as a tool for people who draw, to turn their own drawings into a LoRA themselves.
+
+A LoRA of your own style or your own characters can help with your own creative work. The drawings it learns from are yours, and so is the LoRA made from them. That is why, only for LoRAs you make yourself from drawings you made yourself, publishing them and using them commercially is allowed.
+
+On the other hand, please do not use it to collect someone else's drawings without permission and make a LoRA that imitates their style. This software is meant to help the people who draw, never to take something away from them. That is the wish behind it.
 
 The existing code and models it uses follow their own terms (`LICENSES.md`). The bundled ComfyUI custom nodes (`engines/bundled`) keep their original licenses (AGPL-3.0 / GPL-3.0).
 
@@ -77,7 +86,7 @@ The "ヘルプ" (Help) button at the top right explains the operations, where to
 
 ### Supported models
 
-The supported families are SDXL (Illustrious / NoobAI / Pony / SDXL 1.0) and Anima. Qwen-Image-2512, Qwen-Image-2.1 and Z-Image are also supported. Image generation has been confirmed for all of them; for training, only a short Z-Image Turbo run has been tried (training of the Qwen models is unverified). When added from "Recommended models" in the settings, a lighter version for generation (GGUF quantization level, text encoder version) is chosen to fit the GPU's VRAM, and the bf16 version the training engine needs is fetched separately for training. Before training starts, it also checks that main memory meets the recommendation (64GB for Qwen-Image-2512). Training for 2.1 uses the development version of the musubi-tuner training engine. MOSS-Image is experimental, and both generation and training are unverified (training uses a separately installed sd-scripts v0.12.1 that supports MOSS-Image, and INT8 loading and block swap are chosen automatically to fit the VRAM). Krea 2 supports image generation and material generation (generation has been confirmed to work). Training uses the RAW main model (selectable since 2026-10-28; training from this tool is unverified). If you add your ComfyUI folder in the settings, ComfyUI's models and LoRAs can be used as they are, without copying. LoRAs cannot be shared between different model families.
+The supported families are SDXL (Illustrious / NoobAI / Pony / SDXL 1.0) and Anima. Anima 2.9B (Anima expanded from 28 to 40 layers) can also be added from "Recommended models"; its generation and training through this tool are unverified. Qwen-Image-2512, Qwen-Image-2.1 and Z-Image are also supported. Image generation has been confirmed for all of them; for training, only a short Z-Image Turbo run has been tried (training of the Qwen models is unverified). When added from "Recommended models" in the settings, a lighter version for generation (GGUF quantization level, text encoder version) is chosen to fit the GPU's VRAM, and the bf16 version the training engine needs is fetched separately for training. Before training starts, it also checks that main memory meets the recommendation (64GB for Qwen-Image-2512). Training for 2.1 uses the development version of the musubi-tuner training engine. MOSS-Image is experimental, and both generation and training are unverified (training uses a separately installed sd-scripts v0.12.1 that supports MOSS-Image, and INT8 loading and block swap are chosen automatically to fit the VRAM). Krea 2 supports image generation and material generation (generation has been confirmed to work). Training uses the RAW main model (selectable since 2026-10-28; training from this tool is unverified). If you add your ComfyUI folder in the settings, ComfyUI's models and LoRAs can be used as they are, without copying. LoRAs cannot be shared between different model families.
 
 The feature that makes a character LoRA from AI-generated images lets you choose the checkpoint used for generation, file by file. Images are generated on a plain white background, and background instructions in the prompt (`city street`, `outdoors` and so on) are removed before generating (the removed words are shown on the screen).
 
@@ -102,8 +111,17 @@ Sources and licenses: `LICENSES.md`
 1. 他人の著作権などの権利を侵害する使い方は、決してしないでください。これがすべての前提です。
 2. 使ってよいのは、個人が趣味で使う場合だけです。研究や教育、仕事のために使うことはできません。会社や学校などの団体で使うこともできません。
 3. このソフトで作った LoRA や画像、説明文などは、公開も配布もしないでください。ただし、自分で描いた絵や自分で撮った写真のように、自分が権利を持っている素材だけから作ったものは、公開してもかまいません。
-4. このソフトを人に渡すときは、この条件も一緒に渡してください。
-5. この条件を守れない場合は、このソフトを使うことはできません。
+4. 自分で描いたイラストを自分で LoRA にする場合に限り、2 と 3 の例外として、公開も商用での利用もしてかまいません。公開するときは、公開するもののどこか（説明文など、場所はどこでもかまいません）にライセンスを書いてください。
+5. このソフトを人に渡すときは、この条件も一緒に渡してください。
+6. この条件を守れない場合は、このソフトを使うことはできません。
+
+**このソフトに込めた想い**
+
+LoRAtelier は、絵を描く人が、自分の絵を自分で LoRA にするための道具として作りました。
+
+自分の絵柄や自分のキャラクターを LoRA にできれば、自分の作品づくりを手伝わせることができます。そのもとになる絵は描いた本人のものですし、そこから作った LoRA も本人のものです。だから、自分で描いた絵から自分で作った LoRA に限っては、公開することも、商用で使うことも認めています。
+
+その反対に、他人の絵を断りなく集めて、その人の絵柄をまねる LoRA を作ることには使わないでください。このソフトは描く人を手助けするためのもので、描く人から何かを奪うためのものではありません。それが、このソフトに込めたいちばんの願いです。
 
 このソフトの中で使っている他のプログラムやモデルには、それぞれに利用条件があります（`LICENSES.md` にまとめています）。一緒に入れている ComfyUI 用の拡張（`engines/bundled`）は、元のライセンス（AGPL-3.0 / GPL-3.0）のまま使っています。
 
@@ -165,6 +183,7 @@ LoRAtelier は、キャラクター LoRA とスタイル LoRA を自分の PC �
 ### 使えるモデル
 
 - **SDXL 系と Anima**：SDXL 系（Illustrious、NoobAI、Pony、SDXL 1.0）と Anima に対応しています。
+  - Anima の層を 28 から 40 に増やした Anima 2.9B も、「おすすめのモデル」から追加できます。このツールでの生成と学習は、まだ確かめていません。
 - **Qwen-Image と Z-Image**：Qwen-Image-2512、Qwen-Image-2.1、Z-Image にも対応しています。どれも画像の生成は確かめてあります。学習のほうは、Z-Image Turbo で短く学習してみただけで、Qwen 系の学習はまだ確かめていません。
   - 設定の「おすすめのモデル」から追加すると、生成用には GPU のメモリに合った軽い版（GGUF の量子化の段階や、テキストエンコーダーの版）を選びます。学習用には、学習エンジンが必要とする bf16 の版を別にダウンロードします。
   - 学習を始める前に、PC のメモリが足りているかも確かめます（Qwen-Image-2512 は 64GB をおすすめします）。
