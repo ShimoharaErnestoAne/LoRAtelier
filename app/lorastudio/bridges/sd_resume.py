@@ -73,12 +73,8 @@ def patch_source(source: str) -> str:
     return result
 
 
-def main():
-    engine = Path(os.getcwd()).resolve()
-    script = sys.argv.pop(1)
-    # this file's folder must not shadow the engine's modules
-    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != Path(__file__).resolve().parent]
-    sys.path.insert(0, str(engine))
+def fix_train_network(engine: Path) -> None:
+    """Load the engine's train_network.py with the fix into sys.modules (the engine folder must be on sys.path)."""
     path = engine / "train_network.py"
     source = patch_source(path.read_text(encoding="utf-8-sig"))
     spec = importlib.util.spec_from_file_location("train_network", path)
@@ -86,6 +82,15 @@ def main():
     sys.modules["train_network"] = module
     exec(compile(source, str(path), "exec"), module.__dict__)
     print("LoRAtelier: resume step count fixed (sd_resume.py)", flush=True)
+
+
+def main():
+    engine = Path(os.getcwd()).resolve()
+    script = sys.argv.pop(1)
+    # this file's folder must not shadow the engine's modules
+    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != Path(__file__).resolve().parent]
+    sys.path.insert(0, str(engine))
+    fix_train_network(engine)
     sys.argv[0] = str(engine / script)
     runpy.run_path(str(engine / script), run_name="__main__")
 

@@ -75,7 +75,13 @@ def defaults(family: str, kind: str, variant: str, n_images: int, vram_mb: int |
         d.update(learning_rate=1e-4, network_dim=32 if kind == "style" else 16,
                  network_alpha=32 if kind == "style" else 16, train_batch_size=2,
                  optimizer_type="AdamW8bit", lr_scheduler="constant", blocks_to_swap=0)
-        if vram_mb and vram_mb < 14000:
+        if variant == "anima29":
+            # 40 blocks instead of 28 (about 1.4x the weights and activations): estimated, not measured
+            if vram_mb and vram_mb < 14000:
+                d.update(train_batch_size=1, blocks_to_swap=16)
+            elif vram_mb and vram_mb < 20000:
+                d.update(train_batch_size=1)
+        elif vram_mb and vram_mb < 14000:
             d.update(train_batch_size=1, blocks_to_swap=10)
     elif family == "krea2":
         # 12.9B DiT: fp8 (scaled) base + block swap is required on a 16GB card

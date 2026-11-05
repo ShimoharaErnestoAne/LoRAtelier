@@ -26,6 +26,10 @@ VARIANTS = {
     "sdxl_base": {"family": "sdxl", "label": "SDXL 1.0 本家 / 実写系", "caption": "natural", "prediction": "eps", "verified": True},
     "anima": {"family": "anima", "label": "Anima (CircleStone)", "caption": "tags", "prediction": "flow", "verified": True,
               "natural_ok": True},   # also reads natural language: the project's 説明文の作り方 picks tags or sentences
+    # Gazingstars123/Anima-2.9B: Anima with 12 inserted blocks (40).  Same text encoder / VAE; ComfyUI counts the blocks;
+    # sd-scripts fixes them at 28, so training goes through bridges/anima_blocks.py.  Not trained through this app yet.
+    "anima29": {"family": "anima", "label": "Anima 2.9B（40 層）", "caption": "tags", "prediction": "flow", "verified": False,
+                "natural_ok": True},
     # Qwen-Image / 2.1 / Z-Image / MOSS-Image: "verified" stays False until training is recorded in
     # docs/VERIFICATION.md (generation of Qwen 2512 fp8, 2.1 GGUF and Z-Image Turbo is).  Qwen and Z-Image are no
     # longer marked experimental.
@@ -58,6 +62,8 @@ KREA2_NOTE = ("Krea 2 の学習には RAW 版の本体（bf16、約 26GB）が�
               "学習した LoRA は Turbo 版で使う想定です。")
 QWEN_IMAGE_NOTE = ("Qwen-Image-2512 は 20B の大きなモデルです。学習には bf16 版の本体とテキストエンコーダー（合わせて約 57GB）が必要で、"
                    "学習中はメインメモリを多く使います（64GB を推奨）。")
+ANIMA29_NOTE = ("Anima 2.9B は、Anima の層を 28 から 40 に増やしたモデルです（試作版）。テキストエンコーダーと VAE は Anima と同じものを使います。"
+                "Anima（2B）で作った LoRA は層の並びが違うため、効き方が変わることがあります。")
 ZIMAGE_NOTE = "Turbo 系で学習するときは、Turbo 用の学習アダプター（約 0.3GB）を使います。"
 MOSS_NOTE = ("MOSS-Image は試験導入中です。このツールでは動作を確認していないため、生成や学習が動かない可能性があります。"
              "学習には MOSS-Image に対応した新しい版の学習エンジン（sd-scripts v0.12.1）を別に入れて使います。")
@@ -70,6 +76,7 @@ VARIANTS["qwen_image21"]["note"] = QWEN21_NOTE
 VARIANTS["krea2"]["note"] = KREA2_NOTE
 VARIANTS["zimage_turbo"]["note"] = ZIMAGE_NOTE
 VARIANTS["zimage_base"]["note"] = ZIMAGE_NOTE
+VARIANTS["anima29"]["note"] = ANIMA29_NOTE
 VARIANTS["moss_image_sft"]["note"] = MOSS_NOTE
 VARIANTS["moss_image_base"]["note"] = MOSS_NOTE
 
@@ -135,6 +142,11 @@ CATALOG = [
     {"id": "anima_base", "variant": "anima", "name": "Anima base v1.0", "license": "CircleStone Labs Non-Commercial",
      "gated": False, "files": {
          "ckpt": ("circlestone-labs/Anima", "split_files/diffusion_models/anima-base-v1.0.safetensors", 4.18, "diffusion_models"),
+         "te": ("circlestone-labs/Anima", "split_files/text_encoders/qwen_3_06b_base.safetensors", 1.19, "text_encoders"),
+         "vae": ("circlestone-labs/Anima", "split_files/vae/qwen_image_vae.safetensors", 0.25, "vae")}},
+    {"id": "anima_29b", "variant": "anima29", "name": "Anima 2.9B preview v1", "license": "CircleStone Labs Non-Commercial",
+     "gated": False, "files": {
+         "ckpt": ("Gazingstars123/Anima-2.9B", "Anima-2.9B-preview-v1.safetensors", 5.84, "diffusion_models"),
          "te": ("circlestone-labs/Anima", "split_files/text_encoders/qwen_3_06b_base.safetensors", 1.19, "text_encoders"),
          "vae": ("circlestone-labs/Anima", "split_files/vae/qwen_image_vae.safetensors", 0.25, "vae")}},
     # Qwen-Image-2512: the light GGUF serves generation (picked by VRAM); training needs the bf16 DiT and text encoder
@@ -346,6 +358,9 @@ def detect_header(hdr: dict, name: str = "") -> dict:
         return res
     if any("llm_adapter" in k for k in keys):
         res.update(family="anima", variant="anima", confidence="高", evidence="LLM Adapter を持つ DiT (Anima)")
+        blocks = {int(m.group(1)) for k in strip_prefix(keys) for m in [re.match(r"(?:net\.)?blocks\.(\d+)\.", k)] if m}
+        if blocks and max(blocks) + 1 > 28:
+            res.update(variant="anima29", evidence=f"LLM Adapter を持つ DiT (Anima、{max(blocks) + 1} 層)")
         return res
     bare = set(strip_prefix(keys))
     if {"txt_in.text_norm.weight", "modulation.1.weight", "img_in.weight"} <= bare:
@@ -748,7 +763,7 @@ class Library:
                 self._cache[key] = companion_fit(family, kind, read_safetensors_header(f)) \
                     if f.suffix.lower() == ".safetensors" else None
             return self._cache[key]
-        except (OSError, ValueError):
+        except (OSError, ValueError, struct.error):   # struct.error: a file shorter than a header (cut off while copying)
             return None
 
     def _repair_companions(self) -> None:

@@ -745,6 +745,8 @@ def default_sampling(model: dict | None, fast: str | None = None) -> dict:
         fam = "qwen_image21_turbo"
     elif fam == "zimage" and (model or {}).get("variant") == "zimage_base":
         fam = "zimage_base"
+    elif fam == "anima" and (model or {}).get("variant") == "anima29":
+        fam = "anima29"
     elif fam == "krea2" and krea2_raw(model, gen_slot(model)):
         fam = "krea2_raw"
     s = dict(SAMPLING.get(fam, SAMPLING["sdxl"]))

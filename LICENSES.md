@@ -53,6 +53,7 @@ FastAPI (MIT), Uvicorn (BSD-3), Pillow (MIT-CMU), NumPy (BSD-3)。依存一覧�
 | SDXL 1.0 base | CreativeML Open RAIL++-M |
 | Pony Diffusion V6 XL | 独自ライセンス（配布元で確認） |
 | Anima (circlestone-labs) | CircleStone Labs Non-Commercial License（非商用） |
+| Anima 2.9B（Gazingstars123/Anima-2.9B、Anima を元にしたモデル） | CircleStone Labs Non-Commercial License（非商用） |
 | Qwen-Image-2512（Comfy-Org/Qwen-Image_ComfyUI） | Apache-2.0 |
 | Qwen-Image-2512 GGUF（unsloth/Qwen-Image-2512-GGUF） | Apache-2.0 |
 | Qwen-Image-2.1 / 2.1 Turbo（Comfy-Org/Qwen-Image-2.1、Qwen/Qwen-Image-2.1-Turbo） | Qwen Research License（非商用のみ） |

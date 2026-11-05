@@ -19,7 +19,8 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import config, loraconf
+from . import comfyflow, config, loraconf
+from .evaluate import ATTENTION_FLAGS, ATTENTION_PACKAGES, attention_installed
 from .evaluate import COUPLE_FAMILIES, KEEP_COMFY_OWNERS, NATIVE_SIZE, comfy, comfy_user, wants_negpip
 from .events import bus
 from .generate import (_stage, build_graph, check_model_loras, check_seed, clamp_denoise, default_sampling, source_file,
@@ -290,8 +291,45 @@ def request_sampling(model: dict | None, form: dict) -> tuple[dict, str | None]:
     return ds, edit
 
 
+ATTENTION_LABEL = {"pytorch": "PyTorch（SDPA）", "split": "Split", "quad": "Sub-quadratic", "sage": "SageAttention",
+                   "flash": "FlashAttention"}
+
+
+def companions(form: dict, model: dict | None) -> dict:
+    """The VAE / text encoder (CLIP) chosen in 詳細 instead of the model's own: {"vae": path, "te": path}.
+    SDXL checkpoints carry two text encoders (CLIP-L and -G), which one file cannot replace: only the VAE there."""
+    out = {}
+    for kind in ("vae", "te"):
+        p = str(form.get(kind) or "").strip()
+        if p and not (kind == "te" and (model or {}).get("family") == "sdxl"):
+            out[kind] = p
+    return out
+
+
+def check_extras(form: dict, model: dict | None) -> list[str]:
+    from .models import library
+    errors = []
+    for kind, p in companions(form, model).items():
+        what = "VAE" if kind == "vae" else "CLIP（テキストエンコーダー）"
+        if not Path(p).is_file():
+            errors.append(f"詳細設定で選んだ {what} のファイルが見つかりません: {Path(p).name}")
+        elif model and library.fits(model["family"], kind, p) is False:
+            errors.append(f"詳細設定で選んだ {what}（{Path(p).name}）は、このモデル用ではありません。")
+    att = form.get("attention") or ""
+    if att and att not in ATTENTION_FLAGS:
+        errors.append("アテンションの種類が正しくありません。")
+    elif att in ATTENTION_PACKAGES and not attention_installed()[att]:
+        errors.append(f"{ATTENTION_LABEL[att]} は ComfyUI の環境に入っていないため使えません。詳細設定のアテンションを「標準」にしてください。")
+    return errors
+
+
 def check(form: dict) -> dict:
+    if form.get("workflow"):   # workflow のまま生成: its own model / LoRAs / size / sampling
+        errors = [] if comfyflow.meta(form["workflow"]) else ["読み込んだ workflow が見つかりません。画像をもう一度読み込んでください。"]
+        errors += check_extras({"attention": form.get("attention")}, None)
+        return {"errors": errors, "notes": [], "model": None}
     errors, model = check_model_loras(form.get("model_id"), form.get("loras"))
+    errors += check_extras(form, model)
     if not (form.get("positive") or "").strip():
         errors.append("プロンプトを入力してください。")
     if form.get("init_image") and not init_file(form["init_image"]):
@@ -307,6 +345,8 @@ def submit(form: dict, runner) -> dict:
     chk = check(form)
     if chk["errors"]:
         raise ValueError(" ".join(chk["errors"]))
+    if form.get("workflow"):
+        return _submit_workflow(form, runner)
     model = chk["model"]
     over = {k: v for k, v in (form.get("sampling") or {}).items() if k in SAMPLING_KEYS and v not in (None, "")}
     ds, edit = request_sampling(model, form)
@@ -339,6 +379,8 @@ def submit(form: dict, runner) -> dict:
         **({"edit": edit} if edit else {}),
         **({"thumb_for": form["thumb_for"], "thumb_name": form.get("thumb_name") or ""} if form.get("thumb_for") else {}),
         **({"regions": regions} if regions else {}),
+        **companions(form, model),
+        **({"attention": form["attention"]} if form.get("attention") in ATTENTION_FLAGS else {}),
     }
     entry = {"id": uuid.uuid4().hex[:12], "created": time.time(), "status": "queued", "message": "順番待ち",
              "settings": settings, "images": [], "warnings": []}
@@ -351,6 +393,53 @@ def submit(form: dict, runner) -> dict:
     job.entry = entry["id"]
     bus.publish("imagegen", id=entry["id"], status="queued", message="順番待ち")
     return entry
+
+
+def _count(form: dict) -> int:
+    try:
+        return max(1, min(MAX_COUNT, int(form.get("count") or 1)))
+    except (TypeError, ValueError):
+        raise ValueError("枚数は整数で入れてください") from None
+
+
+def _queue(entry: dict, runner, detail: str) -> dict:
+    with _lock:
+        items = history()
+        items.insert(0, entry)
+        _save_history(items)
+    job = runner.enqueue_task(OWNER, LABEL, lambda: run(entry["id"]), on_cancel=lambda: cancel(entry["id"]))
+    job.detail = detail[:60] or None
+    job.entry = entry["id"]
+    bus.publish("imagegen", id=entry["id"], status="queued", message="順番待ち")
+    return entry
+
+
+def _wf_size(graph: dict, form: dict) -> dict:
+    """The page's size (multiples of 16, as the form), or the workflow's own when the page has none."""
+    own = comfyflow.latent_size(graph) or (None, None)
+    if form.get("width") and form.get("height"):
+        return {"width": _size(form["width"], own[0] or 1024), "height": _size(form["height"], own[1] or 1024)}
+    return {"width": own[0], "height": own[1]}
+
+
+def _submit_workflow(form: dict, runner) -> dict:
+    """workflow のまま生成: the stored workflow with the page's prompt / negative (checked here, so a prompt that
+    cannot go in is said before queueing), seed and count."""
+    wid = form["workflow"]
+    graph, m = comfyflow.load(wid), comfyflow.meta(wid)
+    positive, negative = (form.get("positive") or "").strip(), (form.get("negative") or "").strip()
+    comfyflow.apply_prompts(graph, positive, negative)   # ValueError: said on the page
+    count = _count(form)
+    seed = form.get("seed")
+    seed = check_seed(seed, count) if seed not in (None, "") else random.randint(1, 2**31 - 1000)
+    settings = {"workflow": wid, "workflow_source": m["source"], "workflow_summary": m["summary"],
+                "model_name": "workflow", "family": None, "model_id": None, "loras": [],
+                "positive": positive, "prompt_sent": positive, "trigger_words": [], "negative": negative,
+                **_wf_size(graph, form), "seed": seed, "count": count, "sampling": {}, "sampling_overrides": {},
+                **({"attention": form["attention"]} if form.get("attention") in ATTENTION_FLAGS else {})}
+    entry = {"id": uuid.uuid4().hex[:12], "created": time.time(), "status": "queued", "message": "順番待ち",
+             "settings": settings, "images": [], "warnings": []}
+    return _queue(entry, runner, positive)
 
 
 def cancel(eid: str) -> bool:
@@ -398,6 +487,8 @@ def run(eid: str):
         _cancel.discard(eid)
         return
     s = e["settings"]
+    if s.get("workflow"):
+        return _run_workflow(eid, s)
     model = registry.get(s["model_id"])
     if not model or model["missing"]:
         _update(eid, status="failed", message="生成モデルのファイルが見つかりません")
@@ -413,13 +504,17 @@ def run(eid: str):
     try:
         staged = stage_model_files(model)
         loras = [(_stage("loras", lo["path"]), lo["strength"]) for lo in s["loras"]]
+        if s.get("vae"):   # the VAE / CLIP chosen in 詳細 instead of the model's own
+            staged["vae_override" if model["family"] == "sdxl" else "vae"] = _stage("vae", s["vae"])
+        if s.get("te") and model["family"] != "sdxl":
+            staged["te"] = _stage("text_encoders", s["te"])
         init = None
         if s.get("init_image"):
             src = init_file(s["init_image"])
             if not src:
                 raise RuntimeError("元画像が見つかりません（消された可能性があります）")
             init = {"image": stage_comfy_input(src), "denoise": s["denoise"]}
-        comfy.ensure_started()    # restarts only for folders / custom nodes the running ComfyUI does not know
+        comfy.ensure_started(s.get("attention") or "")   # restarts only for unknown folders / custom nodes, or another attention
         _kept = True
         log0 = comfy.log_size()
         if init and s.get("edit") and comfy.moss_edit:   # MOSS-Image edit LoRA: the source image edited as the prompt says
@@ -486,6 +581,80 @@ def run(eid: str):
         _update(eid, status="done", message="完了", images=images)
     if s.get("thumb_for"):
         _preset_thumb_done(s["thumb_for"], eid, img_dir / images[0]["file"] if images else None, "サムネイルの生成を中止しました")
+    _arm_idle_stop()
+
+
+def _run_workflow(eid: str, s: dict):
+    """workflow のまま生成 (comfyflow): the graph with this PC's files, checked against the running ComfyUI, then
+    once per seed.  Every image the workflow saves is kept."""
+    global _kept
+    _update(eid, status="running", message="準備中（workflow を確認しています）")
+    _set_progress(eid, phase="loading", image=0, count=s["count"], step=0, steps=0, eta_s=None)
+    img_dir = config.storage_dir("imagegen")
+    img_dir.mkdir(parents=True, exist_ok=True)
+    images, durations = [], []
+    try:
+        graph = comfyflow.load(s["workflow"])
+        if graph is None:
+            raise RuntimeError("読み込んだ workflow が見つかりません")
+        graph = comfyflow.apply_prompts(graph, s["positive"], s["negative"])
+        graph, notes, wf_model = comfyflow.resolve_files(graph, comfyflow.local_files(), comfy.stage_model, registry.list())
+        graph, more = comfyflow.substitute(graph, (wf_model or {}).get("family"))
+        graph = comfyflow.apply_size(graph, s.get("width"), s.get("height"))
+        if notes + more:
+            _update(eid, warnings=notes + more)
+        comfy.ensure_started(s.get("attention") or "")
+        _kept = True
+        errors = comfyflow.check(graph, comfy._get("/object_info", timeout=60))
+        if errors:
+            raise RuntimeError(" ".join(errors))
+        _update(eid, message="生成中")
+        for i in range(s["count"]):
+            if eid in _cancel:
+                break
+            t_img = time.time()
+            first: list = []
+            _set_progress(eid, phase="loading" if i == 0 else "sampling", image=i + 1, step=0, steps=0,
+                          eta_s=_eta(durations, s["count"] - i - 1, None))
+
+            def on_progress(step, steps, i=i, first=first):
+                now = time.time()
+                if not first or step < first[-1][1]:   # a workflow may sample more than once (hires): measured per pass
+                    first.append((now, step))
+                t0, s0 = first[-1]
+                rate = (now - t0) / (step - s0) if step > s0 else None
+                _set_progress(eid, phase="sampling", image=i + 1, step=step, steps=steps,
+                              eta_s=_eta(durations, s["count"] - i - 1, (steps - step) * rate if rate else None))
+            seed = s["seed"] + i
+            try:
+                out = comfy.run_prompt(comfyflow.for_run(graph, seed, f"lsimg_{eid}"), on_progress=on_progress)
+            except RuntimeError:
+                if eid in _cancel:
+                    break
+                raise
+            outs = [o for o in out if o.get("type", "output") == "output"]
+            if not outs:
+                raise RuntimeError("workflow が画像を保存しませんでした")
+            for k, o in enumerate(outs):
+                src = config.DATA_DIR / "comfy_output" / o.get("subfolder", "") / o["filename"]
+                name = f"{eid}_{i}{f'_{k}' if k else ''}_s{seed}.png"
+                shutil.move(str(src), img_dir / name)
+                images.append({"file": name, "seed": seed})
+            durations.append(time.time() - t_img)
+            _update(eid, images=images)
+    except Exception as ex:
+        _progress.pop(eid, None)
+        _update(eid, status="failed", message=f"生成に失敗しました: {ex}", images=images)
+        _kept = False
+        comfy.after_failure(ex)
+        _cancel.discard(eid)
+        return
+    _progress.pop(eid, None)
+    if eid in _cancel:
+        _cancel.discard(eid)
+        _update(eid, status="cancelled", message=f"中止しました（{len(images)} 枚は残っています）", images=images)
+    else:
+        _update(eid, status="done", message="完了", images=images)
     _arm_idle_stop()
 
 

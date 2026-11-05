@@ -319,6 +319,7 @@ QUALITY = {
     "pony": ("score_9, score_8_up, score_7_up, rating_safe, ", "score_4, score_5, score_6, lowres, bad anatomy, watermark"),
     "sdxl_base": ("", "blurry, low quality, deformed, watermark, text"),
     "anima": ("masterpiece, best quality, safe, ", "nsfw, worst quality, low quality, bad anatomy, watermark"),
+    "anima29": ("masterpiece, best quality, safe, ", "nsfw, worst quality, low quality, bad anatomy, watermark"),
     "krea2": ("", ""),
     "qwen_image": ("", "blurry, low quality, deformed, watermark, text"),
     "qwen_image21": ("", ""),
@@ -331,6 +332,8 @@ QUALITY = {
 SAMPLING = {
     "sdxl": {"steps": 28, "cfg": 6.0, "sampler": "euler_ancestral", "scheduler": "normal"},
     "anima": {"steps": 30, "cfg": 4.5, "sampler": "euler_ancestral", "scheduler": "simple"},
+    # Gazingstars123/Anima-2.9B model card: Euler + sgm_uniform (the author's setting), 28-50 steps, CFG 3.5-5
+    "anima29": {"steps": 30, "cfg": 4.5, "sampler": "euler", "scheduler": "sgm_uniform"},
     "krea2": {"steps": 8, "cfg": 1.0, "sampler": "euler", "scheduler": "simple"},
     # the RAW model (not distilled): musubi-tuner docs/krea2.md "RAW model inference", 28 steps, guidance 5.5.
     # Unverified in this tool.
@@ -463,6 +466,21 @@ def _link_or_copy(src: Path, dest: Path):
         shutil.copyfile(src, dest)
 
 
+# 画像生成の詳細設定「アテンション」: ComfyUI's launch options (comfy/cli_args.py attn_group); they apply to the whole
+# process, so a change restarts ComfyUI.  "": ComfyUI's own choice (PyTorch's SDPA with torch 2 on NVIDIA)
+ATTENTION_FLAGS = {"pytorch": "--use-pytorch-cross-attention", "split": "--use-split-cross-attention",
+                   "quad": "--use-quad-cross-attention", "sage": "--use-sage-attention", "flash": "--use-flash-attention"}
+# the backends that need a package in ComfyUI's environment (not installed by setup)
+ATTENTION_PACKAGES = {"sage": "sageattention", "flash": "flash_attn"}
+
+
+def attention_installed() -> dict[str, bool]:
+    """Whether each backend that needs a package has it in ComfyUI's environment (its folder in site-packages:
+    no Python started, so the page does not wait)."""
+    site = config.COMFY_PYTHON.parent.parent / "Lib" / "site-packages"
+    return {k: (site / pkg).is_dir() for k, pkg in ATTENTION_PACKAGES.items()}
+
+
 class Comfy:
     def __init__(self):
         self.proc: subprocess.Popen | None = None
@@ -474,6 +492,8 @@ class Comfy:
         self._log = None   # comfyui.log, open while the process runs
         self.ppm = False   # ComfyUI-ppm's nodes loaded in the running ComfyUI (set at start)
         self.moss_edit = False   # ComfyUI-Moss-Image-Edit-Native's nodes loaded (set at start)
+        self.attention = ""   # the attention backend asked for (ATTENTION_FLAGS key, "": ComfyUI's own choice)
+        self.started_attention = ""   # ... and the one the running process was started with
         self._uses = 0     # ensure_started() calls: an idle stop armed before the latest use must not stop it
         self._cancels = 0  # cancel_current() calls: a run_prompt that sees this change stops its prompt
 
@@ -546,6 +566,8 @@ class Comfy:
                 ensure_node(name)   # put in place on the first start (bundled copy, else a small git clone); without it, generation goes on as before
             self.started_nodes = self._custom_nodes()
             self.started_extra = {k: set(v) for k, v in self.extra_dirs.items()}
+            self.started_attention = self.attention
+            attn = [ATTENTION_FLAGS[self.attention]] if self.attention in ATTENTION_FLAGS else []
             out_dir = config.DATA_DIR / "comfy_output"
             out_dir.mkdir(parents=True, exist_ok=True)
             if not self._port_released():
@@ -559,7 +581,7 @@ class Comfy:
                 [str(config.COMFY_PYTHON), "main.py", "--listen", config.HOST, "--port", str(config.COMFY_PORT),
                  "--disable-auto-launch", "--extra-model-paths-config", str(extra), "--output-directory", str(out_dir),
                  "--input-directory", str(COMFY_INPUT),
-                 "--disable-all-custom-nodes", *self._custom_nodes(), "--preview-method", "none"],
+                 "--disable-all-custom-nodes", *self._custom_nodes(), "--preview-method", "none", *attn],
                 cwd=str(config.COMFY_DIR), stdout=log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
             t0 = time.time()
             while time.time() - t0 < timeout:
@@ -613,16 +635,19 @@ class Comfy:
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def ensure_started(self):
+    def ensure_started(self, attention: str = ""):
         """Start ComfyUI, or keep using the one left running by the previous job.  It is restarted only when
-        files were staged from folders it does not know (extra paths and custom nodes are read at startup)."""
+        files were staged from folders it does not know (extra paths and custom nodes are read at startup), or for
+        another attention backend (画像生成 chooses one; every other job uses ComfyUI's own choice)."""
         with self._lock:
             self._uses += 1
             if self._idle:
                 self._idle.cancel()
                 self._idle = None
+            self.attention = attention if attention in ATTENTION_FLAGS else ""
         if self.running() and ({k: set(v) for k, v in self.extra_dirs.items()} != self.started_extra
-                               or getattr(self, "started_nodes", None) != self._custom_nodes()):
+                               or getattr(self, "started_nodes", None) != self._custom_nodes()
+                               or self.started_attention != self.attention):
             self.refresh()
         else:
             self.start()
@@ -913,6 +938,8 @@ def sampling_for(model: dict, staged: dict) -> dict:
         return dict(SAMPLING["qwen_image21_turbo"])
     if fam == "zimage" and model.get("variant") == "zimage_base":
         return dict(SAMPLING["zimage_base"])
+    if fam == "anima" and model.get("variant") == "anima29":
+        return dict(SAMPLING["anima29"])
     if krea2_raw(model, staged.get("on")):
         return dict(SAMPLING["krea2_raw"])
     return dict(SAMPLING[fam])
@@ -949,6 +976,9 @@ def build_t2i(model: dict, staged: dict, loras: list[tuple[str, float]], prompt:
     if fam == "sdxl":
         g["1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": staged["ckpt"]}}
         model_ref, clip_ref, vae_ref = ["1", 0], ["1", 1], ["1", 2]
+        if staged.get("vae_override"):   # 画像生成の詳細設定で選んだ VAE (e.g. sdxl_vae / a fixed fp16 one)
+            g["1v"] = {"class_type": "VAELoader", "inputs": {"vae_name": staged["vae_override"]}}
+            vae_ref = ["1v", 0]
         from .models import VARIANTS
         if VARIANTS.get(model.get("variant"), {}).get("prediction") == "v":
             # trained as v-prediction (training.py); a merge without ComfyUI's v_pred key would be sampled as eps

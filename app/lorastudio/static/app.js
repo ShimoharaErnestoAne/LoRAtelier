@@ -4061,6 +4061,7 @@ async function renderImageGen() {
       <div class="spacer"></div><span class="savestate" id="ig-save"></span></div>
     <div class="form" style="margin-top:10px">
       <label>保存した設定</label><div id="ig-presets"></div>
+      <label>画像から読み込む</label><div id="ig-info"></div>
       <label>モデル</label>
       <div><div class="row"><select id="ig-model" style="max-width:100%"><option value="">選んでください</option>${genModelOptions(S.lib, f.model_id)}</select>
         <button class="small" id="ig-rescan" title="フォルダーを読み直します">再読み込み</button>
@@ -4101,6 +4102,7 @@ async function renderImageGen() {
         <div class="field"><div class="lab"><span>白飛びを抑える</span><span>初期値 使わない</span></div>
           <select data-igs="rescale"><option value="">使わない</option><option value="on" ${sm.rescale === "on" ? "selected" : ""}>使う</option></select>
           <div class="muted small">CFG を高くしたときの白飛びや色の濃くなりすぎを抑えます（NoobAI の v-pred 系などで起きやすい）。</div></div>
+        ${igExtraFields(f)}
       </div>
       <datalist id="ig-scheds">${["normal", "karras", "exponential", "sgm_uniform", "simple", "beta", "kl_optimal", "ays", "ays+", "ays_30", "gits"].map((x) => `<option value="${x}">`).join("")}</datalist>
       <div class="muted small" style="margin-top:4px">空欄の項目は、モデルに合わせた初期値で生成します。スケジューラーの ays・gits は、少ないステップでも仕上がりやすい種類です。</div>
@@ -4115,15 +4117,18 @@ async function renderImageGen() {
   igDrawSizes();
   igDrawCheck(S.ig.check, S.ig.notes);
   igDrawHistory();
-  $$("#ig-pos, #ig-neg, #ig-left, #ig-right, #ig-w, #ig-h, #ig-count, [data-igs]").forEach((x) => { x.oninput = igSaveSoon; x.onchange = igSaveSoon; });
+  $$("#ig-pos, #ig-neg, #ig-left, #ig-right, #ig-w, #ig-h, #ig-count, [data-igs], #ig-vae, #ig-te, #ig-attn").forEach((x) => { x.oninput = igSaveSoon; x.onchange = igSaveSoon; });
   $("[data-igs=scheduler]")?.setAttribute("list", "ig-scheds");
   $("#ig-pos").addEventListener("input", debounce(() => igTrig(), 200));
   $("#ig-w").onchange = $("#ig-h").onchange = () => { igDrawSizes(); igSaveSoon(); };
   igDrawInit();
+  igDrawInfo();
+  igShowExtras();
   $("#ig-model").onchange = async () => {
     const sel = $("#ig-model");
     if (sel.value.startsWith("file:")) return pickFileModel(sel, () => sel.onchange());
     sel.closest(".row").parentElement.querySelector(".pickfile")?.remove();
+    igShowExtras();
     const before = S.ig.native;
     igDrawLoras(igRead().loras);
     await igSave();
@@ -4844,6 +4849,10 @@ function igRead() {
     regions: { left: $("#ig-left").value.trim(), right: $("#ig-right").value.trim() },
     loras: readLoraRows($("#ig-loras")),
     init_image: (S.ig.form || {}).init_image || null,
+    vae: $("#ig-vae") ? $("#ig-vae").value : (S.ig.form || {}).vae || "",
+    te: $("#ig-te") ? $("#ig-te").value : (S.ig.form || {}).te || "",
+    attention: $("#ig-attn") ? $("#ig-attn").value : (S.ig.form || {}).attention || "",
+    workflow: (S.ig.form || {}).workflow || "",
     denoise: $("#ig-den") && $("#ig-den").value !== "" ? num($("#ig-den").value) : (S.ig.form || {}).denoise ?? null,
   };
 }
@@ -4883,6 +4892,113 @@ function igDrawInit() {
       if (file) igSetInit(file);
     });
   }
+}
+
+/* 詳細設定の VAE / CLIP / アテンション: the files in the vae / text_encoders folders instead of the model's own, and
+   ComfyUI's attention backend (a change restarts ComfyUI before the generation). */
+const IG_ATTN = [["", "標準（ComfyUI が自動で選ぶ）"], ["pytorch", "PyTorch（SDPA）"], ["sage", "SageAttention"],
+  ["flash", "FlashAttention"], ["split", "Split（省メモリ・遅い）"], ["quad", "Sub-quadratic（省メモリ・遅い）"]];
+function igExtraFields(f) {
+  const comp = (S.lib && S.lib.companions) || {}, inst = S.ig.attention || {};
+  const opts = (kind, cur) => {
+    const files = [...(comp[kind] || [])];
+    if (cur && !files.includes(cur)) files.unshift(cur);   // chosen before and moved / removed since: still shown
+    return `<option value="">モデルのもの（初期値）</option>` + files.map((p) =>
+      `<option value="${esc(p)}" title="${esc(p)}" ${p === cur ? "selected" : ""}>${esc(p.split(/[\\/]/).pop())}</option>`).join("");
+  };
+  return `<div class="field"><div class="lab"><span>VAE</span><span>初期値 モデルのもの</span></div>
+      <select id="ig-vae">${opts("vae", f.vae || "")}</select>
+      <div class="muted small">vae フォルダーのファイルから選びます。SDXL 系で別の VAE（sdxl_vae など）を使うときに選びます。</div></div>
+    <div class="field" id="ig-te-field"><div class="lab"><span>CLIP（テキストエンコーダー）</span><span>初期値 モデルのもの</span></div>
+      <select id="ig-te">${opts("te", f.te || "")}</select>
+      <div class="muted small">text_encoders フォルダーのファイルから選びます。SDXL 系はモデルの中の CLIP を使うため選べません。</div></div>
+    <div class="field"><div class="lab"><span>アテンション</span><span>初期値 標準</span></div>
+      <select id="ig-attn">${IG_ATTN.map(([v, label]) => {
+        const off = v in inst && !inst[v];
+        return `<option value="${v}" ${v === (f.attention || "") ? "selected" : ""} ${off && v !== (f.attention || "") ? "disabled" : ""}>${label}${off ? "（入っていません）" : ""}</option>`; }).join("")}</select>
+      <div class="muted small">生成の計算方法です。変えると、生成の前に ComfyUI を起動し直します（10〜30 秒ほど）。SageAttention・FlashAttention は、ComfyUI の環境に入っているときだけ選べます。</div></div>`;
+}
+function igShowExtras() {
+  const el = $("#ig-te-field");
+  if (el) el.hidden = modelFamily($("#ig-model").value) === "sdxl";
+}
+
+/* 画像から読み込む: an image made by A1111 / Forge / ComfyUI / NovelAI ... (or by this page) carries its prompt,
+   model, LoRAs and parameters; they replace the form's, and 「元に戻す」 puts the form back as it was. */
+function igDrawInfo() {
+  const el = $("#ig-info");
+  if (!el) return;
+  const m = S.igInfo;
+  el.innerHTML = `<div class="row"><button class="small" id="ig-info-pick">画像を選ぶ</button>
+      <span class="muted small">生成した画像（PNG など）をここにドロップすると、画像に書き込まれたプロンプト・モデル・LoRA・設定をフォームに入れます。</span>
+      <input type="file" id="ig-info-file" accept="image/*" hidden></div>
+    ${m ? `<div class="small" style="margin-top:4px">${esc(m.source)} の設定を読み込みました。
+        ${m.undo ? `<button class="small" id="ig-info-undo">元に戻す</button>` : ""}
+      ${(m.notes || []).map((x) => `<div class="warntext">${esc(x)}</div>`).join("")}</div>` : ""}
+    ${igWorkflowHtml()}`;
+  const wfSet = async (id) => {
+    S.ig.form = { ...igRead(), workflow: id };
+    await igSave();
+    await renderImageGen();
+  };
+  if ($("#ig-wf-off")) $("#ig-wf-off").onclick = () => wfSet("");
+  if ($("#ig-wf-on")) $("#ig-wf-on").onclick = () => wfSet($("#ig-wf-on").dataset.id);
+  $("#ig-info-pick").onclick = () => $("#ig-info-file").click();
+  $("#ig-info-file").onchange = (e) => { if (e.target.files[0]) igLoadInfo(e.target.files[0]); };
+  if ($("#ig-info-undo")) $("#ig-info-undo").onclick = async () => {
+    try { await api("/api/imagegen/form", { method: "PUT", body: m.undo }); } catch (e) { return fail(e); }
+    S.igInfo = null;
+    await renderImageGen();
+    toast("読み込む前の設定に戻しました");
+  };
+  if (!el.dataset.drop) {
+    el.dataset.drop = "1";
+    el.addEventListener("dragover", (e) => { e.preventDefault(); });
+    el.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const file = [...(e.dataTransfer.files || [])].find((x) => x.type.startsWith("image/"));
+      if (file) igLoadInfo(file);
+    });
+  }
+}
+
+/* workflow のまま生成: a ComfyUI image's workflow is run as it is (its model, LoRAs, size, samplers, hires ...);
+   the page's prompt, negative, seed, count and attention go in.  It can be turned off to use the form instead. */
+function igWorkflowHtml() {
+  const on = (S.ig.form || {}).workflow && S.ig.workflow, loaded = S.igInfo && S.igInfo.workflow;
+  if (on) {
+    const w = S.ig.workflow;
+    return `<div class="panel" style="margin-top:6px;padding:8px"><div class="row"><b>workflow のまま生成します</b>
+        <span class="small muted">${esc(w.source)}・ノード ${w.nodes} 個${w.summary ? `・${esc(w.summary)}` : ""}</span>
+        <div class="spacer"></div><button class="small" id="ig-wf-off">workflow を使わない</button></div>
+      <div class="small muted">モデル・LoRA・サンプラーなどの設定は workflow のものを使い、下の欄のモデル・LoRA・左右の描き分け・元画像・詳細設定（アテンション以外）は使いません。
+        プロンプト・ネガティブ・画像サイズ・seed・枚数・アテンションは、この画面のものを使います。「workflow を使わない」を押すと、下の欄の設定で生成します。</div></div>`;
+  }
+  if (!loaded) return "";
+  if ((loaded.missing_nodes || []).length)
+    return `<div class="small warntext" style="margin-top:4px">この画像の workflow には、ここの ComfyUI に入っていないノード（${esc(loaded.missing_nodes.join("、"))}）があるため、
+      workflow のままでは生成できません。読み取れた設定を下の欄に入れました。</div>`;
+  return `<div class="row" style="margin-top:4px"><button class="small" id="ig-wf-on" data-id="${esc(loaded.id)}">workflow のまま生成する</button>
+    <span class="small muted">いまは下の欄の設定で生成します。</span></div>`;
+}
+
+async function igLoadInfo(file) {
+  const before = igRead();
+  let j;
+  try {
+    const r = await fetch("/api/imagegen/pnginfo", { method: "POST", body: file });
+    j = await r.json();
+    if (!r.ok) throw new Error(j.detail || "画像を読み込めませんでした");
+    await api("/api/imagegen/form", { method: "PUT", body: { ...before, ...j.form } });
+  } catch (e) { return fail(e); }
+  S.igInfo = { source: j.source, notes: j.notes, undo: before, workflow: j.workflow || null };
+  await renderImageGen();
+  const sel = $("#ig-model");
+  if (j.model_file && sel) {   // a model file not set up yet: chosen as in the list, which sets it up
+    sel.value = "file:" + j.model_file;
+    if (sel.value) sel.onchange();
+  }
+  toast(`${j.source} の設定をフォームに入れました`);
 }
 
 async function igSetInit(file) {
@@ -4950,6 +5066,7 @@ async function igReload() {
 const igReloadSoon = debounce(igReload, 300);
 
 function igSettingsText(s) {
+  if (s.workflow) return `workflow のまま（${s.workflow_source}${s.workflow_summary ? `・${s.workflow_summary}` : ""}）${s.width ? ` ／ ${s.width}×${s.height}` : ""} ／ seed ${s.seed}`;
   const lo = s.loras.length ? s.loras.map((l) => `${l.path.split(/[\\/]/).pop()}（${l.strength}）`).join("、") : "なし";
   return `${s.model_name} ／ LoRA: ${lo} ／ ${s.width}×${s.height} ／ seed ${s.seed} ／ ${s.sampling.steps} steps・CFG ${s.sampling.cfg}・${s.sampling.sampler}・${s.sampling.scheduler}${s.sampling.rescale === "on" ? "・白飛び抑制" : ""}${s.regions ? ` ／ 左: ${s.regions[0] || "なし"}・右: ${s.regions[1] || "なし"}` : ""}`
     + (s.edit ? " ／ 元画像を指示で編集" : s.init_image ? ` ／ 元画像から（変化の強さ ${s.denoise}）` : "");
@@ -4994,7 +5111,7 @@ function igDrawHistory() {
         ${active ? `<button class="small" data-icancel>中止</button>` : `<button class="small" data-iuse title="このときの設定（seed も含む）をフォームに戻します">この設定に戻す</button>
           ${e.images.length ? `<a class="btnlink" href="${e.images.length === 1 ? `/api/imagegen/img/${encodeURIComponent(e.images[0].file)}?dl=1` : `/api/imagegen/${e.id}/download.zip`}" download>
             <button class="small">${e.images.length === 1 ? "ダウンロード" : `まとめてダウンロード（${e.images.length} 枚・zip）`}</button></a>
-            <button class="small primary" data-icopy>この設定で LoRA 素材を作る</button>` : ""}
+            ${s.workflow ? "" : `<button class="small primary" data-icopy>この設定で LoRA 素材を作る</button>`}` : ""}
           <button class="small" data-idel title="この結果の画像を消します">削除</button>`}</div>
       <div class="row" style="align-items:flex-start;margin:4px 0"><div class="small igshare">${esc(igShareText(s))}</div>
         <button class="small" data-ishare title="モデル・設定・プロンプトを、そのまま貼り付けられる文章でコピーします">コピー</button></div>
@@ -5024,7 +5141,8 @@ function igDrawHistory() {
         await api("/api/imagegen/form", { method: "PUT", body: { model_id: s.model_id, loras: s.loras, positive: s.positive, negative: s.negative,
           width: s.width, height: s.height, count: s.count, seed: s.seed, sampling: s.sampling_overrides,
           init_image: s.init_image || null, denoise: s.denoise ?? null,
-          regions: s.regions ? { left: s.regions[0] || "", right: s.regions[1] || "" } : null } });
+          regions: s.regions ? { left: s.regions[0] || "", right: s.regions[1] || "" } : null,
+          vae: s.vae || "", te: s.te || "", attention: s.attention || "", workflow: s.workflow || "" } });
       } catch (err) { return fail(err); }
       await renderImageGen(); window.scrollTo(0, 0);
       toast("フォームをこの結果の設定に戻しました（seed も同じです）");

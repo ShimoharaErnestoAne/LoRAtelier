@@ -549,10 +549,15 @@ def _common_save(v, out_dir, out_name, state: bool = True):
 
 SD_RESUME = Path(__file__).resolve().parent / "bridges" / "sd_resume.py"
 QWEN21_INT8 = Path(__file__).resolve().parent / "bridges" / "qwen21_int8.py"   # reads ComfyUI INT8 files as bf16
+ANIMA_BLOCKS = Path(__file__).resolve().parent / "bridges" / "anima_blocks.py"   # Anima DiT at the file's block count
 
 
 def _sd_script(script: str, resume: str | None) -> list[str]:
-    """A resumed sd-scripts run goes through bridges/sd_resume.py, which fixes the engine's step counting."""
+    """A resumed sd-scripts run goes through bridges/sd_resume.py, which fixes the engine's step counting.  Anima runs
+    go through bridges/anima_blocks.py, which builds the DiT with the checkpoint's block count (Anima 2.9B: 40; the
+    engine fixes it at 28) and applies the resume fix too."""
+    if script.startswith("anima_"):
+        return [str(ANIMA_BLOCKS)] + (["--resume-fix"] if resume else []) + [script]
     return [str(SD_RESUME), script] if resume else [script]
 
 

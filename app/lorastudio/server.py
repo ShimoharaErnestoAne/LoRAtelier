@@ -1572,7 +1572,8 @@ def imagegen_state():
     ds, edit = imagegen.request_sampling(model, form)
     return {"form": form, "history": hist, "default_sampling": ds, "edit": edit,
             "native": imagegen.native_size(model), "check": chk["errors"], "notes": chk["notes"],
-            "presets": _presets_view()}
+            "presets": _presets_view(), "attention": imagegen.attention_installed(),
+            "workflow": imagegen.comfyflow.meta(form.get("workflow"))}
 
 
 def _presets_view() -> list[dict]:
@@ -1631,7 +1632,8 @@ def imagegen_preset_delete(pid: str):
 
 @app.put("/api/imagegen/form")
 def imagegen_form(body: dict):
-    keep = ("model_id", "loras", "positive", "negative", "width", "height", "count", "seed", "sampling", "init_image", "denoise", "regions")
+    keep = ("model_id", "loras", "positive", "negative", "width", "height", "count", "seed", "sampling", "init_image", "denoise", "regions",
+            "vae", "te", "attention", "workflow")
     form = {k: body.get(k) for k in keep if k in body}
     imagegen.save_form(form)
     model = registry.get(form.get("model_id") or "")
@@ -1813,6 +1815,99 @@ def imagegen_init_image(fname: str):
     if not f:
         raise HTTPException(404)
     return FileResponse(f, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
+
+
+def _stem(name: str) -> str:
+    """A file name as the other tools write it ("SDXL\\foo.safetensors", "foo") -> "foo" for matching."""
+    base = re.split(r"[\\/]", str(name or ""))[-1]
+    return re.sub(r"\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$", "", base, flags=re.I).strip().lower()
+
+
+@app.post("/api/imagegen/pnginfo")
+async def imagegen_pnginfo(request: Request):
+    """「画像から設定を読み込む」: the prompt, model, LoRAs and parameters written in a generated image (the raw
+    file as the body), matched with this PC's files.  The form is not changed here; the page puts them in."""
+    from starlette.concurrency import run_in_threadpool
+    from . import pnginfo
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "画像が空です")
+    if len(data) > 100 * 2**20:
+        raise HTTPException(400, "画像が大きすぎます（100MB まで）")
+    try:
+        info = await run_in_threadpool(pnginfo.read, data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not info:
+        raise HTTPException(400, "この画像には生成の設定が入っていません。SNS に投稿した画像やスクリーンショットでは、設定が消えていることがあります。")
+    # this app's own image whose history entry is still there: its settings exactly as they were typed
+    own = next((e for e in imagegen.history() if e["id"] == info.get("own_entry")), None)
+    if own:
+        s = own["settings"]
+        form = {"model_id": s["model_id"], "loras": s["loras"], "positive": s["positive"], "negative": s["negative"],
+                "width": s["width"], "height": s["height"], "seed": info["seed"] if info["seed"] is not None else s["seed"],
+                "sampling": s.get("sampling_overrides") or {}, "init_image": s.get("init_image"), "denoise": s.get("denoise"),
+                "regions": {"left": s["regions"][0], "right": s["regions"][1]} if s.get("regions") else None,
+                "vae": s.get("vae") or "", "te": s.get("te") or "", "attention": s.get("attention") or "",
+                "workflow": s.get("workflow") or ""}
+        missing = [] if registry.get(s["model_id"]) else ["生成モデルのファイルが見つかりません。モデルを選び直してください。"]
+        return {"source": "LoRAtelier（この画面で生成した画像）", "form": form, "model_file": None, "notes": missing}
+    notes = list(info["notes"])
+    # a ComfyUI image: its workflow is kept, and generation runs it as it is unless the page turns that off
+    workflow = None
+    if info.get("graph"):
+        workflow = imagegen.comfyflow.save(info.pop("graph"), info["source"], imagegen.comfyflow.summary(info))
+        if imagegen.comfyflow._known is None and comfy.running():   # node classes of the ComfyUI here, asked once
+            try:
+                imagegen.comfyflow.remember_nodes(await run_in_threadpool(comfy._get, "/object_info", 30))
+            except (OSError, ValueError):
+                pass
+        miss = imagegen.comfyflow.missing_nodes(imagegen.comfyflow.load(workflow["id"]))
+        workflow["missing_nodes"] = miss
+    scan = await run_in_threadpool(library.scan)
+    form = {"positive": info["positive"], "negative": info["negative"], "seed": info["seed"],
+            "sampling": {k: v for k, v in info["sampling"].items() if k in imagegen.SAMPLING_KEYS}, "regions": None}
+    if info["width"] and info["height"]:
+        form["width"], form["height"] = info["width"], info["height"]
+    model_file = None
+    if info["model_name"]:
+        want = _stem(info["model_name"])
+        reg = next((m for m in registry.list() if not m["missing"] and m["family"] in generate.GEN_FAMILIES
+                    and any(_stem(m["files"].get(k) or "") == want for k in ("gen", "turbo", "ckpt"))), None)
+        if reg:
+            form["model_id"] = reg["id"]
+        elif c := next((c for c in scan["checkpoints"] if _stem(c["path"]) == want and c["family"] in generate.GEN_FAMILIES), None):
+            model_file = c["path"]   # not set up yet: the page chooses it in the model list, which sets it up
+        else:
+            notes.append(f"モデル「{info['model_name']}」はこのパソコンのモデルのフォルダーに見つからなかったので、モデルは今のままです。")
+    # the VAE / CLIP named in the image: from the vae / text_encoders folders; not found: the model's own
+    comp = await run_in_threadpool(library.companion_files)
+    for kind, key, what in (("vae", "vae_name", "VAE"), ("te", "te_name", "CLIP")):
+        form[kind] = ""
+        if info[key]:
+            hit = next((p for p in comp[kind] if _stem(p) == _stem(info[key])), None)
+            if hit:
+                form[kind] = hit
+            else:
+                notes.append(f"{what}「{info[key]}」は {'vae' if kind == 'vae' else 'text_encoders'} のフォルダーに見つからなかったので、"
+                             f"{what} はモデルのものを使います。")
+    form["attention"] = ""
+    if info["attention"]:
+        if imagegen.attention_installed().get(info["attention"], True):
+            form["attention"] = info["attention"]
+        else:
+            notes.append(f"元の画像は {imagegen.ATTENTION_LABEL[info['attention']]} を使っていますが、ComfyUI の環境に入っていないため、"
+                         "アテンションは標準にしました。")
+    loras = []
+    for lo in info["loras"]:
+        hit = next((x for x in scan["loras"] if _stem(x["path"]) == _stem(lo["name"])), None)
+        if hit:
+            loras.append({"path": hit["path"], "strength": lo["strength"]})
+        else:
+            notes.append(f"LoRA「{lo['name']}」（強さ {lo['strength']:g}）は LoRA のフォルダーに見つからなかったので、入れていません。")
+    form["loras"] = loras
+    form["workflow"] = workflow["id"] if workflow and not workflow["missing_nodes"] else ""
+    return {"source": info["source"], "form": form, "model_file": model_file, "notes": notes, "workflow": workflow}
 
 
 @app.post("/api/imagegen/start")

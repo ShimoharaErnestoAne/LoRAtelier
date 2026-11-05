@@ -502,7 +502,7 @@ def _place(st: dict, tmp: Path, name: str, hint: str | None):
     if hint and cls["kind"] == "model":
         for m in registry.list():
             if any(Path(p) == final for p in m["files"].values()) and m.get("auto") and not m.get("variant_confirmed"):
-                if not (hint == "noobai_eps" and m.get("variant") == "noobai_vpred"):
+                if not (hint == "noobai_eps" and m.get("variant") == "noobai_vpred") and                         not (hint == "anima" and m.get("variant") == "anima29"):   # 2.9B is told by its block count
                     registry.update(m["id"], variant=hint, variant_confirmed=True)
     st.update(state="done", message="完了", path=str(final), kind=cls["kind"], dest=cls["dest"],
               dest_label=DEST_LABEL.get(cls["dest"], ""))
