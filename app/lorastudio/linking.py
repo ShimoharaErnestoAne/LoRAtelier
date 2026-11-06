@@ -51,6 +51,36 @@ def same_drive(a: Path, b: Path) -> bool:
     return os.path.splitdrive(os.path.abspath(a))[0].lower() == os.path.splitdrive(os.path.abspath(b))[0].lower()
 
 
+_link_ok: dict[str, bool] = {}
+NO_LINK_MESSAGE = "このドライブ（exFAT・FAT32 など）はハードリンクに対応していません"
+
+
+def links_supported(folder: Path) -> bool:
+    """True when hard links can be made on the drive of folder (NTFS yes; exFAT, FAT32 no).  Tried once per drive
+    with two small files in folder."""
+    folder = Path(folder)
+    drive = os.path.splitdrive(os.path.abspath(folder))[0].lower()
+    if drive in _link_ok:
+        return _link_ok[drive]
+    a = folder / f".lslinktest_{os.getpid()}"
+    b = a.with_name(a.name + "_b")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        a.write_bytes(b"")
+        os.link(a, b)
+        ok = True
+    except OSError:
+        ok = False
+    finally:
+        for f in (b, a):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    _link_ok[drive] = ok
+    return ok
+
+
 def _sha256(p: Path, fresh: bool = False) -> str:
     """fresh: read the file again (the check right before a file is replaced must not trust the cache)."""
     st = p.stat()
@@ -95,12 +125,14 @@ def find_duplicates(progress=None) -> list[dict]:
                     item["status"] = "linked"          # already one file
                 elif _sha256(f) != _sha256(c):
                     continue                           # same size, different contents (all SDXL fp16 files are the same size)
+                elif not same_drive(f, c):
+                    item["status"] = "other_drive"
                 else:
-                    item["status"] = "same" if same_drive(f, c) else "other_drive"
+                    item["status"] = "same" if links_supported(f.parent) else "no_link"
             except OSError as e:
                 item.update(status="error", error=str(e))
             out.append(item)
-            if item["status"] in ("same", "linked", "other_drive"):
+            if item["status"] in ("same", "linked", "other_drive", "no_link"):
                 break
     return out
 
@@ -137,7 +169,10 @@ def link_duplicates(items: list[dict]) -> dict:
             done += 1
             freed += it["size"]
         except OSError as e:
-            errors.append(f"{t.name}: {e}（使用中の可能性があります。学習や生成が終わってからもう一度試してください）")
+            if not links_supported(t.parent):
+                errors.append(f"{t.name}: {NO_LINK_MESSAGE}。そのままにしました")
+            else:
+                errors.append(f"{t.name}: {e}（使用中の可能性があります。学習や生成が終わってからもう一度試してください）")
     return {"linked": done, "freed_bytes": freed, "errors": errors}
 
 
@@ -167,7 +202,8 @@ def start_scan():
 # ---------------------------------------------------------------- exported LoRAs
 def link_export(lora: Path) -> dict | None:
     """Also place an exported LoRA in ComfyUI's models/loras/LoRAStudio/.  Never overwrites; a hard link
-    within one drive, else a symbolic link if Windows allows it, else nothing (no second copy is made)."""
+    within one drive, else a symbolic link if Windows allows it, else nothing (no second copy is made); on a drive
+    without links at all (exFAT, FAT32) a copy."""
     cd = comfy_dir()
     if not cd:
         return None
@@ -179,11 +215,26 @@ def link_export(lora: Path) -> dict | None:
         dest = dest_dir / f"{lora.stem}_{n}{lora.suffix}"
         n += 1
     if same_drive(lora, dest):
-        os.link(lora, dest)
-        return {"path": str(dest), "kind": "hardlink"}
+        try:
+            os.link(lora, dest)
+            return {"path": str(dest), "kind": "hardlink"}
+        except OSError:
+            pass   # a drive without hard links (exFAT, FAT32): a symbolic link is tried as for another drive
     try:
         os.symlink(lora, dest)
         return {"path": str(dest), "kind": "symlink"}
     except OSError:
-        return {"path": None, "kind": "none",
-                "message": "ComfyUI が別のドライブにあり、リンクを作れなかったため、ComfyUI の loras フォルダーには置いていません"}
+        pass
+    if same_drive(lora, dest):
+        # no link of any kind on this drive (exFAT, FAT32): a LoRA is small, so a copy puts it in ComfyUI all the same
+        import shutil
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            shutil.copyfile(lora, tmp)
+            os.replace(tmp, dest)
+            return {"path": str(dest), "kind": "copy"}
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            return {"path": None, "kind": "none", "message": f"ComfyUI の loras フォルダーに置けませんでした: {e}"}
+    return {"path": None, "kind": "none",
+            "message": "ComfyUI が別のドライブにあり、リンクを作れなかったため、ComfyUI の loras フォルダーには置いていません"}

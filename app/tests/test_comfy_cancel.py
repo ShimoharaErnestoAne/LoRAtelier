@@ -170,3 +170,27 @@ def test_a_comparison_image_is_made_again_after_comfyui_hangs(comfy, monkeypatch
     with pytest.raises(RuntimeError, match="拒否"):
         evaluate._run_retrying({"1": {}})
     assert restarts == ["stop", "start"]
+
+
+def test_loras_are_copied_for_comfyui_on_a_drive_without_hard_links(comfy, monkeypatch, tmp_path):
+    """exFAT / FAT32: a LoRA is copied into ComfyUI's folder (once; no restart, same names apart), a model file is
+    read from its own folder as before."""
+    from lorastudio import evaluate
+
+    def no_link(a, b):
+        raise OSError(1, "Incorrect function")
+    monkeypatch.setattr(evaluate.os, "link", no_link)
+    lora = tmp_path / "a" / "x.safetensors"
+    lora.parent.mkdir()
+    lora.write_bytes(b"lora")
+    name = comfy.stage_model("loras", str(lora))
+    dest = evaluate.COMFY_MODELS / "loras" / name
+    assert dest.read_bytes() == b"lora" and "loras" not in comfy.extra_dirs
+    copies = []
+    monkeypatch.setattr(evaluate.shutil, "copyfile", lambda *a: copies.append(a))
+    assert comfy.stage_model("loras", str(lora)) == name and not copies   # not copied again
+    ck = tmp_path / "m" / "model.safetensors"
+    ck.parent.mkdir()
+    ck.write_bytes(b"m")
+    assert comfy.stage_model("checkpoints", str(ck)) == "model.safetensors"
+    assert comfy.extra_dirs["checkpoints"] == {str(ck.parent)}

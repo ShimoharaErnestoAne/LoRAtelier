@@ -3261,7 +3261,7 @@ function drawExport(run, ckpts) {
       $("#x-res").innerHTML = `<div class="note" style="margin-top:8px">書き出しました: <b>${esc(r.file)}</b>
         ${$("#x-dest").value.trim() ? "" : ` <button class="small" data-opendir="loras">loras フォルダーを開く</button>`}
         <br>${r.info.trigger ? `呼び出し語: ${esc(r.info.trigger)} ・ ` : "呼び出し語は要りません ・ "}強さ ${pick.strength} から試してください。
-        ${cl ? (cl.path ? `<br>ComfyUI からは次の名前で使えます（リンクなので容量は増えません）: ${esc(cl.path)}` : `<br><span class="muted">${esc(cl.message || "")}</span>`) : ""}</div>
+        ${cl ? (cl.path ? `<br>ComfyUI からは次の名前で使えます（${cl.kind === "copy" ? "このドライブはリンクを作れないため、コピーして置きました" : "リンクなので容量は増えません"}）: ${esc(cl.path)}` : `<br><span class="muted">${esc(cl.message || "")}</span>`) : ""}</div>
         ${r.leftover_bytes > 0 ? `<div class="note" id="x-discard" style="margin-top:8px">
           <div class="row"><b>学習データ（${fmtSize(r.leftover_bytes)}）を破棄しますか？</b>
             <button id="xd-yes">はい</button><button id="xd-no">いいえ</button></div>
@@ -3726,7 +3726,7 @@ async function drawShare() {
   try { st = await api("/api/comfy_link"); } catch (e) { el.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
   const sc = st.scan || {}, items = sc.items || [];
   const same = items.filter((x) => x.status === "same"), other = items.filter((x) => x.status === "other_drive"),
-    linked = items.filter((x) => x.status === "linked");
+    linked = items.filter((x) => x.status === "linked"), nolink = items.filter((x) => x.status === "no_link");
   const gb = (b) => (b / 1e9).toFixed(1);
   const typed = $("#s-comfy", el), typing = typed && document.activeElement === typed;   // redrawn every 2 s while scanning
   el.innerHTML = `<h2>ComfyUI とファイルを共用</h2>
@@ -3744,7 +3744,8 @@ async function drawShare() {
           <span class="muted small">このツール側のファイルを、ComfyUI のファイルへのハードリンクに置き換えます。ComfyUI 側のファイルは変更しません。</span></div>`
         : `<div class="small">まとめられるファイルはありません。</div>`}
       ${linked.length ? `<div class="small muted" style="margin-top:4px">すでに 1 つにまとまっているもの: ${linked.map((x) => esc(x.tool.split(/[\\/]/).pop())).join("、")}</div>` : ""}
-      ${other.length ? `<div class="small muted" style="margin-top:4px">別のドライブにあるためまとめられないもの: ${other.map((x) => esc(x.tool.split(/[\\/]/).pop())).join("、")}</div>` : ""}</div>` : ""}`;
+      ${other.length ? `<div class="small muted" style="margin-top:4px">別のドライブにあるためまとめられないもの: ${other.map((x) => esc(x.tool.split(/[\\/]/).pop())).join("、")}</div>` : ""}
+      ${nolink.length ? `<div class="small muted" style="margin-top:4px">ドライブがハードリンクに対応していない（exFAT・FAT32 など）ためまとめられないもの: ${nolink.map((x) => esc(x.tool.split(/[\\/]/).pop())).join("、")}。NTFS のドライブなら、まとめられます。</div>` : ""}</div>` : ""}`;
   if (typing) { $("#s-comfy").value = typed.value; $("#s-comfy").focus(); }
   $("#s-comfy-save").onclick = async () => {
     try { await api("/api/comfy_link", { method: "PUT", body: { comfy_dir: $("#s-comfy").value } }); toast("ComfyUI のフォルダーを保存しました"); drawShare(); } catch (e) { fail(e); }

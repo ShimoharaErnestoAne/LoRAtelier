@@ -454,6 +454,15 @@ def build_prompts(kind, outfit_mode, variant, trigger, cls=None, prompt_set=PROM
 
 
 # ======================================================================== ComfyUI server
+def _same_copy(dest: Path, src: Path) -> bool:
+    """dest is a copy of src made by stage_model (same size and modification time)."""
+    try:
+        a, b = dest.stat(), src.stat()
+        return a.st_size == b.st_size and abs(a.st_mtime - b.st_mtime) < 2
+    except OSError:
+        return False
+
+
 def _link_or_copy(src: Path, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -536,9 +545,21 @@ class Comfy:
             dest.parent.mkdir(parents=True, exist_ok=True)
             # a file replaced in place (e.g. downloaded again under the same name) is a new file: link again
             if dest.exists() and not os.path.samefile(dest, src):
+                if kind == "loras" and _same_copy(dest, src):
+                    return os.path.join(sub, src.name)   # the copy made below on a drive without links
                 dest.unlink()
             if not dest.exists():
-                os.link(src, dest)
+                try:
+                    os.link(src, dest)
+                except OSError:
+                    if kind != "loras":
+                        raise
+                    # no hard links on this drive (exFAT, FAT32): a LoRA is small enough to copy, which needs no
+                    # ComfyUI restart and keeps two LoRAs of the same name in different folders apart
+                    tmp = dest.with_name(dest.name + ".part")
+                    shutil.copyfile(src, tmp)
+                    shutil.copystat(src, tmp)
+                    os.replace(tmp, dest)
             return os.path.join(sub, src.name)
         except OSError:
             self.extra_dirs.setdefault(kind, set()).add(str(src.parent))

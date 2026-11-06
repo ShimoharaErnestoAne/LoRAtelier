@@ -75,3 +75,26 @@ def test_export_goes_only_to_its_own_folder_without_overwriting(env):
 def test_not_a_comfyui_folder_is_refused(env):
     with pytest.raises(ValueError):
         env["ln"].set_comfy_dir(str(env["tmp"]))
+
+
+def test_a_drive_without_hard_links_is_not_offered_and_export_still_works(env, tmp_path, monkeypatch):
+    """exFAT / FAT32: no hard links.  Identical files there are listed as not joinable instead of failing when
+    joined, and an exported LoRA is copied into ComfyUI instead of linked."""
+    import os
+    from lorastudio import linking
+
+    def no_link(a, b):
+        raise OSError(1, "Incorrect function")
+    monkeypatch.setattr(linking.os, "link", no_link)
+    linking._link_ok.clear()
+    assert not linking.links_supported(tmp_path / "x")
+    assert not list((tmp_path / "x").iterdir())   # the test files are gone
+    monkeypatch.setattr(linking.os, "symlink", no_link)
+    cd = tmp_path / "ComfyUI"
+    (cd / "models" / "loras").mkdir(parents=True)
+    (cd / "main.py").write_text("")
+    monkeypatch.setattr(linking, "comfy_dir", lambda: cd)
+    lora = tmp_path / "a.safetensors"
+    lora.write_bytes(b"x")
+    r = linking.link_export(lora)   # a copy instead, so the LoRA is in ComfyUI all the same
+    assert r["kind"] == "copy" and Path(r["path"]).read_bytes() == b"x"
