@@ -379,12 +379,14 @@ def _work(entry: dict, sources: dict, token: str | None, st: dict) -> None:
             hit = _comfy_existing([name, *entry.get("aliases", {}).get(key, [])], gb)
             if hit:   # ComfyUI has it: one copy on disk (hard link), or used where it is on another drive
                 from .linking import same_drive
+                files[key] = str(hit)
                 if same_drive(hit, dest):
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    os.link(hit, dest)
-                    files[key] = str(dest)
-                else:
-                    files[key] = str(hit)
+                    try:
+                        os.link(hit, dest)
+                        files[key] = str(dest)
+                    except OSError:
+                        pass   # a drive without hard links (exFAT, FAT32): used where it is, as on another drive
                 st["done_bytes"] += hit.stat().st_size
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
