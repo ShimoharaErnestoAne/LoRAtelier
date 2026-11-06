@@ -7882,11 +7882,46 @@ def save_translations(table: dict[str, str], path: Path | None = None) -> bool:
 INDEX_TRANSLATE_PROMPT = "请将以下文本翻译为日语，直接输出翻译结果，不要进行任何解释。\n\n"
 
 
+# 翻訳専用モデル PLaMo 3 Translate (Preferred Networks、PLaMo Community License: 個人・非商用は登録なしで無料)。
+# 渡し方は配布元の chat_template.jinja が作る PFML3 そのもの (モデルカードも本番では PFML3 を直接組むよう勧めている)。
+# Ollama は GGUF のテンプレートを使わないので /api/generate の raw で渡す。先頭の <|plamo:bos|> はトークナイザーが付ける
+# (GGUF の tokenizer.ggml.add_bos_token = true)。止めるのは <|plamo:tag|> / <|plamo:bos|>、greedy (temperature 0)
+PLAMO_STOP = ["<|plamo:tag|>", "<|plamo:bos|>"]
+# 「訳のモデル」の候補 (取得済みのモデルに加えて出す)。PLaMo は 2B (約 1.7 GB) と 8B (約 5.3 GB)
+TRANSLATE_CHOICES = [
+    "hf.co/IndexTeam/Index-Translate-2B-GGUF:Q4_K_M",
+    "hf.co/pfnet/plamo-3-translate-2b-GGUF:Q4_K_M",
+    "hf.co/pfnet/plamo-3-translate-8b-GGUF:Q4_K_M",
+]
+
+
+def is_plamo_translate(name: str) -> bool:
+    return "plamo" in name.lower() and "translate" in name.lower()
+
+
 def is_translation_model(name: str) -> bool:
-    return "index-translate" in name.lower()
+    """訳すことしかできないモデル (指示に従って JSON で答える用途には使えない)。"""
+    return "index-translate" in name.lower() or is_plamo_translate(name)
+
+
+def plamo_prompt(text: str, lang: str = "ja") -> str:
+    """PFML3 の翻訳依頼 (chat_template.jinja の出力と同じ。原文に予約の <|plamo:...|> があれば崩して渡す)。"""
+    text = text.replace("<|plamo:", "<| plamo:")
+    return ("<|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>" + text
+            + "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>" + lang + "<|plamo:msg|>")
 
 
 def _translate_plain(vlm: "OllamaVLM", text: str, keep_alive: int | str | None) -> str:
+    if is_plamo_translate(vlm.model):
+        req: dict[str, Any] = {
+            "model": vlm.model, "stream": False, "raw": True, "prompt": plamo_prompt(text),
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64 + 40 * (text.count("\n") + 1),
+                        "stop": PLAMO_STOP},
+        }
+        if keep_alive is not None:
+            req["keep_alive"] = keep_alive
+        data = vlm._http("/api/generate", req, abortable=True)
+        return str(data.get("response") or "").strip()
     payload: dict[str, Any] = {
         "model": vlm.model, "stream": False, "think": False,
         "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64 + 40 * (text.count("\n") + 1)},
@@ -9211,7 +9246,7 @@ Flux.1 / SD3、FLUX.2、Krea 2、Qwen-Image、Z-Image Turbo、Z-Image、MOSS-Ima
 ・タガーの出すタグ (一般タグ 8,106 個) と、i2t が足す品質タグ・ネガティブの定番・撮影プリセットの語は、同梱の辞書ですぐに
   日本語になります (Ollama は要りません)。キャラ名は英語のまま表示します
 ・辞書に無い語 (VLM が足した言い回し・自然文など) は、Ollama の「訳のモデル」(「⚙ 設定...」の VLM 欄。
-  既定 hf.co/IndexTeam/Index-Translate-2B-GGUF:Q4_K_M) が訳し、i2t.exe の隣の translations.json に登録します (次からはすぐ出ます)。
+  既定 hf.co/IndexTeam/Index-Translate-2B-GGUF:Q4_K_M。PLaMo 3 Translate の 2B / 8B も選べ、「取得」で Ollama に取得できます) が訳し、i2t.exe の隣の translations.json に登録します (次からはすぐ出ます)。
   Ollama が無いときは、辞書に無い語だけ英語のままです
 ・日本語で見ていても、コピー・保存は英語のままです
 ・辞書も訳のモデルも機械翻訳なので、違っていることがあります。直したいときは translations.json に「"英語": "日本語"」で書くと、
@@ -9885,6 +9920,22 @@ class App:
             return
         self._start_pull(name)
 
+    def pull_translate(self) -> None:
+        """訳のモデル欄のモデルを Ollama に取得する (取得後も VLM 欄は変えない)。"""
+        if self.busy:
+            return
+        name = self.translate_var.get().strip()
+        if not name:
+            return
+        self._collect_settings()
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Ollama ({self.cfg['ollama_host']}) に訳のモデル「{name}」を取得しますか？\n数 GB のダウンロードになることがあります。",
+            parent=self.root,
+        ):
+            return
+        self._start_pull(name, translate=True)
+
     def _check_hf_model(self, text: str) -> None:
         """Hugging Face の URL: 公開 API でファイル一覧を確かめてから (別スレッド)、取得してよいか聞く。"""
         self._collect_settings()
@@ -9919,8 +9970,8 @@ class App:
         self.vlm_var.set(info["name"])
         self._start_pull(info["name"])
 
-    def _start_pull(self, name: str) -> None:
-        """確認済みのモデル名を Ollama に取得する (導入サポートからも呼ばれる)。"""
+    def _start_pull(self, name: str, translate: bool = False) -> None:
+        """確認済みのモデル名を Ollama に取得する (導入サポートからも呼ばれる)。translate: 訳のモデルとして取得する。"""
         cancel = threading.Event()
         if not self._start_busy(f"{name} を取得中...", cancel.set):
             return
@@ -9929,7 +9980,7 @@ class App:
         def worker() -> None:
             try:
                 OllamaVLM(host, name).pull(name, progress=lambda m: self.queue.put(("status", m)), cancel=cancel)
-                self.queue.put(("pulled", name))
+                self.queue.put(("pulled_translate" if translate else "pulled", name))
             except OperationCancelled:
                 self.queue.put(("cancelled", f"{name} の取得を中止しました (もう一度「追加 (pull)」を押すと続きから取得します)"))
             except Exception as e:  # noqa: BLE001
@@ -10667,9 +10718,14 @@ class App:
         self.pull_btn.grid(row=0, column=2, padx=(4, 0), pady=2)
         ttk.Label(v, text="訳のモデル").grid(row=1, column=0, sticky="w", **pad)
         self.translate_var = tk.StringVar(value=str(self.cfg.get("translate_model") or DEFAULT_CONFIG["translate_model"]))
-        self.translate_box = ttk.Combobox(v, textvariable=self.translate_var, values=[self.translate_var.get()], width=36)
+        self.translate_box = ttk.Combobox(v, textvariable=self.translate_var,
+                                          values=dedup([self.translate_var.get()] + TRANSLATE_CHOICES), width=36)
         self.translate_box.grid(row=1, column=1, sticky="we", pady=2)
-        ttk.Label(v, text="結果の日本語訳用", foreground="#666").grid(row=1, column=2, sticky="w", padx=(4, 0))
+        tb = ttk.Frame(v)
+        tb.grid(row=1, column=2, padx=(4, 0), pady=2, sticky="w")
+        self.tr_pull_btn = ttk.Button(tb, text="取得", width=6, command=self.pull_translate)
+        self.tr_pull_btn.pack(side="left")
+        ttk.Label(tb, text="結果の日本語訳用", foreground="#666").pack(side="left", padx=(4, 0))
         ttk.Label(v, text="Ollama URL").grid(row=2, column=0, sticky="w", **pad)
         self.host_var = tk.StringVar(value=self.cfg["ollama_host"])
         ttk.Entry(v, textvariable=self.host_var, width=36).grid(row=2, column=1, sticky="we", pady=2)
@@ -10896,6 +10952,7 @@ class App:
         self.busy = True
         self.run_btn.config(state="disabled")
         self.pull_btn.config(state="disabled")
+        self.tr_pull_btn.config(state="disabled")
         if determinate:
             self.progress.config(mode="determinate", maximum=1.0, value=0.0)
         else:
@@ -10965,7 +11022,7 @@ class App:
                 elif kind == "ollama":
                     models, vision = payload  # vision は絞り込み前なら None
                     self._known_models = models
-                    self.translate_box["values"] = dedup(models + [self.translate_var.get().strip()])  # 文字専用のモデルも選べる
+                    self.translate_box["values"] = dedup(models + [self.translate_var.get().strip()] + TRANSLATE_CHOICES)  # 文字専用のモデルも選べる
                     self.vlm_box["values"] = self._vlm_choices(vision if vision else models)
                     current = self.vlm_var.get().strip()
                     hit = current in models or any(m.startswith(current + ":") for m in models)
@@ -11035,6 +11092,13 @@ class App:
                     self.vlm_var.set(payload)
                     self._save_cfg()
                     self.status_var.set(f"取得完了: {payload}")
+                    self._probe_ollama_async()
+                elif kind == "pulled_translate":
+                    self._finish()
+                    self.cfg["translate_model"] = payload
+                    self.translate_var.set(payload)
+                    self._save_cfg()
+                    self.status_var.set(f"取得完了 (訳のモデル): {payload}")
                     self._probe_ollama_async()
                 elif kind == "hf_checked":
                     self._on_hf_checked(payload)
@@ -11119,6 +11183,7 @@ class App:
         self._vlm_estimate = None
         self.run_btn.config(state="normal" if self._ready() else "disabled")
         self.pull_btn.config(state="normal")
+        self.tr_pull_btn.config(state="normal")
 
     def _show_result(self, result: PromptResult, mosaic_level: str | None = None) -> None:
         """結果を画面に出す。mosaic_level は解析に使ったモザイクの強さ (履歴から開いたとき。無ければ今回の解析の設定)。"""

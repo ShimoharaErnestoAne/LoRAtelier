@@ -442,6 +442,13 @@ function onI2tEvent(m) {
       iStatus("MOSS-Image のキャラ一覧を取得しました");
       if (I.afterDownload) { const f = I.afterDownload; I.afterDownload = null; setTimeout(f, 50); }
     } else if (op === "face_models") iStatus("顔用のモデルを取得しました");
+    else if (op === "pull" && I.pullTranslate === m.value.name) {   // 訳のモデルとして取得: VLM の欄は変えない
+      I.pullTranslate = null;
+      iStatus(`${m.value.name} を取得しました（訳のモデル）`);
+      iSet("translate_model", m.value.name);
+      iProbeOllama();
+      if ($("#s-i2t")) drawI2tSettings();
+    }
     else if (op === "pull") { iStatus(`${m.value.name} を取得しました`); iAfterPull(m.value.name); }
     else if (op === "translate") { iStatus(`日本語に訳しました (${Object.keys(m.value.translated).length} 語)`); iRefreshLabels(); }
     else if (op === "pose_estimate") { iStatus("骨格を推定しました"); if (I.onPose) I.onPose(m.value); }
@@ -676,7 +683,7 @@ async function iProbeOllama(askSetup) {
     iShowOllama();
     if ($("#s-vlm-list")) {
       $("#s-vlm-list").innerHTML = [...new Set([...v.vision, ...(I.cfg.ollama_models || []), I.cfg.ollama_model].filter(Boolean))].map((m) => `<option value="${esc(m)}">`).join("");
-      $("#s-tr-list").innerHTML = [...new Set([...v.models, I.cfg.translate_model].filter(Boolean))].map((m) => `<option value="${esc(m)}">`).join("");
+      $("#s-tr-list").innerHTML = [...new Set([...v.models, I.cfg.translate_model, ...(I.c.translate_choices || [])].filter(Boolean))].map((m) => `<option value="${esc(m)}">`).join("");
     }
   } catch (e) {
     I.ollama = { ok: false, models: [], vision: null, error: e.message };
@@ -776,7 +783,7 @@ async function drawI2tSettings() {
   }
   const f = I.cfg, c = I.c;
   const vlmChoices = [...new Set([...(I.ollama.vision || []), ...(f.ollama_models || []), f.ollama_model].filter(Boolean))];
-  const allModels = [...new Set([...(I.ollama.models || []), f.translate_model].filter(Boolean))];
+  const allModels = [...new Set([...(I.ollama.models || []), f.translate_model, ...(c.translate_choices || [])].filter(Boolean))];
   const chk = (k, label) => `<label class="small" style="display:block"><input type="checkbox" data-sk="${k}" ${f[k] ? "checked" : ""}> ${label}</label>`;
   const num = (k, label) => `<label class="small">${label} <input type="number" step="0.05" min="0.01" max="0.99" data-sn="${k}" value="${f[k]}" style="width:70px"></label>`;
   const panel = (title, body) => `<div class="panel" style="margin-bottom:10px"><h3 style="margin:0 0 6px">${title}</h3>${body}</div>`;
@@ -789,7 +796,7 @@ async function drawI2tSettings() {
     ${panel("VLM (Ollama)", `<div class="row"><label class="small">モデル <input type="text" list="s-vlm-list" id="s-vlm" value="${esc(f.ollama_model)}" style="width:280px"></label><datalist id="s-vlm-list">${vlmChoices.map((m) => `<option value="${esc(m)}">`).join("")}</datalist>
         <button class="small" id="s-pull">追加 (pull)</button><button class="small" id="s-stop" ${I.job ? "" : "hidden"}>■ 中止</button></div>
       <div class="small muted">Ollama のモデル名か、Hugging Face の URL（GGUF のリポジトリ）を入れて「追加 (pull)」で取得します。</div>
-      <div class="row"><label class="small">訳のモデル <input type="text" list="s-tr-list" id="s-tr" value="${esc(f.translate_model)}" style="width:280px"></label><datalist id="s-tr-list">${allModels.map((m) => `<option value="${esc(m)}">`).join("")}</datalist><span class="small muted">結果の日本語訳用</span></div>
+      <div class="row"><label class="small">訳のモデル <input type="text" list="s-tr-list" id="s-tr" value="${esc(f.translate_model)}" style="width:280px"></label><datalist id="s-tr-list">${allModels.map((m) => `<option value="${esc(m)}">`).join("")}</datalist><button class="small" id="s-tr-pull">取得</button><span class="small muted">結果の日本語訳用（PLaMo 3 Translate の 2B・8B も選べます）</span></div>
       <div class="row"><label class="small">Ollama URL <input type="text" id="s-host" value="${esc(f.ollama_host)}" style="width:220px"></label><button class="small" id="s-reconnect">再接続</button><button class="small" id="s-setup">導入...</button></div>`)}
     ${panel("プロンプトの書き方", `${chk("quality_tags", "品質タグ (masterpiece, best quality ...) を先頭に付ける")}
       ${chk("use_break", "複数人物は BREAK で人物ごとに区切る (SDXL 系。Regional Prompter などで使う)")}
@@ -815,6 +822,12 @@ async function drawI2tSettings() {
   });
   $("#s-vlm").onchange = (e) => iSet("ollama_model", e.target.value.trim());
   $("#s-tr").onchange = (e) => iSet("translate_model", e.target.value.trim());
+  $("#s-tr-pull").onclick = () => {
+    const name = $("#s-tr").value.trim();
+    if (!name) return;
+    iConfirm("訳のモデルを取得します", `${name} を Ollama に取得します（ollama pull）。数 GB のダウンロードになることがあります。中止しても、次回は続きから取得します。`, "取得する",
+      () => { I.pullTranslate = name; iStartJob("pull", { name, host: I.cfg.ollama_host }, `${name} を取得中...`); });
+  };
   $("#s-host").onchange = (e) => { let h = e.target.value.trim(); if (h && !/^https?:\/\//.test(h)) h = "http://" + h; iSet("ollama_host", h.replace(/\/+$/, "")); e.target.value = I.cfg.ollama_host; };
   $("#s-pull").onclick = () => iPull($("#s-vlm").value);
   $("#s-stop").onclick = iCancel;

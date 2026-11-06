@@ -61,6 +61,7 @@ FastAPI (MIT), Uvicorn (BSD-3), Pillow (MIT-CMU), NumPy (BSD-3)。依存一覧�
 | Z-Image Turbo / Base（Comfy-Org/z_image_turbo、Comfy-Org/z_image、Tongyi-MAI/Z-Image のトークナイザー） | Apache-2.0 |
 | Z-Image Turbo 学習アダプター（ostris/zimage_turbo_training_adapter） | Apache-2.0 |
 | MOSS-Image SFT / Base、Qwen3.5-9B テキストエンコーダー、FLUX.2 small decoder VAE（Comfy-Org/MOSS-Image、OpenMOSS-Team/MOSS-Image-Base のトークナイザー） | Apache-2.0（VAE は Apache-2.0 の small decoder 版を使います。FLUX.2-dev の flux2-vae.safetensors は非商用ライセンスのため取得しません） |
+| PLaMo 3 Translate 2B / 8B（pfnet/plamo-3-translate-2b-GGUF・8b-GGUF。「画像からプロンプト」の訳のモデルとして選んだときだけ Ollama に取得） | PLaMo Community License（個人・非商用は登録なしで無料。商用は Preferred Networks への登録または契約が必要） |
 | Krea 2 RAW / Turbo（積み残し・未対応） | Krea 2 Community License（Hugging Face でログインと同意が必要） |
 
 作った LoRA の利用・配布は、ベースモデルのライセンスと学習素材の権利の両方に従ってください。

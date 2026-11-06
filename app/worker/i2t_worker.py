@@ -108,7 +108,7 @@ def texts(result: dict) -> dict:
 def consts() -> dict:
     m = i2t
     return {
-        "version": m.__version__, "app_name": m.APP_NAME,
+        "version": m.__version__, "app_name": m.APP_NAME, "translate_choices": m.TRANSLATE_CHOICES,
         "engines": m.ENGINES, "targets": m.TARGETS, "modes": m.MODES, "ref_slots": m.REF_SLOTS, "ref_what_ja": m.REF_WHAT_JA,
         "tagger_models": {k: {"repo": v[0], "label": v[1], "ready": m.tagger_ready(k)} for k, v in m.TAGGER_MODELS.items()},
         "mosaic_levels": {k: {kk: vv for kk, vv in v.items() if isinstance(vv, (str, int, float, bool))} for k, v in m.MOSAIC_LEVELS.items()},
