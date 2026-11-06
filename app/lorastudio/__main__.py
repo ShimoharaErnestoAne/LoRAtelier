@@ -59,8 +59,28 @@ def _quiet_proactor_close():
     proactor_events._ProactorBasePipeTransport._call_connection_lost = call_connection_lost
 
 
+def _no_quick_edit():
+    """Windows: a click in this console window starts a text selection ("選択" in its title), and while it lasts every
+    write to the window waits, which stops the server's whole event loop (the screen stops updating, a comparison looks
+    stuck) until Enter or Esc is pressed.  Selecting text is turned off for this window; right-click menus still work."""
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)   # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if h and k32.GetConsoleMode(h, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+            k32.SetConsoleMode(h, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
+
+
 def main():
     _quiet_proactor_close()
+    _no_quick_edit()
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--port", type=int, default=config.PORT)

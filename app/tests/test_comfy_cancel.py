@@ -146,3 +146,27 @@ def test_a_slow_answer_from_comfyui_does_not_fail_the_image(comfy, monkeypatch):
     monkeypatch.setattr(comfy, "running", lambda: False)
     with pytest.raises(RuntimeError, match="終了しました"):
         comfy.run_prompt({"1": {}})
+
+
+def test_a_comparison_image_is_made_again_after_comfyui_hangs(comfy, monkeypatch):
+    """ComfyUI that hung or ended on one image is started again and that image made once more; a graph ComfyUI
+    rejects is not tried again."""
+    from lorastudio import evaluate
+    calls, restarts = [], []
+    answers = [RuntimeError("生成がタイムアウトしました（1 枚に 15 分以上かかりました）"), [{"filename": "a.png"}]]
+
+    def run_prompt(g, timeout=900, on_progress=None):
+        calls.append(g)
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+    monkeypatch.setattr(comfy, "run_prompt", run_prompt)
+    monkeypatch.setattr(comfy, "stop", lambda: restarts.append("stop"))
+    monkeypatch.setattr(comfy, "ensure_started", lambda attention="": restarts.append("start"))
+    assert evaluate._run_retrying({"1": {}})[0]["filename"] == "a.png"
+    assert len(calls) == 2 and restarts == ["stop", "start"]
+    answers[:] = [RuntimeError("ComfyUI がワークフローを拒否しました: x")]
+    with pytest.raises(RuntimeError, match="拒否"):
+        evaluate._run_retrying({"1": {}})
+    assert restarts == ["stop", "start"]

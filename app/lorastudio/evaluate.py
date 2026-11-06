@@ -1416,6 +1416,25 @@ def _start_quietly():
         pass
 
 
+def comfy_stuck(exc: Exception) -> bool:
+    """ComfyUI itself is the cause (it hung, ended, or did not answer), not the graph or a file."""
+    s = str(exc)
+    return isinstance(exc, OSError) or any(w in s for w in ("タイムアウト", "応答しません", "ComfyUI が終了"))
+
+
+def _run_retrying(graph: dict) -> list[dict]:
+    """One comparison image.  When ComfyUI hangs or ends partway through a long comparison (seen on another PC at the
+    27th image), it is started again and the image is made once more; the images made before stay."""
+    try:
+        return comfy.run_prompt(graph)
+    except Exception as e:
+        if not comfy_stuck(e):
+            raise
+    comfy.stop()
+    comfy.ensure_started()
+    return comfy.run_prompt(graph)
+
+
 def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, model, fam, out_dir, em, lora_names, worker,
                      extras=(), notes=()):
     t_begin = time.time()
@@ -1445,7 +1464,7 @@ def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, mod
                 for seed in spec["seeds"]:
                     prefix = f"lorastudio_{project.id[:20]}_r{run_id}_e{eval_id}"
                     g = graph_for(m, lora, strength, text, neg, seed + pi, spec["width"], spec["height"], prefix, mem)
-                    imgs = comfy.run_prompt(g)
+                    imgs = _run_retrying(g)
                     src = config.DATA_DIR / "comfy_output" / imgs[0].get("subfolder", "") / imgs[0]["filename"]
                     name = f"p{pi}_s{seed}_{ck}_{strength:.2f}" + (f"_m{j}" if mid else "") + ".png"
                     shutil.move(str(src), out_dir / name)
