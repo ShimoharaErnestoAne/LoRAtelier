@@ -123,3 +123,26 @@ def test_image_to_image_graph_and_source_files(comfy, monkeypatch, tmp_path):
     assert imagegen.init_file(r["name"])          # still used by b
     imagegen.delete("b")
     assert not imagegen.init_file(r["name"])
+
+
+def test_a_slow_answer_from_comfyui_does_not_fail_the_image(comfy, monkeypatch):
+    """A look at the history that is not answered in time (a slow PC loading the model) is tried again while
+    ComfyUI lives; the run fails only when ComfyUI has ended."""
+    import socket
+    import urllib.error
+    fake = FakeComfy("done")
+    misses = [TimeoutError("timed out"), urllib.error.URLError(socket.timeout("timed out"))]
+    get = fake.get
+
+    def slow_get(path, timeout=10):
+        if path.startswith("/history/") and misses:
+            raise misses.pop(0)
+        return get(path, timeout)
+    monkeypatch.setattr(comfy, "_get", slow_get)
+    monkeypatch.setattr(comfy, "_post", fake.post)
+    monkeypatch.setattr(comfy, "running", lambda: True)
+    assert comfy.run_prompt({"1": {}})[0]["filename"] == "a.png" and not misses
+    misses.append(TimeoutError("timed out"))
+    monkeypatch.setattr(comfy, "running", lambda: False)
+    with pytest.raises(RuntimeError, match="終了しました"):
+        comfy.run_prompt({"1": {}})

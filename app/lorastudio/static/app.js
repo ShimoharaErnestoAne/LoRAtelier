@@ -3230,15 +3230,30 @@ async function drawExtraModels(el, family, ownId, count = () => {}) {
 
 function drawExport(run, ckpts) {
   const el = $("#r-export");
-  const pick = S.picked;
-  const ck = pick ? ckpts.find((c) => (c.step ?? "final") + "" === pick.ckpt + "") : null;
+  let pick = S.picked;
+  let ck = pick ? ckpts.find((c) => (c.step ?? "final") + "" === pick.ckpt + "") : null;
+  // no comparison to pick from (it failed or was never made): the saved LoRA can still be chosen here
+  const direct = !ck && ckpts.length && !$("#r-cmp [data-pick]");
+  if (direct) {
+    const last = ckpts.find((c) => c.step == null) || ckpts[ckpts.length - 1];
+    pick = { ckpt: last.step ?? "final", strength: 1 };
+    ck = last;
+  }
   el.innerHTML = `<h2>書き出し（生成で使う LoRA）</h2>
-    ${ck ? `<div>選択中: <b>${ckLabel(pick.ckpt)}</b>・強さ ${pick.strength}</div>` : `<div class="muted">上の比較表で「これを選ぶ」を選んでください。</div>`}
+    ${direct ? `<div class="row small">比較画像がないため、ここで選んで書き出せます。保存した時点
+        <select id="x-ck">${ckpts.map((c) => `<option value="${c.step ?? "final"}" ${c === ck ? "selected" : ""}>${ckLabel(c.step ?? "final")}</option>`).join("")}</select>
+        記録する強さ <input type="number" id="x-st" value="1" step="0.05" min="0" max="2" style="width:70px"></div>`
+      : ck ? `<div>選択中: <b>${ckLabel(pick.ckpt)}</b>・強さ ${pick.strength}</div>` : `<div class="muted">上の比較表で「これを選ぶ」を選んでください。</div>`}
     <div class="row small" style="margin-top:6px">保存先 <input type="text" id="x-dest" style="flex:1;min-width:240px" placeholder="空欄なら models\\loras の中に、LoRA の名前のフォルダーを作って保存します"></div>
     <div class="row" style="margin-top:8px"><button class="primary" id="x-go" ${ck ? "" : "disabled"}>書き出す</button>
       <span class="muted small">LoRA 本体・使い方・学習条件を保存します。学習画像は含めません。既存ファイルは上書きせず版を分けます。</span></div>
     <div id="x-res"></div>`;
   if (ck) $("#x-go").onclick = async () => {
+    if (direct) {
+      const v = $("#x-ck").value;
+      ck = ckpts.find((c) => (c.step ?? "final") + "" === v) || ck;
+      pick = { ckpt: v, strength: Math.max(0, +$("#x-st").value || 1) };
+    }
     const b = $("#x-go"); b.disabled = true; b.textContent = "書き出し中…";
     try {
       const r = await api(`/api/projects/${S.project.id}/runs/${run.id}/export`, { body: { ckpt_path: ck.path, strength: pick.strength, dest: $("#x-dest").value } });

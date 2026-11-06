@@ -26,7 +26,41 @@ def _probe(port: int, timeout: float = 3) -> str:
         return "other"
 
 
+def _quiet_proactor_close():
+    """Windows: asyncio's Proactor prints "OSError: [WinError 10022]" (or 10054) when a connection the browser already
+    closed is shut down again.  Nothing is lost (the connection is gone either way), but the traceback in the window
+    reads like a failure, so that one shutdown error is ignored."""
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        from asyncio import proactor_events
+    except ImportError:
+        return
+    orig = proactor_events._ProactorBasePipeTransport._call_connection_lost
+
+    def call_connection_lost(self, exc):
+        try:
+            orig(self, exc)
+        except OSError as e:
+            if getattr(e, "winerror", None) not in (10022, 10054, 10057) or self._sock is None:
+                raise
+            # the rest of what the original does after shutdown(): close the socket and detach from the server
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+            server = self._server
+            if server is not None:
+                server._detach()
+                self._server = None
+            self._called_connection_lost = True
+    proactor_events._ProactorBasePipeTransport._call_connection_lost = call_connection_lost
+
+
 def main():
+    _quiet_proactor_close()
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--port", type=int, default=config.PORT)

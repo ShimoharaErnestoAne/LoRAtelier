@@ -703,7 +703,7 @@ class Comfy:
     def after_failure(self, exc: Exception):
         """A job failed.  ComfyUI is started again only when it is the cause (no answer, ended, timed out);
         a rejected graph, a missing file or an unfitting LoRA keeps the process (its start-up is 10-30 s)."""
-        if isinstance(exc, OSError) or "タイムアウト" in str(exc) or not self.running():
+        if isinstance(exc, OSError) or "タイムアウト" in str(exc) or "応答しません" in str(exc) or not self.running():
             self.stop()
         else:
             self.park()
@@ -774,7 +774,12 @@ class Comfy:
                 sock.close()
 
     def _run_prompt(self, graph: dict, client: str, timeout, sock, cancels: int | None = None) -> list[dict]:
-        res = self._post("/prompt", {"prompt": graph, "client_id": client})
+        # a slow PC (a model read from an HDD, memory swapped out) can leave ComfyUI's server unanswered for a while:
+        # one look that is not answered in time is not a failure while the process lives (the whole run has `timeout`)
+        try:
+            res = self._post("/prompt", {"prompt": graph, "client_id": client}, timeout=180)
+        except (TimeoutError, socket.timeout):
+            raise RuntimeError("ComfyUI が 3 分間応答しませんでした（PC の負荷が高いか、メモリーが足りない可能性があります）") from None
         if "error" in res:
             raise RuntimeError(f"ComfyUI がワークフローを拒否しました: {json.dumps(res)[:400]}")
         pid = res["prompt_id"]
@@ -784,7 +789,15 @@ class Comfy:
         t0 = time.time()
         interrupted = False
         while time.time() - t0 < timeout:
-            h = self._get(f"/history/{pid}")
+            try:
+                h = self._get(f"/history/{pid}", timeout=30)
+            except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError) as e:
+                if not self.running():
+                    raise RuntimeError("生成の途中で ComfyUI が終了しました（data/comfyui.log を確認してください）") from None
+                if isinstance(e, urllib.error.URLError) and not isinstance(e.reason, (TimeoutError, socket.timeout, ConnectionError)):
+                    raise
+                time.sleep(1)
+                continue
             if pid not in h and cancels is not None and self._cancels != cancels and not interrupted:
                 try:
                     if self._stop_prompt(pid):
@@ -813,7 +826,7 @@ class Comfy:
                 sock.done.wait(0.5)
             else:
                 time.sleep(0.15)
-        raise RuntimeError("生成がタイムアウトしました")
+        raise RuntimeError(f"生成がタイムアウトしました（1 枚に {int(timeout // 60)} 分以上かかりました）")
 
     def lora_warnings(self, since_bytes: int) -> list[str]:
         p = config.DATA_DIR / "comfyui.log"
