@@ -13,6 +13,7 @@
 !/start.bat
 !/start_intranet.bat
 !/engines.lock.json
+!/更新履歴.md
 
 /engines/*
 !/engines/i2t/
