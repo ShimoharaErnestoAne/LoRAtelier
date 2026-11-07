@@ -5176,10 +5176,14 @@ async function igReload() {
 const igReloadSoon = debounce(igReload, 300);
 
 function igSettingsText(s) {
-  if (s.workflow) return `workflow のまま（${s.workflow_source}${s.workflow_summary ? `・${s.workflow_summary}` : ""}）${s.width ? ` ／ ${s.width}×${s.height}` : ""} ／ seed ${s.seed}`;
+  // the attention used, and (not with a workflow: it has its own) the VAE / CLIP, the model's own when none chosen
+  const attn = `アテンション: ${s.attention ? (IG_ATTN.find(([v]) => v === s.attention) || [, s.attention])[1] : "標準"}`;
+  if (s.workflow) return `workflow のまま（${s.workflow_source}${s.workflow_summary ? `・${s.workflow_summary}` : ""}）${s.width ? ` ／ ${s.width}×${s.height}` : ""} ／ seed ${s.seed} ／ ${attn}`;
   const lo = s.loras.length ? s.loras.map((l) => `${l.path.split(/[\\/]/).pop()}（${l.strength}）`).join("、") : "なし";
+  const file = (p) => p ? p.split(/[\\/]/).pop() : "モデルのもの";
   return `${s.model_name} ／ LoRA: ${lo} ／ ${s.width}×${s.height} ／ seed ${s.seed} ／ ${s.sampling.steps} steps・CFG ${s.sampling.cfg}・${s.sampling.sampler}・${s.sampling.scheduler}${s.sampling.rescale === "on" ? "・白飛び抑制" : ""}${s.regions ? ` ／ 左: ${s.regions[0] || "なし"}・右: ${s.regions[1] || "なし"}` : ""}`
-    + (s.edit ? " ／ 元画像を指示で編集" : s.init_image ? ` ／ 元画像から（変化の強さ ${s.denoise}）` : "");
+    + (s.edit ? " ／ 元画像を指示で編集" : s.init_image ? ` ／ 元画像から（変化の強さ ${s.denoise}）` : "")
+    + ` ／ VAE: ${file(s.vae)} ／ CLIP（テキストエンコーダー）: ${file(s.te)} ／ ${attn}`;
 }
 
 /* The settings of a result as text to paste for someone else: the prompt as sent (with the LoRAs' trigger words). */
