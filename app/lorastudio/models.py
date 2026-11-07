@@ -628,8 +628,15 @@ def companion_fit(family: str, kind: str, hdr: dict) -> bool | None:
     hdr = {k: v for k, v in hdr.items() if k != "__metadata__"}
     if kind == "vae":
         if "decoder.middle.0.residual.0.gamma" not in hdr:
-            # a Diffusers / Flux / SD layout VAE (decoder.conv_in) is not these families'; anything else: unknown
-            return False if family in ("qwen_image21", "qwen_image", "anima", "krea2") and "decoder.conv_in.weight" in hdr else None
+            # a Diffusers / Flux / SD layout VAE (decoder.conv_in): the latent channels it decodes (its input
+            # channels) say which models it is for: 4 SD / SDXL, 16 Flux.1 ae (Z-Image), 32 Flux.2 (MOSS-Image)
+            conv = (hdr.get("decoder.conv_in.weight") or {}).get("shape") or []
+            if family in ("qwen_image21", "qwen_image", "anima", "krea2"):
+                return False if conv else None
+            want = {"sdxl": 4, "zimage": 16, "moss_image": 32}.get(family)
+            return None if want is None or len(conv) != 4 else conv[1] == want
+        if family in ("sdxl", "zimage", "moss_image"):   # the Wan / Qwen-Image layout is none of these
+            return False
         wan22 = "decoder.upsamples.0.upsamples.0.residual.2.weight" in hdr
         head = (hdr.get("decoder.head.2.weight") or {}).get("shape") or []
         q21 = wan22 and len(head) == 5 and head[2] == 1
@@ -638,13 +645,24 @@ def companion_fit(family: str, kind: str, hdr: dict) -> bool | None:
         if family in ("qwen_image", "anima", "krea2"):
             return not wan22
         return None
-    if kind == "te" and family in ("qwen_image21", "qwen_image"):
-        if any("linear_attn" in k for k in hdr):   # Qwen3.5 (MOSS-Image)
-            return False
+    if kind == "te":
+        qwen35 = any("linear_attn" in k for k in hdr)   # Qwen3.5 (MOSS-Image)
         emb = next(((v.get("shape") or []) for k, v in hdr.items() if k.endswith("embed_tokens.weight")), [])
+        if family == "moss_image":
+            return True if qwen35 else (False if len(emb) == 2 else None)
+        if qwen35:
+            return False if family in ("qwen_image21", "qwen_image", "anima", "krea2", "zimage") else None
         if len(emb) != 2:
             return None
-        return emb[1] == (4096 if family == "qwen_image21" else 3584)   # Qwen3-VL 8B / Qwen2.5-VL 7B
+        # the width of the Qwen model: Qwen3-VL 8B / Qwen2.5-VL 7B / Qwen3 0.6B (Anima); 2560 is Qwen3 4B (Z-Image)
+        # and Qwen3-VL 4B (Krea 2), told apart by the vision tower the VL files carry
+        if family in ("qwen_image21", "qwen_image", "anima"):
+            return emb[1] == {"qwen_image21": 4096, "qwen_image": 3584, "anima": 1024}[family]
+        if family in ("zimage", "krea2"):
+            if emb[1] != 2560:
+                return False
+            vision = any(k.startswith(("visual.", "model.visual.")) for k in hdr)
+            return (not vision) if family == "zimage" else (True if vision else None)
     return None
 # DiT-only families: the model file, a text encoder and a VAE (see COMPANIONS)
 DIT_FAMILIES = ("anima", "qwen_image", "qwen_image21", "krea2", "zimage", "moss_image")

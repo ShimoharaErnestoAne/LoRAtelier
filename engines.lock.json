@@ -34,6 +34,15 @@
       "env": "comfy",
       "used_for": "MOSS-Image の編集用 LoRA（chinoll Moss-Image-Edit、akhaliq MOSS-Image-Edit-HQ）で、元画像をプロンプトの指示どおりに編集する。この ComfyUI（10-18）には MOSS の参照画像の仕組みがないため、このパックが ComfyUI のモデルに足す"
     },
+    "rgthree-comfy": {
+      "url": "https://github.com/rgthree/rgthree-comfy.git",
+      "commit": "d7297b42f0fa78bec1c0411478f887423c249502",
+      "license": "MIT (ComfyUI custom node in its own process; fetched with git, not bundled)",
+      "optional": true,
+      "path": "engines/ComfyUI/custom_nodes/rgthree-comfy",
+      "env": "comfy",
+      "used_for": "画像から読み込んだ workflow の rgthree のノード（SDXL Empty Latent Image など）を、そのまま使う。この ComfyUI（10-18）より前の 10-06 の版。pip の追加パッケージはなし"
+    },
     "ComfyUI-GGUF": {
       "url": "https://github.com/leejet/ComfyUI-GGUF.git",
       "commit": "edd981b10e107d3b8f58e16c498f2d08f631bc47",

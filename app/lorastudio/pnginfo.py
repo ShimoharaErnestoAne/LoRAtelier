@@ -139,7 +139,7 @@ def _comfy_texts(graph: dict, ref: Any, side: str, depth: int = 0) -> list[str]:
     if depth > 20 or not (isinstance(ref, list) and ref):
         return []
     node = graph.get(str(ref[0]))
-    if not isinstance(node, dict):
+    if not isinstance(node, dict) or node.get("class_type") == "ConditioningZeroOut":   # no text: the zeroed one is not it
         return []
     inputs = node.get("inputs") or {}
     texts: list[str] = []

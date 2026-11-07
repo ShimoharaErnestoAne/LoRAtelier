@@ -126,6 +126,7 @@ def install_engine(name: str) -> None:
 
 PPM = "ComfyUI-ppm"
 MOSS_EDIT = "ComfyUI-Moss-Image-Edit-Native"   # MOSS-Image edit LoRAs (instruction editing from a source image)
+RGTHREE = "rgthree-comfy"   # rgthree's nodes in workflows read from images (SDXL Empty Latent Image ...)
 BUNDLE_MARK = ".lorastudio_commit"   # in a copy made without git: the commit the files are from
 _tried: set[str] = set()
 

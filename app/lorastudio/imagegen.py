@@ -599,13 +599,14 @@ def _run_workflow(eid: str, s: dict):
             raise RuntimeError("読み込んだ workflow が見つかりません")
         graph = comfyflow.apply_prompts(graph, s["positive"], s["negative"])
         graph, notes, wf_model = comfyflow.resolve_files(graph, comfyflow.local_files(), comfy.stage_model, registry.list())
-        graph, more = comfyflow.substitute(graph, (wf_model or {}).get("family"))
+        comfy.ensure_started(s.get("attention") or "")
+        _kept = True
+        info = comfy._get("/object_info", timeout=60)   # which nodes make the empty image (substitute)
+        graph, more = comfyflow.substitute(graph, (wf_model or {}).get("family"), info)
         graph = comfyflow.apply_size(graph, s.get("width"), s.get("height"))
         if notes + more:
             _update(eid, warnings=notes + more)
-        comfy.ensure_started(s.get("attention") or "")
-        _kept = True
-        errors = comfyflow.check(graph, comfy._get("/object_info", timeout=60))
+        errors = comfyflow.check(graph, info)
         if errors:
             raise RuntimeError(" ".join(errors))
         _update(eid, message="生成中")

@@ -280,6 +280,35 @@ def test_workflow_prompt_seed_and_outputs():
     assert g["11"]["class_type"] == "PreviewImage"
 
 
+def test_workflow_blank_negative_takes_the_page_negative_and_cfg_is_read():
+    """An SDXL workflow whose negative was left blank: the negative typed on the page goes in its text node
+    (it used to say there was nowhere to write it).  The CFG of the workflow decides the CFG 1 note."""
+    from lorastudio import comfyflow, pnginfo
+    g = _hires_graph()
+    g["4"]["inputs"]["text"] = ""
+    assert comfyflow.apply_prompts(g, "1girl, smile", "") == g
+    g2 = comfyflow.apply_prompts(g, "1girl, smile", "lowres, bad hands")
+    assert g2["4"]["inputs"]["text"] == "lowres, bad hands" and g2["3"]["inputs"]["text"] == "1girl, smile"
+    # CLIPTextEncodeSDXL with text in text_g only: text_l stays blank when the prompt changes
+    g3 = dict(g, **{"3": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text_g": "1girl", "text_l": "", "clip": ["2", 1]}}})
+    g4 = comfyflow.apply_prompts(g3, "2girls", "")
+    assert g4["3"]["inputs"] == {"text_g": "2girls", "text_l": "", "clip": ["2", 1]}
+    # a negative that is the positive zeroed (ConditioningZeroOut): not read as the prompt, and not written into it
+    g5 = dict(g, **{"12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["3", 0]}}})
+    g5["7"] = {**g5["7"], "inputs": {**g5["7"]["inputs"], "negative": ["12", 0]}}
+    g5["9"] = {**g5["9"], "inputs": {**g5["9"]["inputs"], "negative": ["12", 0]}}
+    assert comfyflow.text_slots(g5, "negative") == []
+    assert pnginfo.parse_comfy(json.dumps(g5))["negative"] == ""
+    assert comfyflow.apply_prompts(g5, "1girl, smile", "") == g5
+    assert comfyflow.apply_prompts(g5, "1girl, smile", "lowres") == g5   # generated without it, never stopped
+    assert comfyflow.has_negative(g5) is False and comfyflow.has_negative(g) is True
+    assert comfyflow.cfg_of(g) == 5.0
+    g6 = dict(g, **{"14": {"class_type": "PrimitiveFloat", "inputs": {"value": 1.0}}})
+    g6["7"] = {**g6["7"], "inputs": {**g6["7"]["inputs"], "cfg": ["14", 0]}}
+    assert comfyflow.cfg_of(g6) == 1.0
+    assert comfyflow.cfg_of({"1": {"class_type": "VAEDecode", "inputs": {}}}) is None
+
+
 def test_workflow_files_and_check():
     from lorastudio import comfyflow
     files = {"checkpoints": ["D:/models/animagine-xl-3.1.safetensors"], "loras": [], "vae": [], "text_encoders": [], "diffusion_models": []}
@@ -301,7 +330,7 @@ def test_endpoint_keeps_workflow_and_submit_runs_it(client, monkeypatch):
     from lorastudio import comfyflow, evaluate, imagegen
     j = cl.post("/api/imagegen/pnginfo", content=_png(prompt=json.dumps(_hires_graph()))).json()
     wid = j["workflow"]["id"]
-    assert j["form"]["workflow"] == wid and j["workflow"]["nodes"] == 11 and "animagine" in j["workflow"]["summary"]
+    assert j["form"]["workflow"] == j["form"]["workflow_offer"] == wid and j["workflow"]["nodes"] == 11 and "animagine" in j["workflow"]["summary"]
     assert j["form"]["seed"] == 4242 and j["form"]["model_id"] == model["id"]     # the form is filled too (turn workflow off)
     st = cl.put("/api/imagegen/form", json={**j["form"], "count": 2}).json()
     assert st["check"] == []
@@ -372,13 +401,25 @@ def test_moss_workflow_takes_this_pcs_files_rgthree_size_and_page_size(tmp_path)
     assert g["4"]["inputs"]["lora_name"] == "lsg/moss_image_8steps_dmd2.safetensors"
     assert len(notes) == 3 and "qwen3.5_9b_bf16.safetensors" in notes[0]
     assert comfyflow.latent_size(g) == (896, 1152)
-    g, more = comfyflow.substitute(g, "moss_image")
-    assert g["5"] == {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": 896, "height": 1152, "batch_size": 1}}
-    assert (g["8"]["inputs"]["width"], g["8"]["inputs"]["height"]) == (1792, 2304) and more
+    # the empty image is found by what the node does (ComfyUI's /object_info), not by its name: its LATENT goes to
+    # the model's own empty-image node of the same size; its size outputs stay its own
+    info = {"SDXL Empty Latent Image (rgthree)": {"input": {"required": {"dimensions": [[" 896 x 1152  (portrait)"]], "clip_scale": ["FLOAT"],
+                                                                         "batch_size": ["INT"]}}, "output": ["LATENT", "INT", "INT"]},
+            "LoraLoaderModelOnly": {"input": {"required": {"model": ["MODEL"], "lora_name": [["x"]]}}, "output": ["MODEL"]}}
+    g, more = comfyflow.substitute(g, "moss_image", info)
+    assert g["5_latent"] == {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": 896, "height": 1152, "batch_size": 1}}
+    assert g["7"]["inputs"]["latent_image"] == ["5_latent", 0] and g["8"]["inputs"]["width"] == ["5", 1] and "5" in g and more
+    assert comfyflow.substitute(g, None, info)[0] == g                                # model not known: as it is
     g = comfyflow.apply_size(g, 1024, 768)
-    assert (g["5"]["inputs"]["width"], g["5"]["inputs"]["height"]) == (1024, 768)
-    assert comfyflow.missing_nodes(_moss_graph(), {n["class_type"] for n in _moss_graph().values()} - {"SDXL Empty Latent Image (rgthree)"}
-                                   | {"EmptyLatentImage"}) == []
+    assert (g["5_latent"]["inputs"]["width"], g["5_latent"]["inputs"]["height"]) == (1024, 768)
+    # only its image used: the node goes, so it is not missing even where it is not installed
+    g2 = _moss_graph()
+    del g2["8"]
+    g2, _ = comfyflow.substitute(g2, "moss_image")
+    assert "5" not in g2 and g2["7"]["inputs"]["latent_image"] == ["5_latent", 0]
+    known = {n["class_type"] for n in _moss_graph().values()} - {"SDXL Empty Latent Image (rgthree)"}
+    assert comfyflow.missing_nodes({k: v for k, v in _moss_graph().items() if k != "8"}, known) == []
+    assert comfyflow.missing_nodes(_moss_graph(), known) == ["SDXL Empty Latent Image (rgthree)"]   # its sizes are used
     r = pnginfo.read(_png(prompt=json.dumps(_moss_graph())))
     assert (r["width"], r["height"]) == (896, 1152)
     # only the SFT 8-step DMD here (another LoRA): the workflow's DMD2 is not swapped for it

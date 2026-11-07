@@ -209,6 +209,40 @@ def _write_error(folder: Path) -> str | None:
     return err
 
 
+_detect_cache: dict[str, dict] = {}
+
+
+def model_train_errors(model: dict) -> list[str]:
+    """What stops training with this registered model, whatever the project: its kind, missing files, files the
+    training engine needs (bf16, not fp8 / GGUF ...).  preflight blocks on these; the model lists show them."""
+    from .models import GEN_ONLY, UNAVAILABLE_NOTE, VARIANTS, detect, trainable
+    errors = []
+    if not model.get("variant") or model["variant"] not in VARIANTS:
+        return ["モデルの系統が未確認です。設定画面で選んでください。"]
+    fam = model["family"]
+    need = [k for k in model["missing"] if k not in GEN_ONLY.get(fam, ())]
+    if need:
+        errors += missing_file_messages(model, need)
+    if not trainable(model["variant"]):
+        errors.append(UNAVAILABLE_NOTE.get(model["variant"], "このモデル系列は現在対応していません。"))
+    errors += _family_file_errors(model)
+    if not need and model["files"].get("ckpt"):
+        ck = Path(model["files"]["ckpt"])
+        try:   # header only: cheap even for multi-GB files; kept by size and time for the model lists
+            st = ck.stat()
+            key = f"{ck}|{st.st_size}|{int(st.st_mtime)}"
+            if key not in _detect_cache:
+                _detect_cache[key] = detect(ck)
+            det = _detect_cache[key]
+            if det.get("family") != fam:
+                errors.append(f"登録されたモデルの中身が「{fam}」系ではありません（{det.get('evidence') or '判定不能'}）。設定画面でファイルを確認してください。")
+            elif det.get("fp8"):
+                errors.append("学習には bf16 版のモデル本体が必要です（登録されているのは fp8 版で、生成にだけ使えます）。")
+        except (OSError, ValueError) as e:
+            errors.append(f"モデルファイルを読めません: {e}")
+    return errors
+
+
 def preflight(project, used_images: list[dict], values: dict) -> dict:
     """Checks before training.  'errors' block the start; 'warnings' are shown but don't."""
     meta = project.get_meta()
@@ -228,27 +262,13 @@ def preflight(project, used_images: list[dict], values: dict) -> dict:
     from .models import GEN_ONLY
     gen_only = GEN_ONLY.get(fam, ())
     need = [k for k in model["missing"] if k not in gen_only]
-    if need:
-        errors += missing_file_messages(model, need)
+    errors += model_train_errors(model)
     if len(need) < len(model["missing"]):
         warnings += ["学習には使わない生成用のファイルが見つかりません（学習はできます。学習後の比較画像は、学習用の本体で生成します）。" + m
                      for m in missing_file_messages(model, [k for k in model["missing"] if k in gen_only])]
-    from .models import UNAVAILABLE_NOTE, detect, trainable
-    if not trainable(model["variant"]):
-        errors.append(UNAVAILABLE_NOTE.get(model["variant"], "このモデル系列は現在対応していません。"))
     from .models import experimental_note
     if experimental_note(model["variant"]):
         warnings.append(experimental_note(model["variant"]))
-    errors += _family_file_errors(model)
-    if not need and model["files"].get("ckpt"):
-        try:   # header only: cheap even for multi-GB files
-            det = detect(Path(model["files"]["ckpt"]))
-            if det.get("family") != fam:
-                errors.append(f"登録されたモデルの中身が「{fam}」系ではありません（{det.get('evidence') or '判定不能'}）。設定画面でファイルを確認してください。")
-            elif det.get("fp8"):
-                errors.append("学習には bf16 版のモデル本体が必要です（登録されているのは fp8 版で、生成にだけ使えます）。")
-        except (OSError, ValueError) as e:
-            errors.append(f"モデルファイルを読めません: {e}")
     if not VARIANTS[model["variant"]]["verified"]:
         warnings.append(f"「{VARIANTS[model['variant']]['label']}」はこのツールでの実学習検証が未完了です。")
     enh = None

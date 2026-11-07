@@ -582,8 +582,8 @@ class Comfy:
             for k in ("checkpoints", "diffusion_models", "text_encoders", "vae", "loras"):
                 (COMFY_MODELS / k).mkdir(parents=True, exist_ok=True)
             extra = self._write_extra_paths()
-            from .addons import MOSS_EDIT, PPM, ensure_node
-            for name in (PPM, MOSS_EDIT):
+            from .addons import MOSS_EDIT, PPM, RGTHREE, ensure_node
+            for name in (PPM, MOSS_EDIT, RGTHREE):
                 ensure_node(name)   # put in place on the first start (bundled copy, else a small git clone); without it, generation goes on as before
             self.started_nodes = self._custom_nodes()
             self.started_extra = {k: set(v) for k, v in self.extra_dirs.items()}
@@ -645,7 +645,7 @@ class Comfy:
     @staticmethod
     def _custom_nodes() -> list[str]:
         """Custom nodes are off, except the optional ones this tool installed (e.g. ComfyUI-GGUF)."""
-        names = [n for n in ("ComfyUI-GGUF", "ComfyUI-ppm", "ComfyUI-Moss-Image-Edit-Native") if (config.COMFY_DIR / "custom_nodes" / n / "__init__.py").exists()]
+        names = [n for n in ("ComfyUI-GGUF", "ComfyUI-ppm", "ComfyUI-Moss-Image-Edit-Native", "rgthree-comfy") if (config.COMFY_DIR / "custom_nodes" / n / "__init__.py").exists()]
         return ["--whitelist-custom-nodes", *names] if names else []
 
     def refresh(self):
@@ -979,6 +979,12 @@ def sampling_for(model: dict, staged: dict) -> dict:
     return dict(SAMPLING[fam])
 
 
+def latent_class(fam: str) -> str:
+    """ComfyUI's node making the empty image (latent) of the shape a model family takes."""
+    return "EmptyLatentImage" if fam in ("sdxl", "qwen_image21") else \
+        "EmptyFlux2LatentImage" if fam == "moss_image" else "EmptySD3LatentImage"
+
+
 NEGPIP_FAMILIES = ("sdxl", "anima", "moss_image")   # ComfyUI-ppm CLIPNegPip
 COUPLE_FAMILIES = ("sdxl", "anima")                  # ComfyUI-ppm AttentionCouplePPM
 _NEG_WEIGHT = re.compile(r":\s*-\s*\d")                                  # (word:-1)
@@ -1072,8 +1078,7 @@ def build_t2i(model: dict, staged: dict, loras: list[tuple[str, float]], prompt:
         g["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": clip_ref}}
         g["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": clip_ref}}
         pos, neg = ["3", 0], ["4", 0]
-    latent_cls = "EmptyLatentImage" if fam in ("sdxl", "qwen_image21") else \
-        "EmptyFlux2LatentImage" if fam == "moss_image" else "EmptySD3LatentImage"
+    latent_cls = latent_class(fam)
     if edit:
         pass   # the latent is MOSSImageEditTextEncode's third output
     elif init:   # the image, scaled and centre-cropped to the size, encoded by the model's own VAE

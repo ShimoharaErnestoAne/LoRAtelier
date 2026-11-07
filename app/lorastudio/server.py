@@ -28,7 +28,7 @@ from .gpu import gpu, query_gpus
 from . import addons, i2tlink, imagegen, linking, loraconf, moss_catalog, multichar, pipeline, projectio, promptedit, relocate, remote, traincache
 from .models import FAMILY_FILES, FAMILY_LABEL, VARIANTS, detect, hasher, library, registry
 from .store import ProjectManager, ProjectMoving, default_trigger
-from .training import (ACTIVE, QUEUE_FILE, STATUS_LABEL, Job, Runner, create_run, preflight, resume_block_reason,
+from .training import (ACTIVE, QUEUE_FILE, STATUS_LABEL, Job, Runner, create_run, model_train_errors, preflight, resume_block_reason,
                        state_is_complete)
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
@@ -222,8 +222,14 @@ def get_library():
     for lo in scan["loras"]:
         lo["family_label"] = FAMILY_LABEL.get(lo["family"], "不明")
         lo["conf"] = loraconf.get(lo["path"])
+    comp = library.companion_files()
+    # whether each text encoder / VAE file fits each model family (read from the file; True / False / None unknown)
+    fits = {kind: {p: {fam: library.fits(fam, kind, p) for fam in generate.GEN_FAMILIES} for p in comp[kind]} for kind in ("te", "vae")}
+    models = [m for m in registry.list() if not m["missing"]]
+    for m in models:   # what would stop training with it (the same checks as before training starts)
+        m["train_errors"] = model_train_errors(m)
     return {"default_dirs": [str(d) for d in library.default_dirs() if d.is_dir()], "roots": library.roots(), **scan,
-            "models": [m for m in registry.list() if not m["missing"]], "companions": library.companion_files()}
+            "models": models, "companions": comp, "companion_fits": fits}
 
 
 @app.post("/api/models/from_file")
@@ -1573,7 +1579,17 @@ def imagegen_state():
     return {"form": form, "history": hist, "default_sampling": ds, "edit": edit,
             "native": imagegen.native_size(model), "check": chk["errors"], "notes": chk["notes"],
             "presets": _presets_view(), "attention": imagegen.attention_installed(),
-            "workflow": imagegen.comfyflow.meta(form.get("workflow"))}
+            "workflow": _workflow_view(form.get("workflow"))}
+
+
+def _workflow_view(wid) -> dict | None:
+    """The workflow's meta and its sampler's CFG (the negative-prompt note goes by it, not by the form's model)."""
+    m = imagegen.comfyflow.meta(wid)
+    if m:
+        graph = imagegen.comfyflow.load(wid)
+        m = {**m, "cfg": imagegen.comfyflow.cfg_of(graph) if graph else None,
+             "negative": imagegen.comfyflow.has_negative(graph) if graph else True}
+    return m
 
 
 def _presets_view() -> list[dict]:
@@ -1633,7 +1649,7 @@ def imagegen_preset_delete(pid: str):
 @app.put("/api/imagegen/form")
 def imagegen_form(body: dict):
     keep = ("model_id", "loras", "positive", "negative", "width", "height", "count", "seed", "sampling", "init_image", "denoise", "regions",
-            "vae", "te", "attention", "workflow")
+            "vae", "te", "attention", "workflow", "workflow_offer")
     form = {k: body.get(k) for k in keep if k in body}
     imagegen.save_form(form)
     model = registry.get(form.get("model_id") or "")
@@ -1849,11 +1865,12 @@ async def imagegen_pnginfo(request: Request):
                 "sampling": s.get("sampling_overrides") or {}, "init_image": s.get("init_image"), "denoise": s.get("denoise"),
                 "regions": {"left": s["regions"][0], "right": s["regions"][1]} if s.get("regions") else None,
                 "vae": s.get("vae") or "", "te": s.get("te") or "", "attention": s.get("attention") or "",
-                "workflow": s.get("workflow") or ""}
+                "workflow": s.get("workflow") or "", "workflow_offer": s.get("workflow") or ""}
         missing = [] if registry.get(s["model_id"]) else ["生成モデルのファイルが見つかりません。モデルを選び直してください。"]
         return {"source": "LoRAtelier（この画面で生成した画像）", "form": form, "model_file": None, "notes": missing}
     notes = list(info["notes"])
     # a ComfyUI image: its workflow is kept, and generation runs it as it is unless the page turns that off
+    # (opening the page again starts without it, with its 「workflow のまま生成する」 button: workflow_offer)
     workflow = None
     if info.get("graph"):
         workflow = imagegen.comfyflow.save(info.pop("graph"), info["source"], imagegen.comfyflow.summary(info))
@@ -1900,13 +1917,15 @@ async def imagegen_pnginfo(request: Request):
                          "アテンションは標準にしました。")
     loras = []
     for lo in info["loras"]:
-        hit = next((x for x in scan["loras"] if _stem(x["path"]) == _stem(lo["name"])), None)
+        # also under another name of the very same file (MOSS-Image-Base-8-steps-dmd2 = moss_image_8steps_dmd2 ...)
+        names = imagegen.comfyflow.same_names(lo["name"])
+        hit = next((x for x in scan["loras"] if _stem(x["path"]) == _stem(lo["name"])), None) or             next((x for x in scan["loras"] if imagegen.comfyflow._stem(x["path"]) in names), None)
         if hit:
             loras.append({"path": hit["path"], "strength": lo["strength"]})
         else:
             notes.append(f"LoRA「{lo['name']}」（強さ {lo['strength']:g}）は LoRA のフォルダーに見つからなかったので、入れていません。")
     form["loras"] = loras
-    form["workflow"] = workflow["id"] if workflow and not workflow["missing_nodes"] else ""
+    form["workflow"] = form["workflow_offer"] = workflow["id"] if workflow and not workflow["missing_nodes"] else ""
     return {"source": info["source"], "form": form, "model_file": model_file, "notes": notes, "workflow": workflow}
 
 
@@ -1933,11 +1952,33 @@ def imagegen_delete(eid: str):
     return {"ok": True}
 
 
+def _clean_jpeg(f: Path) -> bytes:
+    """The image as a JPEG carrying its pixels only: the prompt, the ComfyUI workflow and every other text / EXIF /
+    ICC block of the PNG are left out (a new image is made from the pixel values, nothing of the PNG's info is
+    passed on).  Transparent parts become white."""
+    import io
+    with Image.open(f) as im:
+        im.load()
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.getchannel("A"))
+            im = bg
+        px = Image.frombytes("RGB", im.size, im.convert("RGB").tobytes())
+    out = io.BytesIO()
+    px.save(out, "JPEG", quality=95, subsampling=0)
+    return out.getvalue()
+
+
 @app.get("/api/imagegen/img/{fname}")
-def imagegen_image(fname: str, dl: int = 0, thumb: int = 0):
+def imagegen_image(fname: str, dl: int = 0, thumb: int = 0, jpg: int = 0):
     f = imagegen.img_file(Path(fname).name)
     if not f.exists():
         raise HTTPException(404)
+    if jpg:   # 「JPG（情報なし）」: no prompt / workflow inside
+        from fastapi.responses import Response
+        return Response(_clean_jpeg(f), media_type="image/jpeg",
+                        headers={"Content-Disposition": f'attachment; filename="{f.stem}.jpg"'})
     if dl:
         return FileResponse(f, media_type="image/png", filename=f.name)
     if thumb:
@@ -1946,8 +1987,9 @@ def imagegen_image(fname: str, dl: int = 0, thumb: int = 0):
 
 
 @app.get("/api/imagegen/{eid}/download.zip")
-def imagegen_zip(eid: str):
-    """All images of one request in a zip (PNG is already compressed: stored as is)."""
+def imagegen_zip(eid: str, jpg: int = 0):
+    """All images of one request in a zip (PNG is already compressed: stored as is; jpg=1: JPEGs without the
+    prompt / workflow, as _clean_jpeg)."""
     e = next((x for x in imagegen.history() if x["id"] == eid), None)
     files = [imagegen.img_file(im["file"]) for im in (e or {}).get("images", [])]
     files = [f for f in files if f.exists()]
@@ -1959,8 +2001,11 @@ def imagegen_zip(eid: str):
     os.close(fd)
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
         for f in files:
-            zf.write(f, f.name)
-    name = time.strftime("images_%Y%m%d-%H%M%S", time.localtime(e["created"])) + ".zip"
+            if jpg:
+                zf.writestr(f.stem + ".jpg", _clean_jpeg(f))
+            else:
+                zf.write(f, f.name)
+    name = time.strftime("images_%Y%m%d-%H%M%S", time.localtime(e["created"])) + ("_jpg" if jpg else "") + ".zip"
     return FileResponse(tmp, media_type="application/zip", filename=name, background=BackgroundTask(os.unlink, tmp))
 
 
