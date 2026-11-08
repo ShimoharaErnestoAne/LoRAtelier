@@ -786,11 +786,30 @@ def _queue_masks(p):
 
 
 # ====================================================================== images
+_CTX_CACHE: dict[str, tuple] = {}   # project id -> (signature, context): the dataset checks are O(n^2)
+_CTX_LOCK = threading.Lock()
+
+
 def _ctx(p, imgs, meta):
+    """judge.build_context for the project, reused while nothing it reads has changed.  The image list is
+    fetched about once a second while analysis runs, and each image detail and training plan needs it too."""
     ident = {int(k): v for k, v in ((meta.get("identity") or {}).get("map") or {}).items()}
     meta = dict(meta)
     meta["reference_ids"] = meta.get("reference_ids") or meta.get("auto_reference") or []
-    return judge.build_context(imgs, meta, ident)
+    sig = (json.dumps({k: meta.get(k) for k in ("kind", "outfit_mode", "reference_ids", "concept_words", "concept_target")},
+                      sort_keys=True, default=str),
+           json.dumps(ident, sort_keys=True, default=str),
+           tuple((im["id"], im["sha"], json.dumps(im.get("crop"), default=str), im.get("ai_key"),
+                  json.dumps({k: (im.get("fast") or {}).get(k) for k in ("ok", "phash", "sharpness_p90")}, default=str))
+                 for im in imgs))
+    with _CTX_LOCK:
+        hit = _CTX_CACHE.get(p.id)
+    if hit and hit[0] == sig:
+        return hit[1]
+    ctx = judge.build_context(imgs, meta, ident)
+    with _CTX_LOCK:
+        _CTX_CACHE[p.id] = (sig, ctx)
+    return ctx
 
 
 def _light(im: dict, res: dict) -> dict:
@@ -1245,16 +1264,32 @@ def _prune_gen_sources(p, keep: list[str]):
             f.unlink(missing_ok=True)
 
 
+async def _read_image_body(request: Request, limit_mb: int) -> bytes:
+    """The dropped image sent as the raw body.  Too large a file is refused before it is read into memory
+    (by its Content-Length, or while it streams in)."""
+    limit = limit_mb * 2**20
+    too_big = HTTPException(400, f"画像が大きすぎます（{limit_mb}MB まで）")
+    try:
+        if int(request.headers.get("content-length") or 0) > limit:
+            raise too_big
+    except ValueError:
+        pass
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > limit:
+            raise too_big
+    if not buf:
+        raise HTTPException(400, "画像が空です")
+    return bytes(buf)
+
+
 @app.post("/api/projects/{pid}/gen/source")
 async def gen_source(pid: str, request: Request):
     """A source image for image-to-image material generation (the raw file as the body)."""
     from starlette.concurrency import run_in_threadpool
     p = P(pid)
-    data = await request.body()
-    if not data:
-        raise HTTPException(400, "画像が空です")
-    if len(data) > 100 * 2**20:
-        raise HTTPException(400, "画像が大きすぎます（100MB まで）")
+    data = await _read_image_body(request, 100)
     try:
         return await run_in_threadpool(generate.save_source_image, data, generate.gen_source_dir(p))
     except ValueError as e:
@@ -1380,8 +1415,12 @@ def gen_delete(pid: str, bid: int, body: dict):
     for r in targets:
         for f in (d / r["file"], d / "thumbs" / (Path(r["file"]).stem + ".webp")):
             if f.exists():
-                freed += f.stat().st_size
-                f.unlink()
+                size = f.stat().st_size
+                try:   # a file being shown right now cannot be deleted on Windows: the row is updated anyway
+                    f.unlink()
+                    freed += size
+                except OSError:
+                    pass
     with p.tx() as db:
         if scope == "all":
             db.execute("DELETE FROM gen_images WHERE batch_id=?", (bid,))
@@ -1530,11 +1569,7 @@ def i2t_models_dir(body: dict):
 @app.post("/api/i2t/upload")
 async def i2t_upload(request: Request, name: str = "image.png"):
     from starlette.concurrency import run_in_threadpool
-    data = await request.body()
-    if not data:
-        raise HTTPException(400, "画像が空です")
-    if len(data) > 200 * 2**20:
-        raise HTTPException(400, "画像が大きすぎます（200MB まで）")
+    data = await _read_image_body(request, 200)
     p = await run_in_threadpool(i2tlink.save_upload, name, data)
     try:
         with Image.open(p) as im:
@@ -1633,16 +1668,20 @@ def i2t_openpose(body: dict):
 
 # ====================================================================== plain image generation (画像生成)
 @app.get("/api/imagegen")
-def imagegen_state():
+def imagegen_state(limit: int = 30):
     form = imagegen.get_form()
     model = registry.get(form.get("model_id") or "")
     chk = imagegen.check(form)
-    hist = imagegen.history()
+    # the newest `limit` results (the page asks for more with 「もっと見る」): the history keeps every request, and
+    # sending and drawing all of them on each update grew slower with every image made.  Queued and running ones
+    # are always sent (the page's stop buttons and progress need them).
+    full = imagegen.history()
+    hist = [e for i, e in enumerate(full) if i < max(1, limit) or e["status"] in ("queued", "running")]
     for e in hist:
         if e["status"] == "running":
             e["progress"] = imagegen.progress(e["id"])
     ds, edit = imagegen.request_sampling(model, form)
-    return {"form": form, "history": hist, "default_sampling": ds, "edit": edit,
+    return {"form": form, "history": hist, "history_more": len(full) - len(hist), "default_sampling": ds, "edit": edit,
             "native": imagegen.native_size(model), "check": chk["errors"], "notes": chk["notes"],
             "presets": _presets_view(), "attention": imagegen.attention_installed(),
             "workflow": _workflow_view(form.get("workflow"))}
@@ -1737,7 +1776,9 @@ def ui_conf(body: dict):
             job = runner.current
             freed = 0
             for d in projects.folders():
-                skip = tuple(r.name for r in (d / "runs").glob(f"{job.run_id:04d}_*")) if job and job.project.id == d.name else ()
+                # a task (material generation, comparison...) has no run of its own: nothing to keep for it
+                skip = (tuple(r.name for r in (d / "runs").glob(f"{job.run_id:04d}_*"))
+                        if job and job.run_id is not None and job.project.id == d.name else ())
                 freed += traincache.clear_project(d, skip)
     return {"blur_images": config.settings().get("blur_images", False), "keep_train_cache": traincache.keep(), "freed": freed}
 
@@ -1868,11 +1909,7 @@ def imagegen_rewrite(body: dict):
 async def imagegen_init(request: Request):
     """A source image for image-to-image (the raw file as the body)."""
     from starlette.concurrency import run_in_threadpool
-    data = await request.body()
-    if not data:
-        raise HTTPException(400, "画像が空です")
-    if len(data) > 100 * 2**20:
-        raise HTTPException(400, "画像が大きすぎます（100MB まで）")
+    data = await _read_image_body(request, 100)
     try:
         return await run_in_threadpool(imagegen.save_init, data)
     except ValueError as e:
@@ -1911,11 +1948,7 @@ async def imagegen_pnginfo(request: Request):
     file as the body), matched with this PC's files.  The form is not changed here; the page puts them in."""
     from starlette.concurrency import run_in_threadpool
     from . import pnginfo
-    data = await request.body()
-    if not data:
-        raise HTTPException(400, "画像が空です")
-    if len(data) > 100 * 2**20:
-        raise HTTPException(400, "画像が大きすぎます（100MB まで）")
+    data = await _read_image_body(request, 100)
     try:
         info = await run_in_threadpool(pnginfo.read, data)
     except ValueError as e:
@@ -2097,25 +2130,26 @@ def _used_images(p):
     return [im for im in imgs if judge.check_image(im, ctx)["use"]]
 
 
-def _members(p):
-    """Member list for the run snapshot of a multi-character project (None for any other project)."""
-    return multichar.gather(projects, p, _used_images)[1] if multichar.is_multi(p.get_meta()) else None
-
-
 def _plan(p):
+    return _plan_with(p)[0]
+
+
+def _plan_with(p):
+    """The training plan, with the images it would use and (multi-character) the member list: starting a run
+    needs all three, and for a multi-character project each one judges every member's images."""
     meta = p.get_meta()
     model = registry.get(meta.get("model_id") or "")
-    used = _used_images(p)
+    multi = multichar.is_multi(meta)
+    used, members = multichar.gather(projects, p, _used_images) if multi else (_used_images(p), None)
     if not model:
-        return {"model": None, "used": len(used), "preflight": {"errors": ["ベースモデルが未設定です。"], "warnings": [], "info": {}}}
+        return {"model": None, "used": len(used), "preflight": {"errors": ["ベースモデルが未設定です。"], "warnings": [], "info": {}}}, used, members
     if not model.get("variant"):
-        return {"model": model, "used": len(used), "preflight": preflight(p, used, {})}
+        return {"model": model, "used": len(used), "preflight": preflight(p, used, {})}, used, members
     d = _defaults(meta, model, len(used))
     ov = meta.get("train_overrides") or {}
     values, changed = presets.merged(d, ov)
     pf = preflight(p, used, values)
-    if multichar.is_multi(meta):
-        _imgs, members = multichar.gather(projects, p, _used_images)
+    if multi:
         e, w = multichar.check(members, lambda mid: (VARIANTS.get((registry.get(mid or "") or {}).get("variant") or "") or {}).get("caption"))
         pf["errors"] = e + [x for x in pf["errors"] if not x.startswith("採用画像が ")]
         pf["warnings"] = w + pf["warnings"]
@@ -2136,7 +2170,7 @@ def _plan(p):
     return {"model": model, "used": len(used), "defaults": d, "values": values, "changed": changed, "mask": mp,
             "fields": presets.FIELDS, "preflight": pf, "preset_version": presets.PRESET_VERSION,
             "relative": {k: ov[k] for k in ("steps_scale", "save_count") if ov.get(k)},
-            "imported": meta.get("settings_import")}
+            "imported": meta.get("settings_import")}, used, members
 
 
 def _mask_plan(meta, model, used):
@@ -2314,13 +2348,11 @@ def train_restore(pid: str, body: dict):
 @app.post("/api/projects/{pid}/train/start")
 def train_start(pid: str, body: dict | None = None):
     p = P(pid)
-    plan = _plan(p)
-    if plan["preflight"]["errors"]:
-        raise HTTPException(400, " / ".join(plan["preflight"]["errors"]))
-    used = _used_images(p)
-    rid = create_run(p, used, plan["values"], plan["changed"], (body or {}).get("name"), _members(p))
     ahead = 1 if runner.current else 0
-    runner.enqueue(p, rid)
+    try:
+        rid = _start_run(p, (body or {}).get("name"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"run_id": rid, "ahead": ahead + len(runner.waiting()) - 1}
 
 
@@ -2337,7 +2369,7 @@ def train_batch(pid: str, body: dict):
     field = body.get("field")
     if field not in BATCH_FIELDS:
         raise HTTPException(400, "まとめて変えられない設定です")
-    plan = _plan(p)
+    plan, used, members = _plan_with(p)
     if plan["preflight"]["errors"]:
         raise HTTPException(400, " / ".join(plan["preflight"]["errors"]))
     if field not in (plan["values"] or {}):
@@ -2368,7 +2400,6 @@ def train_batch(pid: str, body: dict):
     free = shutil.disk_usage(p.runs_dir).free / 1e9
     if free < need + 2:
         raise HTTPException(400, f"空き容量が足りません（{len(variants)} 件で 約{need:.1f}GB 必要 / 空き {free:.1f}GB）。件数を減らしてください。")
-    used, members = _used_images(p), _members(p)
     ids = []
     for x, v, changed in variants:
         rid = create_run(p, used, v, changed, f"{label} {x:g}", members)
@@ -2385,9 +2416,9 @@ def _job_view(j) -> dict:
     if hasattr(j.project, "meta"):
         try:
             name = j.project.meta("name")
-            if not task:
-                r = j.project.run(j.run_id)
-                run_name = r["name"] if r else None
+            if not task:   # only the name: the run's config (every caption) is not parsed on each status poll
+                r = j.project.q("SELECT name FROM runs WHERE id=?", (j.run_id,))
+                run_name = r[0]["name"] if r else None
         except sqlite3.Error:
             pass
     label = getattr(j, "label", None) or ""
@@ -2438,7 +2469,7 @@ def _current_view(j) -> dict:
             frac, msg = min(1.0, (pr.get("step") or 0) / pr["total"]), pr.get("message")
         else:
             msg = "準備中"
-        controls = [{"action": "stop", "label": "中止", "title": "今の 1 枚が終わったら止まります。できた画像は残ります", "danger": True}]
+        controls = [{"action": "stop", "label": "中止", "title": "描いている途中の 1 枚も止めます。できた画像は残ります", "danger": True}]
     elif v["kind"] == "imagegen":
         pr = imagegen.progress(getattr(j, "entry", "")) or {}
         if pr.get("count"):
@@ -2482,7 +2513,8 @@ def queue_current(action: str, body: dict):
         return gen_control(j.project.id, _num_after(v["label"]), action)
     if v["kind"] == "eval":
         j.eval_cancel = True
-        return {"accepted": True, "message": "中止を受け付けました。今の 1 枚が終わったら止まります。"}
+        comfy.cancel_current()   # the image being drawn is stopped too, not finished first
+        return {"accepted": True, "message": "中止を受け付けました。描いている途中の 1 枚も止めます。"}
     if v["kind"] == "imagegen":
         imagegen.cancel(getattr(j, "entry", ""))
         return {"accepted": True, "message": "中止を受け付けました。"}
@@ -2516,13 +2548,17 @@ def _eval_cancelled(p, rid, eid, msg="開始前に取り消しました"):
 
 
 # ---- LoRA creation tasks (pipeline.py): material generation -> analysis and captions -> training
-def _pipeline_start_training(p, name):
-    plan = _plan(p)
+def _start_run(p, name):
+    """Freeze the current material and settings into a new run and queue it (学習を開始 / LoRA 作成タスク).
+    Raises ValueError with the preflight errors when training cannot start."""
+    plan, used, members = _plan_with(p)
     if plan["preflight"]["errors"]:
         raise ValueError(" / ".join(plan["preflight"]["errors"]))
-    rid = create_run(p, _used_images(p), plan["values"], plan["changed"], name, _members(p))
+    rid = create_run(p, used, plan["values"], plan["changed"], name, members)
     runner.enqueue(p, rid)
     return rid
+
+
 
 
 def _pipeline_stop_batch(p, bid):
@@ -2541,7 +2577,7 @@ def _pipeline_import(p, bid):
 pipeline.hooks.queue_batch = _queue_batch
 pipeline.hooks.stop_batch = _pipeline_stop_batch
 pipeline.hooks.import_batch = _pipeline_import
-pipeline.hooks.start_training = _pipeline_start_training
+pipeline.hooks.start_training = _start_run
 pipeline.hooks.stop_run = lambda p, rid: runner.stop(p, rid)
 pipeline.hooks.analysis_busy = lambda: analyzer.queue_size() > 0 or analyzer.current is not None   # also the item in work
 tasks = pipeline.Pipeline(projects)
@@ -2717,6 +2753,8 @@ def app_logs_clear():
 def run_log(pid: str, rid: int, tail: int = 200):
     p = P(pid)
     r = _run_or_404(p, rid)
+    if not r["run_dir"]:   # the run failed before its folder was made (Path("") would be the app's own folder)
+        return {"text": ""}
     logs = sorted((Path(r["run_dir"]) / "logs").glob("*.log"))
     if not logs:
         return {"text": ""}
@@ -2812,7 +2850,12 @@ def eval_more(pid: str, rid: int, body: dict):
     with p.tx() as db:
         eid = db.execute("INSERT INTO evals(run_id, created, status, spec) VALUES(?,?,?,?)",
                          (rid, time.time(), "queued", json.dumps(spec, ensure_ascii=False))).lastrowid
+    _queue_eval(p, rid, eid)
+    return {"eval_id": eid, "n_images": n}
 
+
+def _queue_eval(p, rid: int, eid: int) -> None:
+    """Put the comparison eval `eid` of run `rid` on the task queue (one GPU job after another)."""
     def task():
         try:
             run_eval(p, rid, eid, _eval_progress(p, rid))
@@ -2822,7 +2865,6 @@ def eval_more(pid: str, rid: int, body: dict):
             p.q("UPDATE evals SET status='failed', error=? WHERE id=?", (str(e), eid))
             bus.publish("eval", project=p.id, run=rid, eval=eid, status="failed")
     runner.enqueue_task(p, f"比較 #{rid}", task, on_cancel=lambda: _eval_cancelled(p, rid, eid))
-    return {"eval_id": eid, "n_images": n}
 
 
 # ---- comparing runs with each other
@@ -2902,16 +2944,7 @@ def compare_generate(pid: str, body: dict):
         with p.tx() as db:
             eid = db.execute("INSERT INTO evals(run_id, created, status, spec) VALUES(?,?,?,?)",
                              (rid, time.time(), "queued", json.dumps(sp, ensure_ascii=False))).lastrowid
-
-        def task(rid=rid, eid=eid):
-            try:
-                run_eval(p, rid, eid, _eval_progress(p, rid))
-            except EvalCancelled:
-                _eval_cancelled(p, rid, eid, "中止しました（できた画像は残っています）")
-            except Exception as e:
-                p.q("UPDATE evals SET status='failed', error=? WHERE id=?", (str(e), eid))
-                bus.publish("eval", project=p.id, run=rid, eval=eid, status="failed")
-        runner.enqueue_task(p, f"比較 #{rid}", task, on_cancel=lambda rid=rid, eid=eid: _eval_cancelled(p, rid, eid))
+        _queue_eval(p, rid, eid)
         queued.append({"run": rid, "eval_id": eid})
     return {"queued": queued, "n_images": n}
 
@@ -2920,7 +2953,7 @@ def compare_generate(pid: str, body: dict):
 def eval_image(pid: str, rid: int, eid: int, fname: str, thumb: int = 0):
     p = P(pid)
     r = p.run(rid)
-    if not r:
+    if not r or not r["run_dir"]:
         raise HTTPException(404)
     f = (Path(r["run_dir"]) / "eval" / f"{eid:03d}" / Path(fname).name)
     if not f.exists():
@@ -3030,6 +3063,33 @@ def on_error(request, exc):
 BOOT = time.time()   # this start of the app: rows created later belong to it
 
 
+def _recover_project(p, order: dict, reserved: list) -> None:
+    """resume_pending_on_startup for one project: runs, material batches, comparisons and analysis left running."""
+    for r in p.runs():
+        if r["created"] >= BOOT:   # started after this start (the page answers while this runs)
+            continue
+        if r["status"] == "queued" and r["run_dir"] and (r["progress"] or {}).get("phase", "queued") == "queued":
+            pos, resume = order.get((p.id, r["id"]), (None, None))
+            if pos is not None or not p.checkpoints(r["id"]):   # not in the file: only a run that never trained
+                reserved.append((pos if pos is not None else len(order), r["created"], p, r["id"], resume))
+                continue
+        if r["status"] in ACTIVE:
+            out_dir = Path(r["run_dir"] or ".") / "output"
+            if r["run_dir"] and out_dir.is_dir():
+                try:   # saves written after the runner's last 2 s poll; cut-off files are skipped
+                    runner._register_checkpoints(Job(p, r["id"]), out_dir, final=True)
+                except Exception:
+                    pass
+            runner._set(p, r["id"], status="failed", ended=time.time(),
+                        error={"code": "interrupted", "message": "アプリの終了により中断されました。",
+                               "fixes": ["再開用の保存地点があれば「再開」できます"]})
+    for b in p.q("SELECT id FROM gen_batches WHERE status IN ('queued','running') AND created < ?", (BOOT,)):
+        generate._set_status(p, b["id"], "paused", "アプリの終了で止まりました。「再開」で続きを生成できます。")
+    for e in p.q("SELECT id FROM evals WHERE status IN ('queued','running') AND created < ?", (BOOT,)):
+        p.q("UPDATE evals SET status='failed', error='アプリの終了により中断されました' WHERE id=?", (e["id"],))
+    _resume_analysis(p)
+
+
 def resume_pending_on_startup():
     """After a restart, runs that were in progress are marked as interrupted (not silently resumed)."""
     imagegen.recover()
@@ -3041,33 +3101,16 @@ def resume_pending_on_startup():
     order = {(q.get("project"), q.get("run")): (i, q.get("resume")) for i, q in enumerate(saved) if isinstance(q, dict)}
     reserved = []   # runs reserved but not started yet: they keep their place in the queue
     for info in projects.list():
+        if info.get("error"):   # a project whose database cannot be opened: the list shows it; nothing to recover
+            continue
         try:
-            p = projects.get(info["id"])
+            _recover_project(projects.get(info["id"]), order, reserved)
         except KeyError:
             continue
-        for r in p.runs():
-            if r["created"] >= BOOT:   # started after this start (the page answers while this runs)
-                continue
-            if r["status"] == "queued" and r["run_dir"] and (r["progress"] or {}).get("phase", "queued") == "queued":
-                pos, resume = order.get((p.id, r["id"]), (None, None))
-                if pos is not None or not p.checkpoints(r["id"]):   # not in the file: only a run that never trained
-                    reserved.append((pos if pos is not None else len(order), r["created"], p, r["id"], resume))
-                    continue
-            if r["status"] in ACTIVE:
-                out_dir = Path(r["run_dir"] or ".") / "output"
-                if r["run_dir"] and out_dir.is_dir():
-                    try:   # saves written after the runner's last 2 s poll; cut-off files are skipped
-                        runner._register_checkpoints(Job(p, r["id"]), out_dir, final=True)
-                    except Exception:
-                        pass
-                runner._set(p, r["id"], status="failed", ended=time.time(),
-                            error={"code": "interrupted", "message": "アプリの終了により中断されました。",
-                                   "fixes": ["再開用の保存地点があれば「再開」できます"]})
-        for b in p.q("SELECT id FROM gen_batches WHERE status IN ('queued','running') AND created < ?", (BOOT,)):
-            generate._set_status(p, b["id"], "paused", "アプリの終了で止まりました。「再開」で続きを生成できます。")
-        for e in p.q("SELECT id FROM evals WHERE status IN ('queued','running') AND created < ?", (BOOT,)):
-            p.q("UPDATE evals SET status='failed', error='アプリの終了により中断されました' WHERE id=?", (e["id"],))
-        _resume_analysis(p)
+        except Exception:   # one broken project must not leave every later one stuck as running
+            import traceback
+            (config.DATA_DIR / "server_errors.log").open("a", encoding="utf-8").write(
+                time.strftime("%F %T ") + f"startup recovery of {info.get('id')}\n" + traceback.format_exc() + "\n")
     for _pos, _created, p, rid, resume in sorted(reserved, key=lambda x: (x[0], x[1])):
         if resume and not Path(resume).exists():   # never train a resumed run again from the start over its saves
             runner._set(p, rid, status="failed", ended=time.time(),

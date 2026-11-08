@@ -38,6 +38,7 @@ const debounce = (fn, ms) => {
   let t = null, args;
   const d = (...a) => { clearTimeout(t); args = a; t = setTimeout(() => { t = null; fn(...args); }, ms); };
   d.flush = () => { if (t) { clearTimeout(t); t = null; fn(...args); } };
+  d.cancel = () => { clearTimeout(t); t = null; };
   return d;
 };
 /* Autosaves that wait for typing to pause: sent at once when the page changes (route) or the tab is closed
@@ -47,6 +48,7 @@ function saveDebounce(fn, ms) {
   const d = debounce((...a) => { PENDING_SAVES.delete(call); return fn(...a); }, ms);
   const call = (...a) => { PENDING_SAVES.add(call); d(...a); };
   call.flush = () => d.flush();
+  call.cancel = () => { PENDING_SAVES.delete(call); d.cancel(); };
   return call;
 }
 function flushSaves() { [...PENDING_SAVES].forEach((d) => d.flush()); }
@@ -85,7 +87,12 @@ const S = {
 
 // ------------------------------------------------------------------ routing
 window.addEventListener("hashchange", route);
+/* Counts page changes.  A page renderer that waited for the server checks it afterwards (navStale) and draws
+   nothing when the user has gone to another page meanwhile: a slow answer must not paint over the new page. */
+let NAV = 0;
+const navStale = (nav) => nav !== NAV;
 function route() {
+  NAV++;
   flushSaves();   // the old page's inputs are still there
   const h = location.hash.replace(/^#\/?/, "");
   S.route = h ? h.split("/") : [];
@@ -207,11 +214,13 @@ function drawProjectList(list) {
 }
 
 async function renderHome() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = "";
   main.innerHTML = `<div class="muted">読み込み中…</div>`;
   let list = [], models = { models: [] };
-  try { [list, models] = await Promise.all([api("/api/projects"), api("/api/models")]); } catch (e) { fail(e); }
+  try { [list, models] = await Promise.all([api("/api/projects"), api("/api/models")]); } catch (e) { if (!navStale(nav)) fail(e); }
+  if (navStale(nav)) return;
   const noModel = !models.models.length;
   main.innerHTML = `
     ${misplacedHtml(models.misplaced)}
@@ -286,7 +295,7 @@ function onProjectMenu(e) {
       b.innerHTML = `もう一度押すと削除（元に戻せません）`;
       const note = document.createElement("div");
       note.className = "muted small"; note.style.padding = "2px 10px 6px"; note.style.maxWidth = "300px";
-      note.textContent = `「${card.dataset.pname}」の素材・説明文・学習結果をすべて削除します。書き出し済みの LoRA（models\loras）は残ります。`;
+      note.textContent = `「${card.dataset.pname}」の素材・説明文・学習結果をすべて削除します。書き出し済みの LoRA（models\\loras）は残ります。`;
       m.append(note);
       return;
     }
@@ -631,7 +640,11 @@ function newGenForm(kind = "character") {
 // ------------------------------------------------------------------ project shell
 async function openProject(pid, tab) {
   if (!S.project || S.project.id !== pid) {
-    try { S.project = await api(`/api/projects/${pid}`); } catch (e) { fail(e); location.hash = "#/"; return; }
+    const nav = NAV;
+    let proj;
+    try { proj = await api(`/api/projects/${pid}`); } catch (e) { if (!navStale(nav)) { fail(e); location.hash = "#/"; } return; }
+    if (navStale(nav)) return;   // another project or page was opened meanwhile
+    S.project = proj;
     S.images = []; S.sel.clear(); S.focus = null; S.detail = null; S.resultsRun = null; S.resultsEv = null; S.picked = null;
     _imgReq++; _imgBusy = false; _imgAgain = false;   // a list still on its way belongs to the previous project
   }
@@ -879,7 +892,7 @@ const refreshImages = debounce(async () => {
     const im = S.images.find((x) => x.id === S.focus);
     if (im && (!S.detail || detailSig(im) !== S.detailSig)) loadDetail(S.focus, true);
   }
-  refreshStartBar();
+  refreshStartBarIfChanged();
 }, 120);
 
 function drawUndo() {
@@ -960,13 +973,15 @@ function drawTagList() {
   const el = $("#m-tags"), btn = $("#m-tags-open");
   if (!el) return;
   if (btn) btn.classList.toggle("on", !!S.tagsOpen);
-  if (!S.tagsOpen) { el.innerHTML = ""; return; }
+  if (!S.tagsOpen) { el.innerHTML = ""; el._html = null; return; }
   if (S.project.caption_style === "natural") {
+    el._html = null;
     el.innerHTML = `<div class="panel tl"><b>タグの一覧</b><div class="muted small" style="margin-top:4px">このモデルの説明文は文章なので、タグに分けて数えられません。
       説明文の語句は、上の「説明文・タグで絞り込み」と、選んだ画像の「置換」で直せます。</div></div>`;
     return;
   }
   const { n, tags } = tagIndex();
+  TL.tags = tags;   // the buttons look the images up here, so handlers bound by an earlier draw see the latest captions
   const trig = (S.project.trigger || "").trim();
   const q = TL.q.toLowerCase();
   let list = tags.filter((t) => !q || t.tag.toLowerCase().includes(q));
@@ -975,7 +990,7 @@ function drawTagList() {
   const shown = list.slice(0, TL.limit);
   const focusQ = document.activeElement && document.activeElement.id === "tl-q";
   const scroll = el.querySelector(".tl-list") ? el.querySelector(".tl-list").scrollTop : 0;   // redrawn while analysis runs
-  el.innerHTML = `<div class="panel tl">
+  const html = `<div class="panel tl">
     <div class="row"><b>タグの一覧</b>
       <span class="chips">${[["used", "採用中の画像"], ["all", "すべての画像"]].map(([k, l]) => `<span class="chip ${TL.scope === k ? "on" : ""}" data-tls="${k}">${l}</span>`).join("")}</span>
       <span class="chips">${[["count", "多い順"], ["name", "名前順"]].map(([k, l]) => `<span class="chip ${TL.sort === k ? "on" : ""}" data-tlo="${k}">${l}</span>`).join("")}</span>
@@ -997,9 +1012,10 @@ function drawTagList() {
         ${isTrig ? "" : `<button class="small" data-tla="rep">置き換え</button><button class="small" data-tla="del">削除</button>`}</div>`; }).join("")}</div>
     ${list.length > shown.length ? `<button class="small" id="tl-more" style="margin-top:6px">さらに表示（残り ${list.length - shown.length} 個）</button>` : ""}
     ${!list.length ? `<div class="muted small">${tags.length ? "一致するタグはありません。" : "説明文にタグがありません。"}</div>` : ""}</div>`;
+  if (!setHTML(el, html)) return;   // nothing changed: keep the rows (a checkbox being clicked, the scroll position)
   if (focusQ) { const qi = $("#tl-q"); qi.focus(); qi.setSelectionRange(qi.value.length, qi.value.length); }
   if ($(".tl-list", el)) $(".tl-list", el).scrollTop = scroll;
-  const idsOf = (tagList) => [...new Set(tags.filter((t) => tagList.includes(t.tag)).flatMap((t) => t.ids))];
+  const idsOf = (tagList) => [...new Set(TL.tags.filter((t) => tagList.includes(t.tag)).flatMap((t) => t.ids))];
   const select = (ids) => {
     S.sel = new Set(ids); S.filter = "all"; S.search = ""; if ($("#m-search")) $("#m-search").value = "";
     drawReport(); drawGrid(); drawBulk();
@@ -1353,8 +1369,11 @@ function drawDetail(d) {
     const p = S.capSaving = (async () => {
       try {
         const r = await api(`/api/projects/${pid}/edit`, { body: { label: `#${d.id} の説明文を編集`, changes: [{ id: d.id, field: "caption", value }] } });
-        st.textContent = "保存済み（手動編集）"; S.history = r.history; drawUndo();
-        const im = S.images.find((x) => x.id === d.id); if (im) { im.caption = value; im.caption_edited = true; }
+        st.textContent = "保存済み（手動編集）";
+        if (S.project && S.project.id === pid) {   // image ids are per project
+          S.history = r.history; drawUndo();
+          const im = S.images.find((x) => x.id === d.id); if (im) { im.caption = value; im.caption_edited = true; }
+        }
       } catch (e) { st.className = "savestate err"; st.textContent = "保存できませんでした：" + e.message; }
       if (S.capSaving === p) S.capSaving = null;
     })();
@@ -1454,6 +1473,20 @@ function setupCrop(d) {
 }
 
 // ---- start bar (one click to train when there are no blocking problems)
+/* The image list is refreshed about once a second while analysis runs; the plan behind the start bar checks every
+   used image's file, so it is asked for again only when something it depends on changed. */
+let _startSig = null;
+function refreshStartBarIfChanged() {
+  if (!S.project) return;
+  const job = S.status && S.status.job;
+  const sig = JSON.stringify([S.project.id, S.project.model_id, job ? job.project : null,
+    S.images.map((i) => [i.id, i.use, i.decision, i.verdict, i.caption_status, i.ai_status, i.fast_status, i.mask_off, i.mask, i.crop])]);
+  const el = $("#m-start");
+  if (sig === _startSig && el && el._html) return;
+  _startSig = sig;
+  refreshStartBar();
+}
+
 const refreshStartBar = debounce(async () => {
   const el = $("#m-start");
   if (!el || !S.project) return;
@@ -2613,6 +2646,24 @@ function bindMaskPanel(m) {
   };
 }
 
+/* Training settings are saved one change after another, each applied to the overrides the previous save
+   returned: two fields changed in quick succession must not overwrite each other (the server replaces the whole
+   train_overrides).  The plan is redrawn once the last pending save is done. */
+let ovChain = Promise.resolve(), ovPending = 0;
+function saveOverrides(change) {
+  const pid = S.project.id;
+  ovPending++;
+  ovChain = ovChain.then(async () => {
+    if (!S.project || S.project.id !== pid) return;
+    const ov = { ...(S.project.train_overrides || {}) };
+    change(ov);
+    try {
+      const p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { train_overrides: ov } });
+      if (S.project && S.project.id === pid) S.project = p;
+    } catch (e) { fail(e); }
+  }).finally(() => { if (--ovPending === 0 && S.project && S.project.id === pid) loadPlan(); });
+}
+
 async function loadPlan() {
   const el = $("#t-plan");
   let plan;
@@ -2667,21 +2718,17 @@ async function loadPlan() {
   bindMaskPanel(plan.mask);
   $("#t-batch").ontoggle = (e) => { S.batchOpen = e.target.open; };
   drawBatch(plan);
-  const save = async (ov) => { try { S.project = await api(`/api/projects/${S.project.id}`, { method: "PATCH", body: { train_overrides: ov } }); loadPlan(); } catch (e) { fail(e); } };
   $$("[data-k]", el).forEach((inp) => inp.onchange = () => {
-    const ov = { ...(S.project.train_overrides || {}) };
-    const t = inp.dataset.type;
-    ov[inp.dataset.k] = t === "int" ? parseInt(inp.value, 10) : t === "float" ? parseFloat(inp.value) : inp.value;
-    delete ov[RELKEY[inp.dataset.k]];   // a typed value is a fixed value
-    save(ov);
+    const t = inp.dataset.type, k = inp.dataset.k;
+    const val = t === "int" ? parseInt(inp.value, 10) : t === "float" ? parseFloat(inp.value) : inp.value;
+    saveOverrides((ov) => { ov[k] = val; delete ov[RELKEY[k]]; });   // a typed value is a fixed value
   });
   $$("[data-reset]", el).forEach((a) => a.onclick = (e) => {
     e.preventDefault();
-    const ov = { ...(S.project.train_overrides || {}) };
-    delete ov[a.dataset.reset]; delete ov[RELKEY[a.dataset.reset]];
-    save(ov);
+    const k = a.dataset.reset;
+    saveOverrides((ov) => { delete ov[k]; delete ov[RELKEY[k]]; });
   });
-  if ($("#t-resetall")) $("#t-resetall").onclick = () => save({});
+  if ($("#t-resetall")) $("#t-resetall").onclick = () => saveOverrides((ov) => { for (const k of Object.keys(ov)) delete ov[k]; });
   $("#t-load").onclick = () => $("#t-sources").innerHTML ? ($("#t-sources").innerHTML = "") : drawSources();
   if ($("#t-savepreset")) $("#t-savepreset").onclick = async () => {
     const r = await ask([{ label: "プリセットの名前", value: `${S.project.name}の設定` }], "保存", "#t-presetrow");
@@ -2757,9 +2804,19 @@ const refreshRunsSoon = debounce(() => { if ($("#t-runs")) loadRuns(); if ($("#r
 async function loadRuns() {
   const el = $("#t-runs");
   if (!el) return;
-  try { S.runs = await api(`/api/projects/${S.project.id}/runs`); } catch (e) { return fail(e); }
+  const pid = S.project.id;
+  let runs;
+  try { runs = await api(`/api/projects/${pid}/runs`); } catch (e) { return fail(e); }
+  if (!S.project || S.project.id !== pid || $("#t-runs") !== el) return;   // another project or tab meanwhile
+  S.runs = runs;
   if (!S.runs.length) { el.innerHTML = `<div class="muted">まだ学習していません。</div>`; return; }
+  // the 技術ログ boxes the user has open stay open with their text (the log is reloaded only by its button)
+  const open = $$("pre[id^='log-']", el).filter((x) => !x.hidden).map((x) => [x.id, x.textContent, x.scrollTop]);
   el.innerHTML = S.runs.map(runHtml).join("");
+  for (const [id, text, top] of open) {
+    const pre = document.getElementById(id);
+    if (pre && el.contains(pre)) { pre.textContent = text; pre.hidden = false; pre.scrollTop = top; }
+  }
   bindRunButtons(el);
 }
 
@@ -2815,12 +2872,11 @@ function bindRunButtons(el) {
   $$("[data-resume]", el).forEach((b) => b.onclick = async () => {
     try { const r = await api(`/api/projects/${pid}/runs/${b.dataset.resume}/resume`, { body: {} }); toast(`ステップ ${r.resumed_from_step ?? "最終"} の保存地点から再開します`); loadRuns(); } catch (e) { fail(e); }
   });
-  $$("[data-rdel]", el).forEach((b) => b.onclick = async () => {
-    if (!b.dataset.armed) { b.dataset.armed = "1"; b.textContent = "もう一度押すと削除"; return; }
+  $$("[data-rdel]", el).forEach((b) => b.onclick = () => confirmClick(b, "もう一度押すと削除", async () => {
     b.disabled = true;
     try { await api(`/api/projects/${pid}/runs/${b.dataset.rdel}`, { method: "DELETE" }); toast("学習の履歴を削除しました"); loadRuns(); }
     catch (e) { fail(e); b.disabled = false; }
-  });
+  }));
   $$("[data-res]", el).forEach((a) => a.onclick = () => { S.resultsRun = +a.dataset.res; });
   $$("[data-log]", el).forEach((b) => b.onclick = async () => {
     const pre = $(`#log-${b.dataset.log}`);
@@ -2890,8 +2946,12 @@ function restoreForm(root, st) {
   $$("input, textarea, select", root).forEach((x) => {
     const k = formKey(x);
     if (!k || !(k in st.v)) return;
+    const focused = st.focus && st.focus[0] === k;
+    // focus before the value goes back: the browser fires "change" on blur only for a value that differs from the
+    // one at focus time, so a typed value restored after focusing still saves when the user leaves the field
+    if (focused) x.focus();
     if (x.type === "checkbox" || x.type === "radio") x.checked = st.v[k]; else x.value = st.v[k];
-    if (st.focus && st.focus[0] === k) { x.focus(); try { x.setSelectionRange(st.focus[1], st.focus[2]); } catch { /* number inputs */ } }
+    if (focused) { try { x.setSelectionRange(st.focus[1], st.focus[2]); } catch { /* number inputs */ } }
   });
   $$("details", root).forEach((x) => { const s = $("summary", x); if (s && s.textContent in st.open) x.open = st.open[s.textContent]; });
 }
@@ -3456,13 +3516,18 @@ async function drawStorageMove(det) {
   };
 }
 
-let storageMoveTimer = null;
+let storageMoveTimer = null, storageMoveGen = 0;
 async function watchStorageMove() {
   clearTimeout(storageMoveTimer);
+  const gen = ++storageMoveGen;   // a newer call (redraw, cancel) takes over: an answer to this one is dropped
   const el = $("#s-movestate");
   if (!el) return;
   let s;
-  try { s = await api("/api/storage/move"); } catch { return; }
+  try { s = await api("/api/storage/move"); } catch {
+    if (gen === storageMoveGen && el.isConnected) storageMoveTimer = setTimeout(watchStorageMove, 3000);
+    return;
+  }
+  if (gen !== storageMoveGen || !el.isConnected) return;
   if (!s.kind) { el.innerHTML = ""; return; }
   const pct = s.bytes_total ? Math.min(100, Math.round(s.bytes_done / s.bytes_total * 100)) : 0;
   el.innerHTML = `<div style="padding:8px 0">
@@ -3506,10 +3571,12 @@ const IG_SAMPLERS = ["euler_ancestral", "euler", "dpmpp_2m", "dpmpp_2m_sde", "dp
 const IG_SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple", "beta", "kl_optimal", "ddim_uniform", "linear_quadratic", "ays", "ays+", "ays_30", "gits"];
 
 async function renderSettings() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>設定</span>`;
   let d, st, lib, sto;
-  try { lib = await api("/api/library"); [d, st, sto] = await Promise.all([api("/api/models"), api("/api/status"), api("/api/storage")]); } catch (e) { return fail(e); }
+  try { lib = await api("/api/library"); [d, st, sto] = await Promise.all([api("/api/models"), api("/api/status"), api("/api/storage")]); } catch (e) { return navStale(nav) ? undefined : fail(e); }
+  if (navStale(nav)) return;
   // families whose variant cannot always be read from the file (SDXL: Illustrious / Pony ..., Z-Image: Turbo / Base)
   const famVariants = (fam) => Object.entries(d.variants).filter(([, v]) => v.family === fam && v.available !== false);
   const vopts = Object.entries(d.variants).filter(([, v]) => v.available !== false).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("");
@@ -3922,13 +3989,16 @@ const _catReloaded = new Set();
 const DICT_SHOW = 200;
 const _dcDirty = new Map();   // タグの辞書: rows typed in but not saved (kept through redraws and searches)
 async function renderDict() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><a href="#/settings">設定</a><span>›</span><span>タグの辞書</span>`;
   main.innerHTML = `<div class="muted">読み込み中…</div>`;
   let v, rd;
   try {
     [v, rd] = await Promise.all([i2tCall("ja_table"), fetch("/static/tag_readings.json").then((r) => r.ok ? r.json() : {}).catch(() => ({}))]);
+    if (navStale(nav)) return;
   } catch (e) {
+    if (navStale(nav)) return;
     main.innerHTML = `<div class="err">辞書を読み込めませんでした（${esc(e.message)}）。画像からプロンプト（i2t）が使える状態か、設定で確認してください。</div>`;
     return;
   }
@@ -4020,10 +4090,12 @@ async function renderDict() {
 }
 
 async function renderLoraSettings() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>LoRA 設定</span>`;
   main.innerHTML = `<div class="muted">読み込み中…</div>`;
-  try { S.lib = await api("/api/library"); } catch (e) { main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  try { S.lib = await api("/api/library"); } catch (e) { if (!navStale(nav)) main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (navStale(nav)) return;
   const focus = S.loraFocus; S.loraFocus = null;
   main.innerHTML = `<div class="panel">
     <div class="row"><h2 style="margin:0">LoRA 設定</h2><div class="spacer"></div>
@@ -4152,12 +4224,13 @@ const IG_SIZES = {
 };
 
 async function renderImageGen() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>画像生成</span>`;
   const entering = !$("#ig-history");   // coming to the page (not redrawn after a change on it)
   if (entering) main.innerHTML = `<div class="muted">読み込み中…</div>`;
   try {
-    [S.ig, S.lib] = await Promise.all([api("/api/imagegen"), api("/api/library")]);
+    [S.ig, S.lib] = await Promise.all([api(igStateUrl()), api("/api/library")]);
     // the page starts with the form: 「workflow のまま生成」 is never left on from before.  The last workflow read
     // (workflow_offer) keeps its 「workflow のまま生成する」 button
     if (entering) S.igInfo = null;
@@ -4166,7 +4239,8 @@ async function renderImageGen() {
       S.ig.workflow = null;
       await api("/api/imagegen/form", { method: "PUT", body: S.ig.form });
     }
-  } catch (e) { main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  } catch (e) { if (!navStale(nav)) main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (navStale(nav)) return;
   const f = S.ig.form || {};
   const ds = S.ig.default_sampling || {}, sm = f.sampling || {};
   main.innerHTML = `<div class="panel gen">
@@ -4388,10 +4462,12 @@ function plSort() {
 }
 
 async function renderPresetList() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><a href="#/gen">画像生成</a><span>›</span><span>保存した設定</span>`;
   if (!$("#pl-list")) main.innerHTML = `<div class="muted">読み込み中…</div>`;
-  try { S.pl = (await api("/api/imagegen/presets")).presets; } catch (e) { main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  try { S.pl = (await api("/api/imagegen/presets")).presets; } catch (e) { if (!navStale(nav)) main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (navStale(nav)) return;
   if (!$("#pl-list")) {
     const cur = plSort();
     main.innerHTML = `<div class="panel">
@@ -4887,29 +4963,13 @@ async function igJaTranslate(words) {
   let job;
   try { job = await api("/api/i2t/job", { body: { op: "translate", words } }); } catch (e) { b.disabled = false; msg.textContent = e.message; return; }
   msg.textContent = job.message || "訳しています…";
-  for (let errs = 0; ;) {
-    await new Promise((r) => setTimeout(r, 1000));
-    if (!$("#ig-ja")) return;   // left the page; the words are in the dictionary next time
-    let st;
-    try { st = await api("/api/i2t/job"); errs = 0; } catch (e) {
-      if (++errs < 10) continue;
-      const m = $("#ig-jatrmsg"), bb = $("#ig-jatr");
-      if (m) m.textContent = "進み具合を確かめられませんでした: " + e.message;
-      if (bb) bb.disabled = false;
-      return;
-    }
-    if (st.job && st.job.rid === job.rid) { const m = $("#ig-jatrmsg"); if (m) m.textContent = st.job.message || ""; continue; }
-    const done = st.last_done && st.last_done.rid === job.rid ? st.last_done : null;
-    if (!$("#ig-ja")) return;   // left the page; the words are in the dictionary next time
-    if (done && done.ok) {
-      TAGAC.list = null;
-      await igJaRefresh();
-      const v = done.value || {};
-      toast(`日本語に訳しました（${Object.keys(v.translated || {}).length} 語）` + (v.readings_error ? `。読みは調べられませんでした（${v.readings_error}）` : ""));
-    }
-    else { const m = $("#ig-jatrmsg"); if (m) m.textContent = done ? (done.error || "訳せませんでした") : "訳せませんでした"; const bb = $("#ig-jatr"); if (bb) bb.disabled = false; }
-    return;
-  }
+  const done = await i2tJobWait(job.rid, () => !!$("#ig-ja"), (t) => { const m = $("#ig-jatrmsg"); if (m) m.textContent = t; });
+  if (!done) return;   // left the page; the words are in the dictionary next time
+  if (!done.ok) { const m = $("#ig-jatrmsg"), bb = $("#ig-jatr"); if (m) m.textContent = done.error || "訳せませんでした"; if (bb) bb.disabled = false; return; }
+  TAGAC.list = null;
+  await igJaRefresh();
+  const v = done.value || {};
+  toast(`日本語に訳しました（${Object.keys(v.translated || {}).length} 語）` + (v.readings_error ? `。読みは調べられませんでした（${v.readings_error}）` : ""));
 }
 
 /* Wait for an i2t job started by this page.  onMsg(text) shows its progress; returns the finished job's record,
@@ -5329,6 +5389,7 @@ async function igStopAll() {
 /* 入力をリセット: the form back to empty (prompt, negative, LoRAs, 詳細設定, workflow, source image, regions ...);
    the model and the image size stay.  The toast's 元に戻す puts back what was there. */
 async function igReset() {
+  igSaveSoon.cancel();   // a save of the old inputs still waiting would land after the reset and bring them back
   const before = igRead();
   const body = { model_id: before.model_id, width: before.width, height: before.height, attention: before.attention,
     positive: "", negative: "", loras: [], count: 1, seed: null, sampling: {}, regions: { left: "", right: "" },
@@ -5343,9 +5404,13 @@ async function igReset() {
   } });
 }
 
+/* The results shown: the newest IG_PAGE, more with 「もっと見る」 (the history keeps every request). */
+const IG_PAGE = 30;
+function igStateUrl() { return `/api/imagegen?limit=${S.igShown || IG_PAGE}`; }
+
 async function igReload() {
   if (S.route[0] !== "gen" || !S.ig) return;
-  try { const r = await api("/api/imagegen"); S.ig.history = r.history; } catch (e) { return fail(e); }
+  try { const r = await api(igStateUrl()); S.ig.history = r.history; S.ig.history_more = r.history_more; } catch (e) { return fail(e); }
   igDrawHistory();
 }
 const igReloadSoon = debounce(igReload, 300);
@@ -5414,7 +5479,9 @@ function igDrawHistory() {
         <a class="igdl" href="/api/imagegen/img/${encodeURIComponent(im.file)}?dl=1" download title="この画像をダウンロード">↓</a>
         <a class="igdl igjpg" href="/api/imagegen/img/${encodeURIComponent(im.file)}?jpg=1" download title="プロンプトや workflow などの生成の情報を入れずに、JPG で保存します">JPG</a></div>`).join("")}</div>
       <div data-icopybox></div></div>`;
-  }).join("");
+  }).join("") + (S.ig.history_more > 0 ? `<div class="row"><button class="small" data-imore>もっと見る（古い結果があと ${S.ig.history_more} 件あります）</button></div>` : "");
+  const more = $("[data-imore]", el);
+  if (more) more.onclick = () => { S.igShown = (S.igShown || IG_PAGE) + IG_PAGE; igReload(); };
   $$(".igimgs", el).forEach((row) => {
     const ims = $$("[data-zoom]", row), list = ims.map((x) => ({ src: x.dataset.zoom, cap: x.dataset.cap }));
     ims.forEach((im, i) => im.onclick = () => openLightbox(list, i));
@@ -5429,6 +5496,7 @@ function igDrawHistory() {
     });
     on("[data-idel]", async () => { try { await api(`/api/imagegen/${id}`, { method: "DELETE" }); igReload(); } catch (err) { fail(err); } });
     on("[data-iuse]", async () => {
+      igSaveSoon.cancel();   // the form typed just before must not overwrite the settings put back here
       const s = e.settings;
       try {
         await api("/api/imagegen/form", { method: "PUT", body: { model_id: s.model_id, loras: s.loras, positive: s.positive, negative: s.negative,
@@ -5477,13 +5545,16 @@ async function igCopyBox(box, e) {
 // ------------------------------------------------------------------ help
 /* The page body is static/help.html.  #/help/<section id> opens the page at that section. */
 async function renderHelp(section) {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>ヘルプ</span>`;
   try {
     const r = await fetch("/static/help.html", { cache: "no-cache" });
     if (!r.ok) throw new Error(`ヘルプを読み込めませんでした（${r.status}）`);
-    main.innerHTML = await r.text();
-  } catch (e) { main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+    const html = await r.text();
+    if (navStale(nav)) return;
+    main.innerHTML = html;
+  } catch (e) { if (!navStale(nav)) main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
   $$("[data-goto]", main).forEach((a) => a.onclick = (e) => {
     e.preventDefault();
     history.replaceState(null, "", `#/help/${a.dataset.goto}`);

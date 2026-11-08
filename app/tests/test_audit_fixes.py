@@ -46,7 +46,7 @@ def test_one_unreadable_image_fails_only_itself(env, monkeypatch):
     an, analysis = env["an"], env["analysis"]
     p = _project(env)
     ids = [_image(env, p, n) for n in (1, 2, 3)]
-    monkeypatch.setattr(analysis.Analyzer, "_caption_plan", staticmethod(lambda meta, img: ("vlm", "k", None)))
+    monkeypatch.setattr(analysis.Analyzer, "_caption_plan", staticmethod(lambda meta, img: ("vlm", analysis._policy(meta), None)))
     monkeypatch.setattr(analysis.worker, "call", lambda *a, **k: {"ok": True, "texts": ["a cat", None, "a dog"]})
     an._do_captions(p, ids)
     st = [p.image(i)["caption_status"] for i in ids]

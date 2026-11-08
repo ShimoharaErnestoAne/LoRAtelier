@@ -1,106 +1,12 @@
 # LoRAtelier
 
-[English](#english) | [日本語](#日本語)
-
-<a id="english"></a>
-
-## English
-
-**This software comes with no warranty. Use it at your own risk. The author is not responsible for anything that results from its use.**
-
-The license is the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) with the additional terms below (full text in `LICENSE`). The additional terms take precedence over PolyForm.
-
-**Additional terms**
-
-1. Above all, do not use this software to infringe the copyright or other rights of others.
-2. You may use this software only as an individual, for personal hobby purposes. You may not use it for research, education, work or similar purposes, or within companies, schools or other organizations.
-3. Do not publish or distribute anything you make with this software (LoRAs, images, captions and so on). However, you may publish things made only from material you hold the rights to (such as your own drawings or your own photos).
-4. Only when you make a LoRA yourself from illustrations you drew yourself, you may publish it and use it commercially, as an exception to 2 and 3. When you publish it, write the license somewhere on what you publish (anywhere is fine, such as its description).
-5. If you distribute this software, pass these terms along with it.
-6. If you do not follow these terms, your permission to use this software ends.
-
-**Why this software exists**
-
-LoRAtelier was made as a tool for people who draw, to turn their own drawings into a LoRA themselves.
-
-A LoRA of your own style or your own characters can help with your own creative work. The drawings it learns from are yours, and so is the LoRA made from them. That is why, only for LoRAs you make yourself from drawings you made yourself, publishing them and using them commercially is allowed.
-
-On the other hand, please do not use it to collect someone else's drawings without permission and make a LoRA that imitates their style. This software is meant to help the people who draw, never to take something away from them. That is the wish behind it.
-
-The existing code and models it uses follow their own terms (`LICENSES.md`). The bundled ComfyUI custom nodes (`engines/bundled`) keep their original licenses (AGPL-3.0 / GPL-3.0).
-
-LoRAtelier is a local tool for making character LoRAs and style LoRAs: add images → fix only what needs fixing → train → compare and choose → export. Training uses existing engines (sd-scripts / musubi-tuner) as they are, and comparison images are generated with ComfyUI.
-
-The user interface (screens and help) is in Japanese.
-
-### Starting
-
-| What to do | File |
-|---|---|
-| First time only: prepare the environment (downloads several GB; on a PC without Python, a private Python is set up inside this folder) | `setup.bat` |
-| Start (a browser opens) | `start.bat` |
-| Start so that other PCs on the same network can use it too | `start_intranet.bat` |
-
-- When started with `start.bat`, the screen is at `http://127.0.0.1:7865/`. Only this PC can connect (no public link is created).
-- When started with `start_intranet.bat`, other PCs and tablets on the same network (home or office LAN) can open it in their browsers too. The address to open (for example `http://192.168.1.10:7865/`) is shown in the black window that starts.
-  - There is no password. Anyone on the same network can operate it, so use it only on networks you trust. It is not exposed to the internet.
-  - If other PCs cannot open it, allow python.exe through the Windows firewall (private networks). If a permission dialog appears the first time you start it, you can allow it there.
-  - Training and image generation run on the GPU of the PC that started it. Exported LoRAs and model folders are on that PC, and "Open folder" opens on that PC's screen.
-  - It cannot run at the same time as `start.bat`. To switch, close the running black window first.
-- Requirements: Windows, an NVIDIA GPU (12GB VRAM or more recommended), 32GB RAM or more recommended (while training SDXL, the training process alone uses about 15GB).
-- Images are never sent outside. Apart from the first download of AI models (for material analysis, about 15GB), it works without a network connection.
-
-### How to use
-
-The "ヘルプ" (Help) button at the top right explains the operations, where to put models and what to do when something goes wrong (the text is in `app/lorastudio/static/help.html`).
-
-1. First time only, prepare a base model. Setup does not download models.
-   - "標準モデルをダウンロード" (Download standard models) on the home screen gets three SDXL models (Illustrious-XL v2.0, Pony Diffusion V6 XL, SDXL 1.0 base).
-   - If you already have model files, just put them in `models\checkpoints` and they appear in the list (Anima and Qwen-Image main files go in `models\diffusion_models`, text encoders in `models\text_encoders`, VAEs in `models\vae`).
-   - Anima, Qwen-Image-2512, Qwen-Image-2.1, MOSS-Image and others can be added as a set from **Settings** → "おすすめのモデル" (Recommended models). You can also paste a Hugging Face or Civitai link, or drop a downloaded file (PixAI and others); the contents are checked and added as a model or LoRA.
-2. On the home screen, choose **Character LoRA / Style LoRA**.
-3. **Materials**: drag and drop images (pasting with Ctrl+V also works). They appear in the list right away and the checks start automatically.
-   - "要確認を優先" (Needs review first) puts images that may have problems at the top. The reason, the confidence and whether it is a fact or an estimate are shown.
-   - Use / exclude, cropping (by dragging) and caption edits are saved automatically. Ctrl+Z undoes them.
-   - Excluding is only a suggestion. Original images are never deleted.
-4. **Start training** (one click). Settings are chosen automatically. To change them, open "学習" (Training) → "詳細設定" (Advanced settings).
-5. **Results**: choose from comparison images lined up by no LoRA / saved checkpoints / strengths, then **export**.
-
-### When something goes wrong
-
-| What you see | Where to look |
-|---|---|
-| Training "failed" | The red explanation and suggested fixes on the training screen. Details are in the technical log (`data/projects/<id>/runs/<run>/logs/`) |
-| Out of GPU memory | In the advanced settings, set the batch size to 1, lower the resolution or increase block swap |
-| AI analysis does not progress | The status at the top right (it waits while training). `data/analysis_worker.log` |
-| No comparison images | `data/comfyui.log` |
-| Errors on the screen | `data/server_errors.log` |
-| Original images not found | Shown on the materials screen. If you point to a folder, only files with matching hashes are restored |
-
-### Where data is kept
-
-- `data/projects/<id>/` … projects (`sources/` has copies of the original images, `project.db` the edits, `runs/` the fixed data and results of each training, `exports/` the export folder of older versions)
-- `models/loras/<LoRA name>/` … exported LoRAs (the LoRA file, 使い方.txt (usage notes) and lora_info.json)
-- `data/settings.json` … registered models
-- "Saving the project" is automatic, "saving for resume" is the in-training save (including optimizer state), and "export" is the LoRA you use in image generation software.
-
-### Supported models
-
-The supported families are SDXL (Illustrious / NoobAI / Pony / SDXL 1.0) and Anima. Anima 2.9B (Anima expanded from 28 to 40 layers) can also be added from "Recommended models"; its generation and training through this tool are unverified. Qwen-Image-2512, Qwen-Image-2.1 and Z-Image are also supported. Image generation has been confirmed for all of them; for training, only a short Z-Image Turbo run has been tried (training of the Qwen models is unverified). When added from "Recommended models" in the settings, a lighter version for generation (GGUF quantization level, text encoder version) is chosen to fit the GPU's VRAM, and the bf16 version the training engine needs is fetched separately for training. Before training starts, it also checks that main memory meets the recommendation (64GB for Qwen-Image-2512). Training for 2.1 uses the development version of the musubi-tuner training engine. MOSS-Image is experimental, and both generation and training are unverified (training uses a separately installed sd-scripts v0.12.1 that supports MOSS-Image, and INT8 loading and block swap are chosen automatically to fit the VRAM). Krea 2 supports image generation and material generation (generation has been confirmed to work). Training uses the RAW main model (selectable since 2026-10-28; training from this tool is unverified). If you add your ComfyUI folder in the settings, ComfyUI's models and LoRAs can be used as they are, without copying. LoRAs cannot be shared between different model families.
-
-The feature that makes a character LoRA from AI-generated images lets you choose the checkpoint used for generation, file by file. Images are generated on a plain white background, and background instructions in the prompt (`city street`, `outdoors` and so on) are removed before generating (the removed words are shown on the screen).
-
-"画像からプロンプト" (Image to prompt) at the top right gives you every feature of i2t (a tool that makes prompts for Stable Diffusion and others from images).
-
-"画像生成" (Image generation) at the top right generates images from just a model, LoRAs, a prompt and an image size. If you like the result, you can copy those settings into the generation settings of a project that makes a character LoRA from AI-generated images (the image size and seed are not copied).
-
-Sources and licenses: `LICENSES.md`
-
----
+[日本語](#日本語) | [English](#english) | [更新履歴](更新履歴.md)
 
 <a id="日本語"></a>
 
 ## 日本語
+
+**更新履歴**：これまでの更新は [更新履歴.md](更新履歴.md) にまとめています。新しい更新が上に来ます。
 
 **このソフトは無保証です。使うときは自己責任でお願いします。使ったことで何か問題が起きても、作者は責任を負いません。**
 
@@ -200,3 +106,101 @@ AI で生成した画像からキャラ LoRA を作るときは、生成に使�
 画面右上の「画像生成」では、モデルと LoRA、プロンプト、画像の大きさを決めるだけで画像を生成できます。気に入った結果が出たら、その設定を、AI 生成画像からキャラ LoRA を作るプロジェクトの生成設定に写せます（画像の大きさと seed は写しません）。
 
 使っているプログラムやモデルの出典とライセンスは、`LICENSES.md` にまとめています。
+
+<a id="english"></a>
+
+## English
+
+**Changes**: see [更新履歴.md](更新履歴.md) (in Japanese, newest first).
+
+**This software comes with no warranty. Use it at your own risk. The author is not responsible for anything that results from its use.**
+
+The license is the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) with the additional terms below (full text in `LICENSE`). The additional terms take precedence over PolyForm.
+
+**Additional terms**
+
+1. Above all, do not use this software to infringe the copyright or other rights of others.
+2. You may use this software only as an individual, for personal hobby purposes. You may not use it for research, education, work or similar purposes, or within companies, schools or other organizations.
+3. Do not publish or distribute anything you make with this software (LoRAs, images, captions and so on). However, you may publish things made only from material you hold the rights to (such as your own drawings or your own photos).
+4. Only when you make a LoRA yourself from illustrations you drew yourself, you may publish it and use it commercially, as an exception to 2 and 3. When you publish it, write the license somewhere on what you publish (anywhere is fine, such as its description).
+5. If you distribute this software, pass these terms along with it.
+6. If you do not follow these terms, your permission to use this software ends.
+
+**Why this software exists**
+
+LoRAtelier was made as a tool for people who draw, to turn their own drawings into a LoRA themselves.
+
+A LoRA of your own style or your own characters can help with your own creative work. The drawings it learns from are yours, and so is the LoRA made from them. That is why, only for LoRAs you make yourself from drawings you made yourself, publishing them and using them commercially is allowed.
+
+On the other hand, please do not use it to collect someone else's drawings without permission and make a LoRA that imitates their style. This software is meant to help the people who draw, never to take something away from them. That is the wish behind it.
+
+The existing code and models it uses follow their own terms (`LICENSES.md`). The bundled ComfyUI custom nodes (`engines/bundled`) keep their original licenses (AGPL-3.0 / GPL-3.0).
+
+LoRAtelier is a local tool for making character LoRAs and style LoRAs: add images → fix only what needs fixing → train → compare and choose → export. Training uses existing engines (sd-scripts / musubi-tuner) as they are, and comparison images are generated with ComfyUI.
+
+The user interface (screens and help) is in Japanese.
+
+### Starting
+
+| What to do | File |
+|---|---|
+| First time only: prepare the environment (downloads several GB; on a PC without Python, a private Python is set up inside this folder) | `setup.bat` |
+| Start (a browser opens) | `start.bat` |
+| Start so that other PCs on the same network can use it too | `start_intranet.bat` |
+
+- When started with `start.bat`, the screen is at `http://127.0.0.1:7865/`. Only this PC can connect (no public link is created).
+- When started with `start_intranet.bat`, other PCs and tablets on the same network (home or office LAN) can open it in their browsers too. The address to open (for example `http://192.168.1.10:7865/`) is shown in the black window that starts.
+  - There is no password. Anyone on the same network can operate it, so use it only on networks you trust. It is not exposed to the internet.
+  - If other PCs cannot open it, allow python.exe through the Windows firewall (private networks). If a permission dialog appears the first time you start it, you can allow it there.
+  - Training and image generation run on the GPU of the PC that started it. Exported LoRAs and model folders are on that PC, and "Open folder" opens on that PC's screen.
+  - It cannot run at the same time as `start.bat`. To switch, close the running black window first.
+- Requirements: Windows, an NVIDIA GPU (12GB VRAM or more recommended), 32GB RAM or more recommended (while training SDXL, the training process alone uses about 15GB).
+- Images are never sent outside. Apart from the first download of AI models (for material analysis, about 15GB), it works without a network connection.
+
+### How to use
+
+The "ヘルプ" (Help) button at the top right explains the operations, where to put models and what to do when something goes wrong (the text is in `app/lorastudio/static/help.html`).
+
+1. First time only, prepare a base model. Setup does not download models.
+   - "標準モデルをダウンロード" (Download standard models) on the home screen gets three SDXL models (Illustrious-XL v2.0, Pony Diffusion V6 XL, SDXL 1.0 base).
+   - If you already have model files, just put them in `models\checkpoints` and they appear in the list (Anima and Qwen-Image main files go in `models\diffusion_models`, text encoders in `models\text_encoders`, VAEs in `models\vae`).
+   - Anima, Qwen-Image-2512, Qwen-Image-2.1, MOSS-Image and others can be added as a set from **Settings** → "おすすめのモデル" (Recommended models). You can also paste a Hugging Face or Civitai link, or drop a downloaded file (PixAI and others); the contents are checked and added as a model or LoRA.
+2. On the home screen, choose **Character LoRA / Style LoRA**.
+3. **Materials**: drag and drop images (pasting with Ctrl+V also works). They appear in the list right away and the checks start automatically.
+   - "要確認を優先" (Needs review first) puts images that may have problems at the top. The reason, the confidence and whether it is a fact or an estimate are shown.
+   - Use / exclude, cropping (by dragging) and caption edits are saved automatically. Ctrl+Z undoes them.
+   - Excluding is only a suggestion. Original images are never deleted.
+4. **Start training** (one click). Settings are chosen automatically. To change them, open "学習" (Training) → "詳細設定" (Advanced settings).
+5. **Results**: choose from comparison images lined up by no LoRA / saved checkpoints / strengths, then **export**.
+
+### When something goes wrong
+
+| What you see | Where to look |
+|---|---|
+| Training "failed" | The red explanation and suggested fixes on the training screen. Details are in the technical log (`data/projects/<id>/runs/<run>/logs/`) |
+| Out of GPU memory | In the advanced settings, set the batch size to 1, lower the resolution or increase block swap |
+| AI analysis does not progress | The status at the top right (it waits while training). `data/analysis_worker.log` |
+| No comparison images | `data/comfyui.log` |
+| Errors on the screen | `data/server_errors.log` |
+| Original images not found | Shown on the materials screen. If you point to a folder, only files with matching hashes are restored |
+
+### Where data is kept
+
+- `data/projects/<id>/` … projects (`sources/` has copies of the original images, `project.db` the edits, `runs/` the fixed data and results of each training, `exports/` the export folder of older versions)
+- `models/loras/<LoRA name>/` … exported LoRAs (the LoRA file, 使い方.txt (usage notes) and lora_info.json)
+- `data/settings.json` … registered models
+- "Saving the project" is automatic, "saving for resume" is the in-training save (including optimizer state), and "export" is the LoRA you use in image generation software.
+
+### Supported models
+
+The supported families are SDXL (Illustrious / NoobAI / Pony / SDXL 1.0) and Anima. Anima 2.9B (Anima expanded from 28 to 40 layers) can also be added from "Recommended models"; its generation and training through this tool are unverified. Qwen-Image-2512, Qwen-Image-2.1 and Z-Image are also supported. Image generation has been confirmed for all of them; for training, only a short Z-Image Turbo run has been tried (training of the Qwen models is unverified). When added from "Recommended models" in the settings, a lighter version for generation (GGUF quantization level, text encoder version) is chosen to fit the GPU's VRAM, and the bf16 version the training engine needs is fetched separately for training. Before training starts, it also checks that main memory meets the recommendation (64GB for Qwen-Image-2512). Training for 2.1 uses the development version of the musubi-tuner training engine. MOSS-Image is experimental, and both generation and training are unverified (training uses a separately installed sd-scripts v0.12.1 that supports MOSS-Image, and INT8 loading and block swap are chosen automatically to fit the VRAM). Krea 2 supports image generation and material generation (generation has been confirmed to work). Training uses the RAW main model (selectable since 2026-10-28; training from this tool is unverified). If you add your ComfyUI folder in the settings, ComfyUI's models and LoRAs can be used as they are, without copying. LoRAs cannot be shared between different model families.
+
+The feature that makes a character LoRA from AI-generated images lets you choose the checkpoint used for generation, file by file. Images are generated on a plain white background, and background instructions in the prompt (`city street`, `outdoors` and so on) are removed before generating (the removed words are shown on the screen).
+
+"画像からプロンプト" (Image to prompt) at the top right gives you every feature of i2t (a tool that makes prompts for Stable Diffusion and others from images).
+
+"画像生成" (Image generation) at the top right generates images from just a model, LoRAs, a prompt and an image size. If you like the result, you can copy those settings into the generation settings of a project that makes a character LoRA from AI-generated images (the image size and seed are not copied).
+
+Sources and licenses: `LICENSES.md`
+
+---

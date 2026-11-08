@@ -679,6 +679,15 @@ STANDARD_DIRS = {"checkpoints", "loras", "diffusion_models", "unet", "text_encod
 MODELS_LOCK = threading.RLock()
 
 
+def _models_copy() -> list[dict]:
+    """A copy of settings["models"] to change and then store with settings().set().  Changing the stored dicts in
+    place raced with another thread's settings save (json.dumps iterating a dict that grows: RuntimeError, and that
+    save lost).  Taken under the settings lock, so the copy itself is never made while a save writes."""
+    import copy
+    with config.Settings._lock:
+        return copy.deepcopy(config.settings().get("models", []))
+
+
 class Library:
     """Model files the user puts in folders.  The ComfyUI-style folders under models/ (checkpoints,
     loras, diffusion_models, text_encoders, vae) are always read; other folders are read only when
@@ -789,7 +798,7 @@ class Library:
         """A registered model whose text encoder / VAE does not fit it (e.g. the older Qwen-Image VAE chosen for
         Qwen-Image-2.1) gets a fitting one from the folders, when there is one."""
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
             changed = False
             for m in models:
                 for kind in ("te", "vae"):
@@ -869,7 +878,11 @@ class Library:
         m = {"id": uuid.uuid4().hex[:10], "name": f.stem, "variant": v, "family": fam, "files": files, "auto": True,
              "variant_confirmed": fam != "sdxl" and (fam not in ("zimage", "moss_image") or v is not None)}
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
+            for old in models:   # registered meanwhile (a double click, or a scan that found it first)
+                if any(q and str(Path(q)).lower() == str(f).lower()
+                       for k, q in old.get("files", {}).items() if k in ("ckpt", "gen", "turbo")):
+                    return old
             models.append(m)
             config.settings().set("models", models)
         return m
@@ -915,7 +928,7 @@ class Library:
         settings screen asks) is pointed to the file's new place, found by its name in the folders this tool
         reads.  The model keeps its id, so projects that use it keep working."""
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
             changed = False
             for m in models:
                 for k, p in list(m.get("files", {}).items()):
@@ -1001,7 +1014,7 @@ class Library:
         name and size (e.g. a copy) - is not added again.  A DiT model whose text encoder or VAE is not
         found is listed with the reason and not registered."""
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
             known = set()
             for m in models:
                 for p in (m.get("files", {}).get(k) for k in ("ckpt", "gen", "turbo")):
@@ -1103,7 +1116,7 @@ class Registry:
             labels = {k: lab for k, lab, _ in FAMILY_FILES[fam]}
             raise ValueError("次のどちらかを指定してください: " + " / ".join(labels[k] for k in one_of))
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
             m = {"id": uuid.uuid4().hex[:10], "name": name, "variant": variant, "family": fam,
                  "files": {k: str(Path(v)) for k, v in files.items() if v}}
             models.append(m)
@@ -1112,7 +1125,7 @@ class Registry:
 
     def update(self, model_id: str, **kw) -> None:
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
             for m in models:
                 if m["id"] == model_id:
                     m.update(kw)
@@ -1124,7 +1137,7 @@ class Registry:
         if not model_id:
             return
         with self._lock:
-            models = config.settings().get("models", [])
+            models = _models_copy()
             changed = False
             for m in models:
                 if m["id"] == model_id:

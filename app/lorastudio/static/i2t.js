@@ -27,11 +27,13 @@ function iStatus(text) { const el = $("#i-status") || $("#s-i2t-status"); if (el
 
 // ------------------------------------------------------------------ page
 async function renderI2t() {
+  const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>画像からプロンプト</span>`;
   if (!$("#i-root")) main.innerHTML = `<div class="muted">読み込み中…（初回は i2t の準備に数秒かかります）</div>`;
   let st;
-  try { st = await api("/api/i2t/state"); } catch (e) { main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  try { st = await api("/api/i2t/state"); } catch (e) { if (!navStale(nav)) main.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (navStale(nav)) return;   // another page was opened while i2t was starting
   if (!st.available) { main.innerHTML = `<div class="err">${esc(st.message)}</div>`; return; }
   I.st = st; I.c = st.consts; I.cfg = st.config; I.job = st.job; I.paused = !!(st.job && st.job.paused);
   main.innerHTML = `<div id="i-root" class="i2t">
@@ -230,8 +232,10 @@ function iDrawBoxes() {
   svg.innerHTML = out;
 }
 
+let iMenuClose = null;   // the open slot menu's document click listener
 function iSlotMenu(slot, e) {
   if (I.job) return;
+  if (iMenuClose) iMenuClose();
   const m = $("#i-menu");
   if (!multi()) {
     if (!I.slots.person) return;
@@ -243,8 +247,9 @@ function iSlotMenu(slot, e) {
       ${SLOT_ORDER.filter((k) => k !== slot).map((k) => { const o = I.slots[k]; const same = o && o.path === s.path;
         return `<button data-use="${k}" ${same ? "disabled" : ""}>この画像を ${esc(iSlotLabel(k))} にも使う${same ? " (同じ画像)" : o ? " (差し替え)" : ""}</button>`; }).join("")}</div>`;
   }
-  const close = () => { m.innerHTML = ""; document.removeEventListener("click", close); };
-  setTimeout(() => document.addEventListener("click", close), 0);
+  const close = () => { m.innerHTML = ""; document.removeEventListener("click", close); if (iMenuClose === close) iMenuClose = null; };
+  iMenuClose = close;
+  setTimeout(() => { if (iMenuClose === close) document.addEventListener("click", close); }, 0);
   $("[data-rm]", m).onclick = () => { delete I.slots[slot]; close(); iRenderPreview(); iUpdateButtons(); };
   $$("[data-use]", m).forEach((b) => b.onclick = () => { I.slots[b.dataset.use] = { ...I.slots[slot] }; close(); iRenderPreview(); });
 }
@@ -407,6 +412,7 @@ function iOnJob(m) { if (m.message) iStatus(m.message); }
 
 function onI2tEvent(m) {
   if (!$("#i-root") && !$("#s-i2t")) return;
+  if (I.job && m.rid !== I.job.rid && ["done", "fraction", "stop_state"].includes(m.event)) return;
   if ($("#s-stop")) $("#s-stop").hidden = m.event === "done";
   if (m.event === "progress") {
     if (I.job && m.rid === I.job.rid) { iStatus(m.message); if (m.fraction >= 0) iProgress(m.fraction); }
@@ -853,7 +859,8 @@ async function drawI2tSettings() {
     <div class="small i-statustext" id="s-i2t-status"></div><div class="small muted" id="s-i2t-ollama"></div>
     ${panel("タガー", `<label class="small">モデル <select id="s-tagger">${Object.entries(c.tagger_models).map(([k, v]) => `<option value="${k}" ${f.tagger_model === k ? "selected" : ""}>${esc(k)} ${esc(v.label)}${v.ready ? " / 取得済み" : ""}</option>`).join("")}</select></label>
       <button class="small" id="s-tagger-get">取得...</button>
-      <div class="row" style="margin-top:6px">しきい値 ${num("general_threshold", "一般")}${num("character_threshold", "キャラクター")}${num("style_threshold", "画風")}</div>`)}
+      <div class="row" style="margin-top:6px">しきい値 ${num("general_threshold", "一般")}${num("character_threshold", "キャラクター")}${num("style_threshold", "画風")}</div>
+      <div class="small muted">Camie Tagger では、一般のしきい値が 0.35（初期値）のままなら、配布元が勧める 0.49 を使います。</div>`)}
     ${panel("VLM (Ollama)", `<div class="row"><span class="small">モデル</span><span id="s-vlm-box" class="small"></span>
         <button class="small" id="s-pull">取得</button><button class="small" id="s-stop" ${I.job ? "" : "hidden"}>■ 中止</button></div>
       <div class="small muted">「未取得」のモデルは、選んで「取得」を押すとダウンロードします。一覧にないモデルは「ほかのモデル」を選び、Ollama のモデル名か Hugging Face の URL（GGUF のリポジトリ）を入れて「取得」します。</div>

@@ -404,7 +404,10 @@ def create_run(project, used_images: list[dict], values: dict, changed: list[str
     try:
         return _write_run(project, run_id, meta, model, fam, engine, now, used_images, values, changed, name, members)
     except Exception as e:
-        # never enqueued: without this the row would stay 待機 with an empty snapshot until the next restart
+        # never enqueued: without this the row would stay 待機 with an empty snapshot until the next restart.
+        # The folder _write_run made is not recorded anywhere (run_dir stays ""): remove it so it is not left over
+        for d in project.runs_dir.glob(f"{run_id:04d}_*"):
+            shutil.rmtree(d, ignore_errors=True)
         with project.tx() as db:
             db.execute("UPDATE runs SET status='failed', ended=?, error=? WHERE id=?",
                        (time.time(), json.dumps({"code": "prepare", "message": f"学習の準備に失敗しました: {e}",
@@ -472,6 +475,14 @@ def _write_run(project, run_id, meta, model, fam, engine, now, used_images, valu
     return run_id
 
 
+def _write_caption(txt: Path, caption: str) -> None:
+    """A caption file is only ever there whole: a run closed while it was written is completed after a restart by
+    skipping the files that exist, so a cut-off caption must never be left under the final name."""
+    tmp = txt.with_name(txt.name + ".tmp")
+    tmp.write_text(caption, encoding="utf-8")
+    os.replace(tmp, txt)
+
+
 def materialize(run_dir: Path, snap: dict) -> None:
     """Write the frozen dataset files (idempotent; a partly written dataset is completed)."""
     ds_dir = run_dir / "dataset"
@@ -490,7 +501,7 @@ def materialize(run_dir: Path, snap: dict) -> None:
             os.replace(tmp, img)
         txt = img.with_suffix(".txt")
         if not txt.exists():
-            txt.write_text(it["caption"], encoding="utf-8")
+            _write_caption(txt, it["caption"])
     enh = snap.get("enhance")
     if enh and enh["method"] == "pair":
         from .enhance import effect, make_partner
@@ -503,7 +514,7 @@ def materialize(run_dir: Path, snap: dict) -> None:
                 make_partner(ds_dir / it["file"], dest, op)
             txt = dest.with_suffix(".txt")
             if not txt.exists():
-                txt.write_text(it["caption"], encoding="utf-8")
+                _write_caption(txt, it["caption"])
 
 
 def pair_dirs(run_dir: Path, snap: dict) -> tuple[Path, Path]:
@@ -911,11 +922,16 @@ def _vram_lighter(now: dict, then: dict) -> bool:
 def last_vram_short(project, model_id: str) -> dict | None:
     """The newest run of this model that reached training, when VRAM ran out in it (else None: a later run that went
     well means the problem was dealt with)."""
-    for r in project.runs():
-        p = r.get("progress") or {}
-        if (r.get("config") or {}).get("model", {}).get("id") != model_id or not p.get("step"):
+    # only the model id of each snapshot is needed: a snapshot holds every caption, parsing them all is slow
+    rows = project.q("SELECT id, name, progress, json_extract(config, '$.model.id') AS model_id FROM runs ORDER BY id DESC")
+    for r in rows:
+        try:
+            p = json.loads(r["progress"] or "{}") or {}
+        except ValueError:
             continue
-        return {"name": r.get("name") or f"#{r['id']}", **p["vram_short"]} if p.get("vram_short") else None
+        if r["model_id"] != model_id or not p.get("step"):
+            continue
+        return {"name": r["name"] or f"#{r['id']}", **p["vram_short"]} if p.get("vram_short") else None
     return None
 
 
@@ -1032,11 +1048,12 @@ class Runner:
 
     # ---------------------------------------------------------------- queue
     def enqueue(self, project, run_id, resume=None):
+        # the row says 待機 before the runner can see the job: written after, it could overwrite 準備中
+        self._set(project, run_id, status="queued", progress={"phase": "queued", "message": "待機中"})
         with self._cond:
             self.jobs.append(Job(project, run_id, resume))
             self._save_queue()
             self._cond.notify_all()
-        self._set(project, run_id, status="queued", progress={"phase": "queued", "message": "待機中"})
         bus.publish("queue")
 
     def _save_queue(self):
@@ -1120,9 +1137,11 @@ class Runner:
         if not j or j.project.id != project.id or j.run_id != run_id:
             return {"accepted": False, "message": "実行中の学習ではありません。"}
         if j.progress.get("phase") == "evaluating":
-            # the LoRA is finished; comparison images stop after the image being generated
+            # the LoRA is finished; the comparison stops, also the image being drawn
             j.eval_cancel = True
-            j.progress["message"] = "比較画像の生成を中止しています（今の 1 枚が終わったら止まります）。学習した LoRA は残っています。"
+            from .evaluate import comfy
+            comfy.cancel_current()
+            j.progress["message"] = "比較画像の生成を中止しています。学習した LoRA は残っています。"
             self._publish(j)
             return {"accepted": True, "message": j.progress["message"]}
         if not force and j.progress.get("phase") == "training":
@@ -1134,6 +1153,13 @@ class Runner:
                 return {"accepted": False, "message": f"次の保存地点が学習の最後（ステップ {total}）です。このまま完了まで進みます。"
                                                       "すぐに止めたい場合は強制停止してください。"}
         j.stop_requested_at = time.time()
+        if j.progress.get("phase") == "queued" and j.proc is None:
+            # taken from the queue but still waiting for the GPU (analysis, image generation): nothing runs yet,
+            # so it is cancelled now; the runner skips it once the GPU is free (_loop)
+            j.force = True
+            self._set(project, run_id, status="cancelled", ended=time.time(),
+                      progress={"phase": "cancelled", "message": "開始前に中止しました"})
+            return {"accepted": True, "message": "開始前の学習を中止しました。"}
         if force or j.progress.get("phase") != "training":
             j.force = True
             if j.proc and j.proc.poll() is None:
@@ -1183,6 +1209,8 @@ class Runner:
                 # stopping take seconds); the snapshot is fixed, so nothing written later depends on that order
                 prep = self._materialize_async(job)
                 gpu.acquire(owner, on_wait=lambda job=job: self._waiting_for_analysis(job))
+                if job.stop_requested_at and job.progress.get("phase") == "queued":
+                    continue   # stopped while waiting for the GPU: already marked cancelled by stop()
                 self._run(job, prep)
             except Exception as e:
                 tb = traceback.format_exc()
@@ -1214,6 +1242,8 @@ class Runner:
 
     def _waiting_for_analysis(self, job: Job):
         """The GPU is ours, but an analysis request (material analysis, captions, i2t) has to end first."""
+        if job.stop_requested_at:
+            return   # already cancelled: keep its 中止 message
         job.progress["message"] = "GPU を使う解析（素材の解析・説明文の作成・i2t など）が終わるのを待っています"
         self._set(job.project, job.run_id, progress=dict(job.progress))
 

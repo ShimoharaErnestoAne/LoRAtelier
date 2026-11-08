@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import random
-import shutil
 import threading
 import time
 import uuid
@@ -21,9 +20,9 @@ from types import SimpleNamespace
 
 from . import comfyflow, config, loraconf
 from .evaluate import ATTENTION_FLAGS, ATTENTION_PACKAGES, attention_installed
-from .evaluate import COUPLE_FAMILIES, KEEP_COMFY_OWNERS, NATIVE_SIZE, comfy, comfy_user, wants_negpip
+from .evaluate import COUPLE_FAMILIES, KEEP_COMFY_OWNERS, NATIVE_SIZE, SAMPLING, comfy, comfy_user, take_output, wants_negpip
 from .events import bus
-from .generate import (_stage, build_graph, check_model_loras, check_seed, clamp_denoise, default_sampling, source_file,
+from .generate import (FAST_SLOTS, _stage, build_graph, check_model_loras, check_seed, clamp_denoise, default_sampling, source_file,
                        stage_comfy_input, save_source_image, stage_model_files, tuned_note)
 from .gpu import gpu
 from .models import EDIT_CHINOLL, detect_lora, experimental_note, registry
@@ -503,6 +502,10 @@ def run(eid: str):
     durations: list[float] = []   # seconds per finished image, for the remaining-time estimate
     try:
         staged = stage_model_files(model)
+        sampling = s["sampling"]
+        fast_gone = sampling.get("fast") in FAST_SLOTS and FAST_SLOTS[sampling["fast"]] not in staged
+        if fast_gone:   # the fast LoRA was removed after this request was made: its few steps / CFG 1 need it
+            sampling = {**sampling, **SAMPLING.get(model["family"], {}), "fast": "off"}
         loras = [(_stage("loras", lo["path"]), lo["strength"]) for lo in s["loras"]]
         if s.get("vae"):   # the VAE / CLIP chosen in 詳細 instead of the model's own
             staged["vae_override" if model["family"] == "sdxl" else "vae"] = _stage("vae", s["vae"])
@@ -523,6 +526,8 @@ def run(eid: str):
         no_ppm = [] if comfy.ppm or not (s.get("regions") or s["sampling"].get("rescale") == "on"
                                           or (not s.get("edit") and wants_negpip(model["family"], s["positive"], s["negative"]))) else \
             ["追加の部品（ComfyUI-ppm）を読み込めなかったため、左右の描き分け・白飛びの抑制・マイナスの強さの指定なしで生成しました。"]
+        if fast_gone:
+            no_ppm.append("高速化の LoRA が見つからなかったため、通常の手数で生成しました。")
         if init and s.get("edit") and not comfy.moss_edit:
             no_ppm.append("編集用の部品（ComfyUI-Moss-Image-Edit-Native）を読み込めなかったため、指示での編集ではなく、"
                           "元画像を下地にする方法で生成しました。")
@@ -549,16 +554,15 @@ def run(eid: str):
                               eta_s=_eta(durations, s["count"] - i - 1, this, steps * rate if rate else None))
             seed = s["seed"] + i
             g = build_graph(model, staged, loras, s.get("prompt_sent") or s["positive"], s["negative"], seed, s["width"], s["height"],
-                            s["sampling"], f"lsimg_{eid}", init=init, regions=s.get("regions"))
+                            sampling, f"lsimg_{eid}", init=init, regions=s.get("regions"))
             try:
                 out = comfy.run_prompt(g, on_progress=on_progress)
             except RuntimeError:
                 if eid in _cancel:
                     break
                 raise
-            src = config.DATA_DIR / "comfy_output" / out[0].get("subfolder", "") / out[0]["filename"]
             name = f"{eid}_{i}_s{seed}.png"
-            shutil.move(str(src), img_dir / name)
+            take_output(out[0], img_dir / name)
             images.append({"file": name, "seed": seed})
             durations.append(time.time() - t_img)
             if i == 0 and loras:
@@ -639,9 +643,8 @@ def _run_workflow(eid: str, s: dict):
             if not outs:
                 raise RuntimeError("workflow が画像を保存しませんでした")
             for k, o in enumerate(outs):
-                src = config.DATA_DIR / "comfy_output" / o.get("subfolder", "") / o["filename"]
                 name = f"{eid}_{i}{f'_{k}' if k else ''}_s{seed}.png"
-                shutil.move(str(src), img_dir / name)
+                take_output(o, img_dir / name)
                 images.append({"file": name, "seed": seed})
             durations.append(time.time() - t_img)
             _update(eid, images=images)

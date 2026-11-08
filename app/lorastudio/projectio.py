@@ -369,7 +369,9 @@ def export_stream(project: Project, include_runs: bool):
 def _rebase(obj, old: str, new: str):
     """Replace the old project folder at the start of every path string (paths are stored absolute)."""
     if isinstance(obj, str):
-        return new + obj[len(old):] if os.path.normcase(obj[:len(old)]) == os.path.normcase(old) else obj
+        # the folder itself or a path inside it, not a sibling folder whose name starts the same ("<old>_2")
+        inside = len(obj) == len(old) or obj[len(old):len(old) + 1] in ("\\", "/")
+        return new + obj[len(old):] if inside and os.path.normcase(obj[:len(old)]) == os.path.normcase(old) else obj
     if isinstance(obj, list):
         return [_rebase(x, old, new) for x in obj]
     if isinstance(obj, dict):

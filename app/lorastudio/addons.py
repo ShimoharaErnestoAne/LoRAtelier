@@ -21,6 +21,7 @@ from pathlib import Path
 from . import config
 from .events import bus
 from .models import CATALOG, catalog_entry, registry
+from .remote import NoAuthOffHost
 
 LOCK_FILE = config.ROOT / "engines.lock.json"
 _state: dict[str, dict] = {}
@@ -268,35 +269,48 @@ def _vram_gb() -> float | None:
     return _vram[0]
 
 
-class _NoAuthOffHost(urllib.request.HTTPRedirectHandler):
-    """The token goes to huggingface.co only: the signed CDN URL it redirects to rejects a second
-    credential, and should not receive the token anyway."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urllib.parse.urlsplit(newurl).hostname != urllib.parse.urlsplit(req.full_url).hostname:
-            new.remove_header("Authorization")
-        return new
-
-
 class Cancelled(Exception):
     """The user pressed キャンセル: the half-fetched file is removed (nothing is left to continue)."""
 
 
-_opener = urllib.request.build_opener(_NoAuthOffHost)
+_opener = urllib.request.build_opener(NoAuthOffHost)   # the token stays on huggingface.co (remote.NoAuthOffHost)
 _in_flight: dict[str, threading.Lock] = {}   # destination file -> lock (two catalog entries can share a file)
 
 
-def _download(repo: str, path: str, dest: Path, token: str | None, st: dict) -> None:
+def _whole(f: Path, gb: float | None) -> bool:
+    """Is the file at f the catalog file: about the listed size and, for safetensors, complete by its own header."""
+    from .remote import _incomplete
+    try:
+        if gb is not None and abs(f.stat().st_size / 1e9 - gb) > max(0.02 * gb, 0.05):
+            return False
+        return _incomplete(f, f.name, None) is None
+    except OSError:
+        return False
+
+
+def _free_name(dest: Path) -> Path:
+    """dest, or name_2.ext, name_3.ext ... : a name no file has (an existing file is never overwritten)."""
+    base, n, cand = dest.stem, 2, dest
+    while cand.exists():
+        cand = dest.with_name(f"{base}_{n}{dest.suffix}")
+        n += 1
+    return cand
+
+
+def _download(repo: str, path: str, dest: Path, token: str | None, st: dict, gb: float | None = None) -> Path:
     """Resumable: an interrupted download continues from the .part file.  The .part is named after the
-    source URL, so a different file saved under the same name never continues it."""
+    source URL, so a different file saved under the same name never continues it.  Returns where the file is:
+    dest, or a free name next to it when dest holds some other file (a cut-off manual copy, or another
+    model's file with the same generic name such as ae.safetensors), which is left as it is."""
     url = f"https://huggingface.co/{repo}/resolve/main/{path}"
     with _lock:
         guard = _in_flight.setdefault(str(dest).lower(), threading.Lock())
     with guard:
-        if dest.exists():   # fetched meanwhile by another entry that shares this file
-            st["done_bytes"] += dest.stat().st_size
-            return
+        if dest.exists():
+            if _whole(dest, gb):   # fetched meanwhile by another entry that shares this file
+                st["done_bytes"] += dest.stat().st_size
+                return dest
+            dest = _free_name(dest)
         tmp = dest.with_name(f"{dest.name}.{hashlib.sha1(url.encode()).hexdigest()[:12]}.part")
         have = tmp.stat().st_size if tmp.exists() else 0
         req = urllib.request.Request(url)
@@ -334,6 +348,7 @@ def _download(repo: str, path: str, dest: Path, token: str | None, st: dict) -> 
             raise RuntimeError(f"{dest.name} のダウンロードが途中で切れました（{short}）。"
                                "もう一度追加すると続きから取得します。")
         tmp.replace(dest)
+        return dest
 
 
 def cancel(cid: str) -> bool:
@@ -397,8 +412,7 @@ def _work(entry: dict, sources: dict, token: str | None, st: dict) -> None:
             if free < gb + 2:
                 raise RuntimeError(f"空き容量が不足しています（{name} に約 {gb:.1f}GB 必要 / 空き {free:.1f}GB）。")
             st["message"] = f"ダウンロード中: {name}"
-            _download(repo, path, dest, token, st)
-            files[key] = str(dest)
+            files[key] = str(_download(repo, path, dest, token, st, gb))
         needs = entry.get("needs") or {}
         for eng in needs.get("engines", []):
             if st.get("cancel"):

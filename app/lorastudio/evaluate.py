@@ -463,18 +463,6 @@ def _same_copy(dest: Path, src: Path) -> bool:
         return False
 
 
-def _link_or_copy(src: Path, dest: Path):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        if dest.stat().st_size == src.stat().st_size:
-            return
-        dest.unlink()
-    try:
-        os.link(src, dest)
-    except OSError:
-        shutil.copyfile(src, dest)
-
-
 # 画像生成の詳細設定「アテンション」: ComfyUI's launch options (comfy/cli_args.py attn_group); they apply to the whole
 # process, so a change restarts ComfyUI.  "": ComfyUI's own choice (PyTorch's SDPA with torch 2 on NVIDIA)
 ATTENTION_FLAGS = {"pytorch": "--use-pytorch-cross-attention", "split": "--use-split-cross-attention",
@@ -795,6 +783,7 @@ class Comfy:
                 sock.close()
 
     def _run_prompt(self, graph: dict, client: str, timeout, sock, cancels: int | None = None) -> list[dict]:
+        graph = fresh_save_prefixes(graph)
         # a slow PC (a model read from an HDD, memory swapped out) can leave ComfyUI's server unanswered for a while:
         # one look that is not answered in time is not a failure while the process lives (the whole run has `timeout`)
         try:
@@ -867,6 +856,31 @@ class Comfy:
 comfy = Comfy()
 
 
+def fresh_save_prefixes(graph: dict) -> dict:
+    """A copy of the graph whose SaveImage nodes write under a prefix no earlier prompt used.  ComfyUI answers a
+    graph it ran before from its cache, pointing at the image file of that run - which this app has already moved
+    away (a workflow run several times whose seed could not be varied, the same comparison image twice).  With a
+    new prefix only the save node runs again; everything before it stays cached."""
+    tag = uuid.uuid4().hex[:8]
+    out = {}
+    for k, n in graph.items():
+        inputs = n.get("inputs") if isinstance(n, dict) else None
+        if isinstance(inputs, dict) and n.get("class_type") == "SaveImage" and isinstance(inputs.get("filename_prefix"), str):
+            n = {**n, "inputs": {**inputs, "filename_prefix": f"{inputs['filename_prefix']}_{tag}"}}
+        out[k] = n
+    return out
+
+
+def take_output(img: dict, dest: Path) -> None:
+    """Move one image ComfyUI saved (an entry of run_prompt's result) out of its output folder to dest."""
+    src = config.DATA_DIR / "comfy_output" / img.get("subfolder", "") / img["filename"]
+    try:
+        shutil.move(str(src), dest)
+    except FileNotFoundError:
+        raise RuntimeError("ComfyUI が保存したはずの画像ファイルが見つかりません（前に作った結果を使い回した可能性があります）。"
+                           "もう一度生成してください。") from None
+
+
 class _ProgressSocket:
     """Receive-only websocket client for ComfyUI's /ws (stdlib only): calls on_progress(step, steps) for the
     "progress" messages of one prompt.  Runs in its own thread; any error just ends the progress reports."""
@@ -932,7 +946,10 @@ class _ProgressSocket:
                     continue
                 d = m.get("data") or {}
                 if m.get("type") == "progress" and self.prompt_id and d.get("prompt_id") in (None, self.prompt_id):
-                    self._cb(int(d.get("value") or 0), int(d.get("max") or 0))
+                    try:
+                        self._cb(int(d.get("value") or 0), int(d.get("max") or 0))
+                    except Exception:   # noqa: BLE001 - a failing progress report must not end the end-of-prompt signal
+                        pass
                 elif self.prompt_id and d.get("prompt_id") == self.prompt_id and (
                         m.get("type") in ("execution_success", "execution_error", "execution_interrupted")
                         or (m.get("type") == "executing" and d.get("node") is None)):
@@ -1132,16 +1149,29 @@ def comfy_lora_file(family: str, src: Path, dest: Path) -> Path:
     LoRA (not older than it) is reused: converting starts the training Python each time."""
     src, final = Path(src).resolve(), Path(dest).resolve()   # the converter runs with cwd=sd-scripts
     final.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if final.stat().st_size > 0 and final.stat().st_mtime >= src.stat().st_mtime:
-            return final
-    except OSError:
-        pass
-    dest = final.with_name(final.stem + ".part" + final.suffix)   # never leave a half-written file under the final name
-    dest.unlink(missing_ok=True)
-    _convert_lora(family, src, dest)
-    os.replace(dest, final)
-    return final
+    with _convert_lock(final):   # export and the comparison may convert the same LoRA at the same time
+        try:
+            if final.stat().st_size > 0 and final.stat().st_mtime >= src.stat().st_mtime:
+                return final
+        except OSError:
+            pass
+        # never leave a half-written file under the final name; a name of its own, so no other writer can remove it
+        dest = final.with_name(f"{final.stem}.{uuid.uuid4().hex[:8]}.part{final.suffix}")
+        try:
+            _convert_lora(family, src, dest)
+            os.replace(dest, final)
+        finally:
+            dest.unlink(missing_ok=True)
+        return final
+
+
+_convert_locks: dict[str, threading.Lock] = {}
+_convert_locks_guard = threading.Lock()
+
+
+def _convert_lock(final: Path) -> threading.Lock:
+    with _convert_locks_guard:
+        return _convert_locks.setdefault(str(final).lower(), threading.Lock())
 
 
 COMFY_INPUT = config.DATA_DIR / "comfy_input"   # images a graph loads (LoadImage): the image page's source images
@@ -1490,10 +1520,16 @@ def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, mod
                 for seed in spec["seeds"]:
                     prefix = f"lorastudio_{project.id[:20]}_r{run_id}_e{eval_id}"
                     g = graph_for(m, lora, strength, text, neg, seed + pi, spec["width"], spec["height"], prefix, mem)
-                    imgs = _run_retrying(g)
-                    src = config.DATA_DIR / "comfy_output" / imgs[0].get("subfolder", "") / imgs[0]["filename"]
+                    try:
+                        imgs = _run_retrying(g)
+                    except Exception:
+                        # a stop interrupts the image being drawn (ComfyUI reports it as an error): the progress
+                        # callback raises the cancel, so it is shown as stopped, not failed, and ComfyUI is kept
+                        if progress_cb:
+                            progress_cb(done, total, None)
+                        raise
                     name = f"p{pi}_s{seed}_{ck}_{strength:.2f}" + (f"_m{j}" if mid else "") + ".png"
-                    shutil.move(str(src), out_dir / name)
+                    take_output(imgs[0], out_dir / name)
                     results.append({"prompt": pi, "seed": seed, "ckpt": ck, "strength": strength, "file": name,
                                     **({"model": mid} if mid else {})})
                     done += 1

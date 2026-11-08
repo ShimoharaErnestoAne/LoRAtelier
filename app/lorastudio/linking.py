@@ -82,15 +82,27 @@ def links_supported(folder: Path) -> bool:
 
 
 def _sha256(p: Path, fresh: bool = False) -> str:
-    """fresh: read the file again (the check right before a file is replaced must not trust the cache)."""
+    """fresh: read the file again (the check right before a file is replaced must not trust the cache).
+    Otherwise the hash kept in settings["hash_cache"] (the same key as models.Hasher and loraconf) is used, so
+    a same-size checkpoint is not read in full again on every start of the app."""
     st = p.stat()
     key = f"{p}|{st.st_size}|{st.st_mtime_ns}"
+    saved_key = f"{p}|{st.st_size}|{int(st.st_mtime)}"   # models.Hasher._key
+    if not fresh and key not in _hash_cache:
+        saved = config.settings().get("hash_cache", {}).get(saved_key)
+        if saved:
+            _hash_cache[key] = saved
     if fresh or key not in _hash_cache:
         h = hashlib.sha256()
         with open(p, "rb") as f:
             for chunk in iter(lambda: f.read(8 << 20), b""):
                 h.update(chunk)
         _hash_cache[key] = h.hexdigest()
+        with config.Settings._lock:
+            cache = dict(config.settings().get("hash_cache", {}))
+            if cache.get(saved_key) != _hash_cache[key]:
+                cache[saved_key] = _hash_cache[key]
+                config.settings().set("hash_cache", cache)
     return _hash_cache[key]
 
 

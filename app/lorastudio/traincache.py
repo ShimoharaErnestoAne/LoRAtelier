@@ -14,6 +14,7 @@ links: an engine that rewrites a cache file it considers out of date must never 
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -83,6 +84,25 @@ def _copy(src: Path, dest: Path) -> bool:
         return False
 
 
+def _listing(d: Path) -> list[str]:
+    """The file names in a folder, sorted, read once: looking each image up with glob() read the whole folder again
+    per image (thousands of files for a large project)."""
+    try:
+        return sorted(e.name for e in os.scandir(d) if e.is_file())
+    except OSError:
+        return []
+
+
+def _starting(names: list[str], prefix: str) -> list[str]:
+    """The names in the sorted list that start with prefix."""
+    i = bisect.bisect_left(names, prefix)
+    out = []
+    while i < len(names) and names[i].startswith(prefix):
+        out.append(names[i])
+        i += 1
+    return out
+
+
 def prime(project_path: Path, run_dir: Path, snap: dict) -> int:
     """Copy stored caches into the run's folders.  Returns the number of files put in place."""
     key = group_key(snap)
@@ -94,13 +114,16 @@ def prime(project_path: Path, run_dir: Path, snap: dict) -> int:
     dest_dir = run_cache_dir(run_dir, snap)
     dest_dir.mkdir(parents=True, exist_ok=True)
     n = 0
+    stored = {sub: _listing(st / sub) for sub in ("L", "T")}
+    present = set(_listing(dest_dir))
     for it in snap.get("items") or []:
         stem = Path(it["file"]).stem
         lat, te = _keys(it, bool(snap.get("mask")))
         for sub, k in (("L", lat), ("T", te)):
-            for f in (st / sub).glob(f"{k}_*"):
-                dest = dest_dir / (stem + f.name[len(k):])
-                if not dest.exists() and _copy(f, dest):
+            for name in _starting(stored[sub], f"{k}_"):
+                dest = dest_dir / (stem + name[len(k):])
+                if dest.name not in present and _copy(st / sub / name, dest):
+                    present.add(dest.name)
                     n += 1
     return n
 
@@ -116,18 +139,21 @@ def harvest(project_path: Path, run_dir: Path, snap: dict) -> int:
         return 0
     st = store_dir(project_path, key)
     n = 0
+    names = _listing(src_dir)
+    stored = {sub: set(_listing(st / sub)) for sub in ("L", "T")}
     for it in snap.get("items") or []:
         stem = Path(it["file"]).stem
         lat, te = _keys(it, bool(snap.get("mask")))
-        for f in src_dir.glob(f"{stem}_*"):
-            if f.name.endswith(".part"):
+        for name in _starting(names, f"{stem}_"):
+            if name.endswith(".part"):
                 continue
-            sub, k = ("T", te) if is_te(f.name) else ("L", lat)
-            dest = st / sub / (k + f.name[len(stem):])
-            if dest.exists():
+            sub, k = ("T", te) if is_te(name) else ("L", lat)
+            dest = st / sub / (k + name[len(stem):])
+            if dest.name in stored[sub]:
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if _copy(f, dest):
+            if _copy(src_dir / name, dest):
+                stored[sub].add(dest.name)
                 n += 1
     return n
 
@@ -200,13 +226,12 @@ def complete(run_dir: Path, snap: dict) -> set[str]:
     items = snap.get("items") or []
     if not items or not d.exists():
         return set()
-    names = [f.name for f in d.iterdir() if f.is_file() and not f.name.endswith(".part")]
+    names = [n for n in _listing(d) if not n.endswith(".part")]
     have_l, have_t = set(), set()
     for it in items:
         stem = Path(it["file"]).stem + "_"
-        for n in names:
-            if n.startswith(stem):
-                (have_t if is_te(n) else have_l).add(stem)
+        for n in _starting(names, stem):
+            (have_t if is_te(n) else have_l).add(stem)
     stems = {Path(it["file"]).stem + "_" for it in items}
     return {k for k, have in (("latents", have_l), ("te", have_t)) if have >= stems}
 

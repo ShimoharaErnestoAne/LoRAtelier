@@ -168,8 +168,7 @@ def test_batch_reservation_varies_one_setting_and_rejects_bad_values(env, monkey
             "resolution": 1024, "seed": 42, "train_batch_size": 2}
     plan = {"preflight": {"errors": [], "warnings": [], "info": {}}, "values": dict(vals), "defaults": dict(vals), "changed": [],
             "model": {"family": "sdxl"}}
-    monkeypatch.setattr(server, "_plan", lambda proj: plan)
-    monkeypatch.setattr(server, "_used_images", lambda proj: [])
+    monkeypatch.setattr(server, "_plan_with", lambda proj: (plan, [], None))
     made = []
     monkeypatch.setattr(server, "create_run", lambda proj, used, v, changed, name, members=None: made.append((v, changed, name)) or len(made))
     monkeypatch.setattr(server.runner, "enqueue", lambda *a, **k: None)

@@ -153,7 +153,11 @@ class Project:
         class _Tx:
             def __enter__(self_inner):
                 proj._lock.acquire()
-                proj.db.execute("BEGIN IMMEDIATE")
+                try:
+                    proj.db.execute("BEGIN IMMEDIATE")
+                except BaseException:   # e.g. a locked or vanished database: __exit__ will not run, free the lock here
+                    proj._lock.release()
+                    raise
                 return proj.db
 
             def __exit__(self_inner, exc_type, exc, tb):

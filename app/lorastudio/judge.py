@@ -37,10 +37,12 @@ def build_context(images: list[dict], meta: dict, identity: dict | None = None) 
     """Dataset-wide context needed for per-image checks (duplicates, similarity, sharpness baseline)."""
     first_by_sha, dup_of = {}, {}
     for im in images:
-        if im["sha"] in first_by_sha:
-            dup_of[im["id"]] = first_by_sha[im["sha"]]
+        # the same file cut out differently (e.g. whole body and face) is two pictures, not a duplicate
+        k = (im["sha"], tuple(im.get("crop") or ()))
+        if k in first_by_sha:
+            dup_of[im["id"]] = first_by_sha[k]
         else:
-            first_by_sha[im["sha"]] = im["id"]
+            first_by_sha[k] = im["id"]
     near: dict[int, set[int]] = {}
     cand = [im for im in images if im.get("fast") and im["fast"].get("ok") and im["id"] not in dup_of]
     if len(cand) > 1:

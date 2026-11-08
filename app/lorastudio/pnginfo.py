@@ -37,7 +37,8 @@ A1111_SCHEDULERS = {
 # the parameter part of an infotext line (A1111 modules/infotext_utils.py re_param)
 RE_PARAM = re.compile(r'\s*(\w[\w \-/]+):\s*("(?:\\.|[^\\"])+"|[^,]*)(?:,|$)')
 RE_LORA = re.compile(r"<lora:([^:>]+)(?::([-+]?[0-9.]+))?[^>]*>", re.I)
-RE_OWN = re.compile(r"^lsimg_([0-9a-f]{12})$")   # imagegen.run: the SaveImage prefix of this app's own images
+# imagegen.run: the SaveImage prefix of this app's own images (+ the per-prompt tag of evaluate.fresh_save_prefixes)
+RE_OWN = re.compile(r"^lsimg_([0-9a-f]{12})(?:_[0-9a-f]{8})?$")
 
 
 def _num(v: Any, kind=float):
@@ -52,6 +53,16 @@ def _blank() -> dict:
             "sampling": {}, "model_name": None, "loras": [], "notes": [], "vae_name": None, "te_name": None, "attention": None}
 
 
+def _utf16(body: bytes) -> str:
+    """UTF-16 without a stated byte order.  The NUL bytes of ASCII characters show it (high byte first: at even
+    positions); text with none (all Japanese) is read as big-endian, which A1111 (piexif) writes."""
+    if body[:2] == b"\xfe\xff":
+        return body[2:].decode("utf-16-be", "replace")
+    if body[:2] == b"\xff\xfe":
+        return body[2:].decode("utf-16-le", "replace")
+    return body.decode("utf-16-le" if body[1::2].count(0) > body[0::2].count(0) else "utf-16-be", "replace")
+
+
 def _decode_user_comment(raw: Any) -> str:
     """EXIF UserComment (the first 8 bytes name the character code)."""
     if isinstance(raw, str):
@@ -60,7 +71,7 @@ def _decode_user_comment(raw: Any) -> str:
         return ""
     head, body = raw[:8], raw[8:]
     if head.startswith(b"UNICODE"):
-        return body.decode("utf-16-be" if body[:1] == b"\x00" else "utf-16-le", "replace").strip("\x00 ")
+        return _utf16(body).strip("\x00 ")
     if head.startswith(b"ASCII") or head == b"\x00" * 8:
         return body.decode("utf-8", "replace").strip("\x00 ")
     return raw.decode("utf-8", "replace").strip("\x00 ")

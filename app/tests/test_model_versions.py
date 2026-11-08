@@ -60,9 +60,10 @@ def test_qwen21_text_encoder_follows_the_gpu(env, monkeypatch, vram, te):
 def _fake_fetch(monkeypatch):
     from lorastudio import addons
 
-    def dl(repo, path, dest, token, st):
+    def dl(repo, path, dest, token, st, gb=None):
         if not dest.exists():
             _st(dest, QWEN if "diffusion_models" in str(dest) and dest.suffix == ".safetensors" else {"x": "BF16"})
+        return dest
     monkeypatch.setattr(addons, "_download", dl)
     monkeypatch.setattr(addons, "install_engine", lambda name: None)
     monkeypatch.setattr(addons, "fetch_tokenizers", lambda repos: None)

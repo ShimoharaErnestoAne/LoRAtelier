@@ -89,13 +89,19 @@ def test_block_swap_comes_first_where_the_engine_has_it(env):
     assert "ブロックスワップ" not in training.vram_advice("anima", {"blocks_to_swap": 26})
 
 
+def _add_run(proj, name, model, progress):
+    with proj.tx() as db:
+        db.execute("INSERT INTO runs(created, status, name, config, run_dir, progress) VALUES(?,?,?,?,?,?)",
+                   (0, "done", name, json.dumps({"model": {"id": model}, "items": []}), "", json.dumps(progress)))
+
+
 def test_next_start_warns_until_the_settings_need_less_vram(env):
-    from lorastudio import training
+    from lorastudio import store, training
     short = {"train_batch_size": 2, "resolution": 1024}
-    runs = [{"id": 3, "name": "#3", "config": {"model": {"id": "m"}}, "progress": {"step": 0}},   # not started: skipped
-            {"id": 2, "name": "#2", "config": {"model": {"id": "m"}}, "progress": {"step": 40, "vram_short": short}},
-            {"id": 1, "name": "#1", "config": {"model": {"id": "m"}}, "progress": {"step": 900}}]
-    proj = SimpleNamespace(runs=lambda: runs)
+    proj = store.ProjectManager().create("vram", "character", None)
+    _add_run(proj, "#1", "m", {"step": 900})
+    _add_run(proj, "#2", "m", {"step": 40, "vram_short": short})
+    _add_run(proj, "#3", "m", {"step": 0})   # not started: skipped
     assert training.last_vram_short(proj, "m")["name"] == "#2"
     assert training.last_vram_short(proj, "other") is None
     assert not training._vram_lighter({"train_batch_size": 2, "resolution": 1024}, short)
@@ -103,7 +109,7 @@ def test_next_start_warns_until_the_settings_need_less_vram(env):
     assert training._vram_lighter({"train_batch_size": 2, "resolution": 896}, short)
     assert training._vram_lighter({"blocks_to_swap": 4}, {"blocks_to_swap": 0})
     # a later run of the same model that went well: the shortage was dealt with
-    runs.insert(0, {"id": 4, "name": "#4", "config": {"model": {"id": "m"}}, "progress": {"step": 900}})
+    _add_run(proj, "#4", "m", {"step": 900})
     assert training.last_vram_short(proj, "m") is None
 
 

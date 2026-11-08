@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import tkinter as tk
@@ -260,6 +260,15 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def upright(im: Image.Image) -> Image.Image:
+    """EXIF の向き (Orientation) どおりに起こした画像 (向きの情報が無ければそのままの写し)。スマホの縦写真が
+    横倒しのままタガー・人物検出・VLM に渡らないように。ブラウザーや画像ビューアーも同じ向きで表示する。"""
+    try:
+        return ImageOps.exif_transpose(im)
+    except Exception:  # noqa: BLE001 - 壊れた EXIF は向きを変えずに使う
+        return im.copy()
+
+
 def load_config() -> dict[str, Any]:
     data: dict[str, Any] = {}
     if CONFIG_PATH.exists():
@@ -313,7 +322,9 @@ def load_config() -> dict[str, Any]:
 
 def save_config(cfg: dict[str, Any]) -> None:
     keep = {k: cfg.get(k, v) for k, v in DEFAULT_CONFIG.items()}
-    CONFIG_PATH.write_text(json.dumps(keep, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(keep, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    os.replace(tmp, CONFIG_PATH)
 
 
 # --------------------------------------------------------------------------
@@ -526,6 +537,9 @@ RATING_MODEL_PATH = MODELS_DIR / "rating" / "anime_rating_mobilenetv3.onnx"
 RATING_LABELS = ["general", "sensitive", "explicit"]   # safe / r15 / r18 の順
 CAMIE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)   # ImageNet
 CAMIE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Camie Tagger v2 の配布元が勧める一般タグのしきい値 (モデルカードの Macro 最適値 0.492)。WD 向けの既定値 0.35 のまま
+# Camie を使うと、Camie には低すぎてタグが増えすぎる。設定を既定値から変えていればその値を使う
+CAMIE_GENERAL_THRESHOLD = 0.49
 
 
 def tagger_is_camie(name: str) -> bool:
@@ -656,6 +670,8 @@ class WD14Tagger:
     def predict(self, image: Image.Image, general_th: float, character_th: float, flip: bool = False) -> TagResult:
         """flip=True なら左右反転した画像でもタグ付けし、確率を平均する (しきい値の近くのタグの揺れを減らす。時間は 2 倍)。
         タガーの語彙に左右 (left / right) を含む一般タグは無いので、反転してもタグの意味は変わらない。"""
+        if self.camie and abs(general_th - DEFAULT_CONFIG["general_threshold"]) < 1e-6:
+            general_th = CAMIE_GENERAL_THRESHOLD
         probs = self._probs(image)
         if flip:
             probs = (probs + self._probs(image.transpose(Image.Transpose.FLIP_LEFT_RIGHT))) / 2
@@ -668,7 +684,7 @@ class WD14Tagger:
                 ratings[name] = p
             elif category == 0:
                 general_probs[name] = p
-                if p >= min(general_th, LOW_THRESHOLD_TAGS.get(name, general_th)):
+                if p >= (general_th if self.camie else min(general_th, LOW_THRESHOLD_TAGS.get(name, general_th))):
                     general.append((name, p))
             elif category == 4 and p >= character_th:
                 characters.append((name, p))
@@ -696,7 +712,7 @@ class WD14Tagger:
         return {label: float(p) for label, p in zip(RATING_LABELS, out)}
 
 
-# タグごとのしきい値 (全体のしきい値より低い方を使う)。Danbooru の全年齢 532 枚で実測し (2026-09-27)、
+# タグごとのしきい値 (全体のしきい値より低い方を使う。WD タガーで測った値なので Camie には使わない)。Danbooru の全年齢 532 枚で実測し (2026-09-27)、
 # 当たりが大きく増え、偏りの無い 322 枚で誤検出が少ししか増えなかった値だけ (DEVLOG 38)。
 # 例: angry 17% → 42%、surprised 13% → 39%、motion lines 21% → 45%、speed lines 5% → 32%、pov 57% → 78%、from behind 57% → 83%。
 # expressionless / frown / scared / from side / dutch angle は誤検出が増えるか効果が小さいので入れない。
@@ -5851,6 +5867,8 @@ class Engine:
         self.last_vlm: tuple[str, float] | None = None  # (モデル, 実際にかかった秒数)
         self._tagger: WD14Tagger | None = None
         self._vlm: OllamaVLM | None = None
+        self._writer: OllamaVLM | None = None   # 説明を書いている最中の describer (中止で接続を切る)
+        self.describe_seconds = 0.0             # describer にかかった秒数 (VLM の見込み時間から除く)
         self._era: EraClassifier | None = None
         self._person: PersonDetector | None = None
         self._head: HeadDetector | None = None
@@ -5869,6 +5887,9 @@ class Engine:
         self._cancel.set()
         if self._vlm is not None:
             self._vlm.abort()
+        writer = self._writer
+        if writer is not None:
+            writer.abort()
 
     def _check(self) -> None:
         if self._cancel.is_set():
@@ -5973,12 +5994,17 @@ class Engine:
         name = str(self.cfg.get("describer_model") or "").strip()
         if not name or name == vlm.model:
             return ""
+        if "vision" not in vlm.capabilities():   # いつもの VLM が画像を読めないなら、説明を書かせても使えない
+            return ""
         self._check()
         self.progress(f"{self._describer_label()} で画像の説明を書いています... (「■ 中止」で止められます)")
         writer = OllamaVLM(vlm.host, name, vlm.timeout)
         writer.keep_alive = 0 if self._low_vram() else None
         writer.cancel_event = self._cancel
+        started = time.time()
+        self._writer = writer
         try:
+            self._check()   # 中止が _writer を置く直前に来たとき
             return writer.describe(image)
         except OperationCancelled:
             raise
@@ -5987,12 +6013,15 @@ class Engine:
                 raise OperationCancelled() from e
             warnings.append(f"{self._describer_label()} の説明をスキップしました: {describe_error(e)}")
             return ""
+        finally:
+            self._writer = None
+            self.describe_seconds = time.time() - started
 
     @staticmethod
     def _open(path: Path) -> Image.Image:
         with Image.open(path) as opened:
             opened.load()  # アニメーション GIF は先頭フレーム
-            return opened.copy()
+            return upright(opened)
 
     def run(self, path: Path, refs: dict[str, Path] | None = None, controls: dict[str, Any] | None = None) -> PromptResult:
         """1 枚を解析する。refs ({"pose" / "outfit" / "background": パス}) を渡すと複数枚モード (path = ① メイン)。
@@ -6153,6 +6182,7 @@ class Engine:
             est = float(seconds) if isinstance(seconds, (int, float)) and seconds > 0 else 0.0
             self.fraction(0.40, (est, 0.40, 0.95) if est else None)
             vlm_started = time.time()
+            self.describe_seconds = 0.0
             vlm = self._run_vlm(
                 numbered_boxes_image(inputs.vlm_image, [p["box"] for p in inputs.persons])
                 if len(inputs.persons) >= 2 and not ref_tags else inputs.vlm_image,
@@ -6169,10 +6199,12 @@ class Engine:
                     NO_STYLE_VLM if no_style else "",
                 ) if x),
                 look=look_prose(look) if look else "",
+                describe_image=inputs.vlm_image,
+                persons_guided=inputs.main_person is not None or bool(inputs.persons),
             )
             warnings += vlm.warnings
             if vlm.ok:
-                self.last_vlm = (model, round(time.time() - vlm_started, 1))
+                self.last_vlm = (model, round(time.time() - vlm_started - self.describe_seconds, 1))
             self.fraction(0.95, None)
             if vlm.analysis:
                 analysis = pair_header + vlm.analysis
@@ -6722,7 +6754,7 @@ class Engine:
         if pose_whole_image is not None:
             self._check()
             self.progress("タガーで推論中 (② ポーズの画像全体の構図)...")
-            ref_tags["pose"] = camera_from_whole(ref_tags["pose"], tagger.predict(pose_whole_image, general_th, character_th))
+            ref_tags["pose"] = camera_from_whole(ref_tags["pose"], predict_once(pose_whole_image))
         # 画角は一番確信度の高いものを 1 つ必ず入れる (構図を取る画像: ② があれば ②、無ければ ①)
         if "pose" in ref_tags:
             ref_tags["pose"] = ensure_framing(ref_tags["pose"])
@@ -7072,7 +7104,8 @@ class Engine:
     def _run_vlm(
         self, image: Image.Image, tags: TagResult, medium: str, negative: list[str], target: str,
         size: tuple[int, int], vlm_refs: list[tuple[str, Image.Image, TagResult]], hint_count: int, hint_tags: list[str],
-        extra_guidance: str = "", look: str = "",
+        extra_guidance: str = "", look: str = "", describe_image: Image.Image | None = None,
+        persons_guided: bool = False,
     ) -> VlmOutcome:
         """VLM で分析する。失敗してもタガーの結果で続けられるよう、理由を warnings に入れて空の結果を返す
         (中止だけは OperationCancelled を投げる)。"""
@@ -7087,12 +7120,12 @@ class Engine:
                 guidance += "\n" + LOOK_VLM.format(look=look)
             if extra_guidance:
                 guidance += "\n" + extra_guidance
-            elif not vlm_refs and hint_count >= 2:
+            if not vlm_refs and not persons_guided and hint_count >= 2:   # 人物ごとの指示が無いときだけ
                 guidance += (
                     f"\nThe tagger suggests {hint_count} people ({', '.join(hint_tags)}). Fill persons with one "
                     "entry per person and keep each person's attributes separate."
                 )
-            described = self._describe(image, vlm, result.warnings)
+            described = self._describe(image if describe_image is None else describe_image, vlm, result.warnings)
             if described:
                 guidance += "\n" + DESCRIBER_VLM.format(text=described)
             separate = tuple(slot for slot, _, _ in vlm_refs if slot in VLM_SEPARATE_SLOTS)
@@ -8329,7 +8362,7 @@ def cli_controls(args: argparse.Namespace, engine: "Engine", log: Callable[[str]
         if not src.is_file():
             raise ValueError(f"骨格を取る画像が見つかりません: {args.bones_from}")
         with Image.open(src) as im:
-            image = im.convert("RGB")
+            image = upright(im).convert("RGB")
         log(f"[{APP_NAME}] 骨格を推定中: {src.name}")
         estimator = PoseEstimator(progress=lambda m: log(f"[{APP_NAME}] {m}"))
         box = main_person_box(engine.person_detector().detect(image))
@@ -9111,7 +9144,7 @@ class PoseEditor:
         if source is not None:
             try:
                 with Image.open(source) as im:
-                    self.image = im.convert("RGB")
+                    self.image = upright(im).convert("RGB")
             except OSError:
                 self.image = None
         self.size = self.image.size if self.image else POSE_TEMPLATE_SIZE
@@ -10683,9 +10716,10 @@ class App:
         try:
             with Image.open(path) as im:
                 im.load()
-                width, height = im.size
                 gen_info = generation_info_from_image(im)
-                thumb = im.convert("RGB")
+                shown = upright(im)
+                width, height = shown.size
+                thumb = shown.convert("RGB")
                 thumb.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.LANCZOS)
         except Exception as e:  # noqa: BLE001
             message = f"画像を開けません: {path.name} ({describe_error(e)})"

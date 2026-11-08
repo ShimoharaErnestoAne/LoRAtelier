@@ -75,17 +75,40 @@ class Settings:
         self.data = {"models": [], "hash_cache": {}, "first_run_done": False}
         if path.exists():
             try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
+                loaded = json.loads(self._read(path))
                 if not isinstance(loaded, dict):
                     raise ValueError("settings.json is not an object")
                 self.data.update(loaded)
-            except (OSError, ValueError):   # JSONDecodeError and UnicodeDecodeError are ValueErrors
-                # keep a copy of the broken file instead of silently discarding it (an earlier copy is kept too)
+            except ValueError:   # JSONDecodeError and UnicodeDecodeError are ValueErrors: the file itself is broken
+                # keep a copy of the broken file instead of silently discarding it (an earlier copy is kept too).
+                # If it cannot be moved aside, do not go on with defaults: the first save would replace it for good.
                 broken = path.with_name(f"{path.stem}.broken-{time.strftime('%Y%m%d-%H%M%S')}.json")
                 try:
                     os.replace(path, broken)
                 except OSError:
-                    pass
+                    try:
+                        import shutil
+                        shutil.copy2(path, broken)
+                    except OSError as e:
+                        raise RuntimeError(f"設定ファイル {path} が壊れていて、退避もできませんでした（{e}）。"
+                                           "ほかのソフトがこのファイルを開いていないか確認してから、起動し直してください。") from e
+
+    @staticmethod
+    def _read(path: Path, tries: int = 5) -> str:
+        """A read that fails for a moment (antivirus or backup software holding the file) is retried.  A file
+        that still cannot be read stops the start: going on with defaults would lose the registered models,
+        storage folders and LoRA settings, and the first save would overwrite the real file with them."""
+        for i in range(tries):
+            try:
+                return path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                raise
+            except OSError as e:
+                if i == tries - 1:
+                    raise RuntimeError(f"設定ファイル {path} を読めませんでした（{e}）。ほかのソフト（ウイルス対策・"
+                                       "バックアップなど）がこのファイルを開いていないか確認してから、起動し直してください。") from e
+                time.sleep(0.5 * (i + 1))
+        return ""
 
     def save(self) -> None:
         with self._lock:

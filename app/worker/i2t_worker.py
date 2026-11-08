@@ -86,6 +86,8 @@ i2t = None
 engine = None
 _job: dict = {"rid": None, "cancel": None, "gate": None, "vlm": None}
 _job_lock = threading.Lock()
+_cfg_lock = threading.Lock()   # i2t's config.json: read-modify-write from the analysis and the settings page
+_pose_estimator = None         # reused across 骨格を推定 calls (one ONNX session)
 
 
 # ------------------------------------------------------------------ helpers
@@ -284,8 +286,9 @@ def _call(rid: int, req: dict) -> None:
         if name in ("read_generation_info",):
             args[0] = Path(args[0])
         if name == "save_config":           # the window saves its whole settings dict
-            fn(args[0])
-            value = i2t.load_config()
+            with _cfg_lock:
+                fn(args[0])
+                value = i2t.load_config()
         else:
             value = fn(*args, **(req.get("kwargs") or {}))
         emit({"rid": rid, "ok": True, "value": value})
@@ -301,22 +304,22 @@ def _analyze(rid: int, req: dict) -> None:
         engine.cfg = cfg
         engine.progress = lambda m: emit({"event": "progress", "rid": rid, "message": str(m)})
         engine.fraction = lambda f, est=None: emit({"event": "fraction", "rid": rid, "value": f, "est": est})
-        engine.reset_cancel()
         path = Path(req["path"])
         refs = {k: Path(v) for k, v in (req.get("refs") or {}).items() if v}
         result = engine.run(path, refs, req.get("controls") or {})
         vlm_kept = _kept_vlm()
         if engine.last_vlm:   # remembered per model for the next estimate (as the window does)
             model, secs = engine.last_vlm
-            saved = i2t.load_config()
-            saved["vlm_seconds"] = {**(saved.get("vlm_seconds") or {}), model: secs}
-            i2t.save_config(saved)
+            with _cfg_lock:   # the settings page may save at the same moment: neither may lose the other's change
+                saved = i2t.load_config()
+                saved["vlm_seconds"] = {**(saved.get("vlm_seconds") or {}), model: secs}
+                i2t.save_config(saved)
             engine.last_vlm = None
         hist = None
         try:
             from PIL import Image
             with Image.open(path) as im:
-                thumb = im.convert("RGB")
+                thumb = i2t.upright(im).convert("RGB")
                 thumb.thumbnail((256, 256))
             hist = i2t.history_add(result, thumb, {"mosaic_strength": cfg.get("mosaic_strength"), "mode": req.get("mode", "single")})
         except Exception as e:   # the history is a convenience; the result is shown either way
@@ -596,8 +599,11 @@ def _pose_estimate(rid, req, cancel):
     missing = not i2t.pose_model_ready() or not i2t.model_file_ok(i2t.PERSON_MODEL_PATH)
     _progress(rid)("モデルを取得中... (初回のみ)" if missing else "骨格を推定中...")
     with Image.open(req["path"]) as im:
-        image = im.convert("RGB")
-    estimator = i2t.PoseEstimator()
+        image = i2t.upright(im).convert("RGB")   # the browser shows the image upright: the points must match
+    global _pose_estimator
+    if _pose_estimator is None:
+        _pose_estimator = i2t.PoseEstimator(None, cancel)
+    estimator = _pose_estimator
     box = i2t.main_person_box(engine.person_detector().detect(image))
     points = [list(p) for p in estimator.estimate(image, box)]
     hidden = [i2t.KEYPOINTS[i][1] for i, p in enumerate(points) if p[2] < i2t.POSE_MIN_CONF]
@@ -709,6 +715,8 @@ def main() -> None:
             if not _begin_job(rid):
                 emit({"rid": rid, "ok": False, "error": "ほかの処理の最中です。終わってからもう一度押してください。"})
             elif op == "analyze":
+                # here, on the thread that also handles "cancel": a cancel sent right after this start is not wiped
+                engine.reset_cancel()
                 threading.Thread(target=_analyze, args=(rid, req), daemon=True).start()
             else:
                 threading.Thread(target=_run_job, args=(rid, op, req), daemon=True).start()

@@ -56,6 +56,22 @@ def _other_image(old_key: str | None, new_key: str) -> bool:
     return bool(old_key) and old_key.split(":")[-2:] != new_key.split(":")[-2:]
 
 
+def _policy(meta: dict, trigger: str | None = None) -> str:
+    """The caption policy key of the project (what the VLM is told to write); `trigger` overrides the project's."""
+    return captions.policy_key(meta["kind"], meta.get("outfit_mode", "include"), captions.project_style(meta),
+                               meta["trigger"] if trigger is None else trigger, meta.get("concept_words") or [],
+                               captions.concept_target(meta))
+
+
+def _cap_ckey(policy: str, img: dict) -> str:
+    """Cache key of the VLM caption written for this picture (file and crop) under `policy`."""
+    return f"cap:{policy}:{img['sha'][:24]}:{img.get('crop')}"
+
+
+def _mono(meta: dict, img: dict) -> bool:
+    return meta["kind"] != "style" and captions.is_monochrome(img)
+
+
 def _no_caption(img) -> dict:
     """A failed analysis makes no caption; an image waiting for one would show "being made" forever."""
     return {"caption_status": "skipped"} if img and img.get("caption_status") in ("pending", "running") else {}
@@ -109,6 +125,14 @@ class WorkerClient:
             if "event" in msg:
                 ev = msg["event"]
                 if ev == "ready":
+                    if msg.get("version") not in (None, ANALYZER_VERSION):   # the two constants must be bumped together
+                        self.last_error = (f"解析ワーカーの版 ({msg.get('version')}) がアプリの版 ({ANALYZER_VERSION}) と"
+                                           "合いません。アプリを更新し直してください。")
+                        try:
+                            with open(config.DATA_DIR / "analysis_worker.log", "a", encoding="utf-8") as f:
+                                f.write(f"version mismatch: worker {msg.get('version')} / app {ANALYZER_VERSION}\n")
+                        except OSError:
+                            pass
                     self.gpu_error = msg.get("gpu_error")
                     self.cpu_since = time.time() if self.gpu_error else None
                 self.status = (("ready_cpu" if self.gpu_error else "ready") if ev in ("ready", "loaded")
@@ -156,6 +180,10 @@ class WorkerClient:
                 now = time.time()
                 if self.status.startswith("loading") and now < load_end:
                     deadline = max(deadline, now + timeout)
+                elif now >= deadline and any(r < rid for r in list(self._pending)):
+                    # the worker answers one request at a time: this one has not started yet (an earlier one,
+                    # e.g. a caption batch, is still running and has its own limit), so it is not stuck
+                    deadline = now + timeout
                 elif now >= deadline:
                     self._pending.pop(rid, None)
                     self.kill()
@@ -219,6 +247,16 @@ def _release_worker_vram():
 gpu.on_exclusive(_release_worker_vram)
 
 
+def _stamp(f: Path) -> list:
+    st = f.stat()
+    return [st.st_size, st.st_mtime_ns]
+
+
+def _stamp_ok(cached: dict, f: Path) -> bool:
+    """A mask cache entry still describes the file (older entries have no stamp and are trusted as before)."""
+    return "file" not in cached or cached["file"] == _stamp(f)
+
+
 CAPTION_BATCH = 8   # images per VLM call; the worker halves the batch when the GPU runs out of memory
 
 
@@ -235,6 +273,7 @@ class Analyzer:
         self._seq = itertools.count()
         self._queued: set[tuple] = set()
         self._forced: set[tuple] = set()   # (project, image) to analyse again without the cache
+        self._captioning: dict[tuple, str] = {}   # (project, image) -> caption key being written by the VLM now
         self._qlock = threading.Lock()
         self.current: tuple | None = None
         threading.Thread(target=self._dispatch_loop, daemon=True, name="ai-dispatch").start()
@@ -315,8 +354,8 @@ class Analyzer:
         style = captions.project_style(meta)
         kind, outfit, trig = meta["kind"], meta.get("outfit_mode", "include"), meta["trigger"]
         concept = meta.get("concept_words") or []
-        key = captions.policy_key(kind, outfit, style, trig, concept, captions.concept_target(meta))
-        mono = kind != "style" and captions.is_monochrome(img)
+        key = _policy(meta)
+        mono = _mono(meta, img)
         mode = meta.get("caption_mode") or captions.default_caption_mode(meta)
         text = None
         if style == "tags":
@@ -347,19 +386,21 @@ class Analyzer:
             project.set_auto_caption(image_id, text, img_key)
             bus.image_changed(project.id, image_id)
             return
-        style = captions.project_style(meta)
-        mono = meta["kind"] != "style" and captions.is_monochrome(img)
-        key = captions.policy_key(meta["kind"], meta.get("outfit_mode", "include"), style, meta["trigger"],
-                                  meta.get("concept_words") or [], captions.concept_target(meta))
-        ckey = f"cap:{key}:{img['sha'][:24]}:{img.get('crop')}"
-        cached = cache_get(ckey)
+        if not force and self._inflight().get((project.id, image_id)) == img_key:
+            return   # the VLM is writing exactly this caption right now: its result is applied when it comes
+        cached = cache_get(_cap_ckey(_policy(meta), img))
         if cached is not None:
-            text = captions.mark_monochrome(cached["text"], meta["kind"], style) if mono else cached["text"]
+            text = (captions.mark_monochrome(cached["text"], meta["kind"], captions.project_style(meta))
+                    if _mono(meta, img) else cached["text"])
             project.set_auto_caption(image_id, text, img_key)
             bus.image_changed(project.id, image_id)
             return
         project.set_fields(image_id, caption_status="pending")
         self._enqueue(7, ("caption", project.id, image_id))
+
+    def _inflight(self) -> dict:
+        """(project, image) -> caption key the VLM is writing right now (set while a caption batch runs)."""
+        return self.__dict__.setdefault("_captioning", {})
 
     def carry_trigger(self, project, old_meta: dict):
         """After only the trigger changed: the VLM captions written for the old trigger are kept with the word
@@ -372,15 +413,12 @@ class Analyzer:
         style = captions.project_style(meta)
         if style == "tags":
             return
-        args = (meta["kind"], meta.get("outfit_mode", "include"), style)
-        k_old = captions.policy_key(*args, old, meta.get("concept_words") or [], captions.concept_target(meta))
-        k_new = captions.policy_key(*args, new, meta.get("concept_words") or [], captions.concept_target(meta))
+        k_old, k_new = _policy(meta, old), _policy(meta, new)
         for img in project.images():
-            tail = f"{img['sha'][:24]}:{img.get('crop')}"
-            if cache_get(f"cap:{k_new}:{tail}") is None:
-                prev = cache_get(f"cap:{k_old}:{tail}")
+            if cache_get(_cap_ckey(k_new, img)) is None:
+                prev = cache_get(_cap_ckey(k_old, img))
                 if prev is not None:
-                    cache_put(f"cap:{k_new}:{tail}", {"text": captions.replace_trigger(prev["text"], old, new)})
+                    cache_put(_cap_ckey(k_new, img), {"text": captions.replace_trigger(prev["text"], old, new)})
 
     # ---------------------------------------------------------------- masks (masked training, masks.py)
     def ensure_mask(self, project, image_id: int, mode: str | None = None, force: bool = False):
@@ -459,7 +497,7 @@ class Analyzer:
             forced = (project.id, image_id, mode) in self._forced
             self._forced.discard((project.id, image_id, mode))
         cached = None if forced else cache_get(ckey)
-        if cached is not None and (cached.get("status") != "done" or out.exists()):
+        if cached is not None and (cached.get("status") != "done" or (out.exists() and _stamp_ok(cached, out))):
             # the same file (and crop) was masked before
             self._set_mask(project, img, mode, {**cached, "crop": crop})
             return
@@ -469,7 +507,9 @@ class Analyzer:
                           domain=((img["ai"].get("domain") or {}).get("label")), out=str(out), timeout=600)
         img = project.image(image_id) or img
         if res.get("ok"):
-            cache_put(ckey, res["result"])
+            # the file is shared by every analysis of this picture (the cache key also has the domain): the entry
+            # remembers which version of the file it describes
+            cache_put(ckey, {**res["result"], **({"file": _stamp(out)} if out.exists() else {})})
             self._set_mask(project, img, mode, {**res["result"], "crop": crop})
         else:
             self._set_mask(project, img, mode, {"status": "failed", "error": res.get("error"), "crop": crop})
@@ -537,7 +577,8 @@ class Analyzer:
         except KeyError as e:
             from .store import ProjectMoving
             if isinstance(e, ProjectMoving):   # being moved to another place: do it once the move is over
-                threading.Timer(10, self._enqueue, (5, item)).start()
+                items = [(op, pid, i) for i in image_id] if op == "caption" else [item]   # a caption batch: all of it
+                threading.Timer(10, lambda: [self._enqueue(5, it) for it in items]).start()
             return
         if not worker.available():
             if op.startswith("mask:"):
@@ -588,11 +629,12 @@ class Analyzer:
         project.set_fields(image_id, ai_status="running")
         bus.image_changed(project.id, image_id)
         res = worker.call("analyze", path=str(project.source_path(img)), crop=img.get("crop"))
+        if res.get("ok"):   # valid for this file and crop even if the image was cropped again meanwhile (undo)
+            cache_put(key, res["result"])
         cur = project.image(image_id)
         if cur is None or ai_key(cur["sha"], cur.get("crop")) != key:
             return  # crop changed meanwhile; a new request has been queued
         if res.get("ok"):
-            cache_put(key, res["result"])
             project.set_fields(image_id, ai=res["result"], ai_key=key, ai_status="done", ai_error=None)
             bus.image_changed(project.id, image_id)
             self.ensure_caption(project, image_id, force=recaption)
@@ -613,34 +655,52 @@ class Analyzer:
                 self.ensure_caption(project, i)
                 continue
             imgs.append(img)
-        if not imgs:
-            return
         style = captions.project_style(meta)
         concept = meta.get("concept_words") or []
-        key = captions.policy_key(meta["kind"], meta.get("outfit_mode", "include"), style, meta["trigger"], concept,
-                                  captions.concept_target(meta))
+        key = _policy(meta)
+        todo = []
+        for img in imgs:   # written meanwhile (e.g. queued again while a batch with it was running): no VLM call
+            cached = cache_get(_cap_ckey(key, img))
+            if cached is None:
+                todo.append(img)
+                continue
+            mono = _mono(meta, img)
+            text = captions.mark_monochrome(cached["text"], meta["kind"], style) if mono else cached["text"]
+            project.set_auto_caption(img["id"], text, key + (":mono" if mono else ""))
+            bus.image_changed(project.id, img["id"])
+        imgs = todo
+        if not imgs:
+            return
+        keys = {img["id"]: key + (":mono" if _mono(meta, img) else "") for img in imgs}
         for img in imgs:
+            self._inflight()[(project.id, img["id"])] = keys[img["id"]]
             project.set_fields(img["id"], caption_status="running")
             bus.image_changed(project.id, img["id"])
-        instr = captions.nl_instruction(meta["kind"], meta.get("outfit_mode", "include"), meta["trigger"], concept,
-                                        captions.concept_target(meta))
-        res = worker.call("captions", paths=[str(project.source_path(img)) for img in imgs],
-                          crops=[img.get("crop") for img in imgs], instruction=instr, timeout=300 + 120 * len(imgs))
+        try:
+            instr = captions.nl_instruction(meta["kind"], meta.get("outfit_mode", "include"), meta["trigger"], concept,
+                                            captions.concept_target(meta))
+            res = worker.call("captions", paths=[str(project.source_path(img)) for img in imgs],
+                              crops=[img.get("crop") for img in imgs], instruction=instr, timeout=300 + 120 * len(imgs))
+        finally:
+            for img in imgs:
+                self._inflight().pop((project.id, img["id"]), None)
         texts = (res.get("texts") or []) if res.get("ok") else []
+        now_meta = project.get_meta()
         for n, img in enumerate(imgs):
             cur = project.image(img["id"])
-            # changed meanwhile (crop, removal, an undo that put a cached caption back): the result is only cached
+            # changed meanwhile (crop, removal, an undo that put a cached caption back, other caption settings):
+            # the result is only cached
             stale = (cur is None or cur["removed"] or cur["sha"] != img["sha"] or cur.get("crop") != img.get("crop")
-                     or cur["caption_status"] != "running")
+                     or cur["caption_status"] != "running" or not cur.get("ai")
+                     or self._caption_plan(now_meta, cur)[1] != keys[img["id"]])
             if n < len(texts) and texts[n] is not None:   # None: the worker could not read that image
                 text = captions.finalize_nl(texts[n], meta["kind"], meta["trigger"])
-                cache_put(f"cap:{key}:{img['sha'][:24]}:{img.get('crop')}", {"text": text})
+                cache_put(_cap_ckey(key, img), {"text": text})
                 if stale:
                     continue
-                mono = meta["kind"] != "style" and captions.is_monochrome(img)
-                if mono:
+                if _mono(meta, img):
                     text = captions.mark_monochrome(text, meta["kind"], style)
-                project.set_auto_caption(img["id"], text, key + (":mono" if mono else ""))
+                project.set_auto_caption(img["id"], text, keys[img["id"]])
             elif not stale:
                 project.set_fields(img["id"], caption_status="failed")
             bus.image_changed(project.id, img["id"])
@@ -658,6 +718,10 @@ class Analyzer:
         project._ident_timer.start()
 
     def compute_identity(self, project):
+        with self._qlock:   # more of this project's images are still being analysed: the last one triggers it
+            busy = any(it[0] == "analyze" and it[1] == project.id for it in self._queued)
+        if busy:
+            return
         imgs = [i for i in project.images() if i.get("ai") and i["ai_status"] == "done"]
         meta = project.get_meta()
         refs = [r for r in (meta.get("reference_ids") or []) if any(i["id"] == r for i in imgs)]

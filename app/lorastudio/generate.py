@@ -17,11 +17,12 @@ import json
 import os
 import random
 import shutil
+import threading
 import time
 from pathlib import Path
 
 from . import config, loraconf, promptkeep
-from .evaluate import COMFY_MODELS, SAMPLING, build_t2i, comfy, gen_slot, gen_text_encoder, krea2_raw, load_as_fp8
+from .evaluate import COMFY_MODELS, SAMPLING, build_t2i, comfy, gen_slot, gen_text_encoder, krea2_raw, load_as_fp8, take_output
 from .events import bus
 from .models import FAMILY_LABEL, VARIANTS, detect_lora, library, registry
 
@@ -651,8 +652,11 @@ def stage_comfy_input(src: Path) -> str:
     """The name LoadImage finds the image by (a copy in ComfyUI's input folder; names are content hashes)."""
     from .evaluate import COMFY_INPUT
     COMFY_INPUT.mkdir(parents=True, exist_ok=True)
-    if not (COMFY_INPUT / src.name).exists():
-        shutil.copyfile(src, COMFY_INPUT / src.name)
+    dest = COMFY_INPUT / src.name
+    if not dest.exists() or dest.stat().st_size != src.stat().st_size:   # a copy cut short is made again
+        tmp = dest.with_name(f"{dest.name}.{os.getpid()}.{threading.get_ident()}.part")
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dest)
     return src.name
 
 
@@ -867,9 +871,8 @@ def run_batch(project, bid: int):
                 if control.get(project.id, bid) == "stop":
                     break
                 raise
-            src = config.DATA_DIR / "comfy_output" / imgs[0].get("subfolder", "") / imgs[0]["filename"]
             name = f"{idx:03d}_s{seed}.png"
-            shutil.move(str(src), out_dir / name)
+            take_output(imgs[0], out_dir / name)
             project.q("INSERT INTO gen_images(batch_id, idx, file, seed, prompt, shot, picked, created) VALUES(?,?,?,?,?,?,1,?)",
                       (bid, idx, name, seed, prompt, json.dumps(shot), time.time()))
             n_done += 1

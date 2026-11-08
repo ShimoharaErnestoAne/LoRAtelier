@@ -68,10 +68,25 @@ def state() -> list[dict]:
 
 
 # ======================================================================== HTTP
+class NoAuthOffHost(urllib.request.HTTPRedirectHandler):
+    """A token goes to the host it was given for only: huggingface.co redirects a file to a signed CDN URL
+    that rejects a second credential, and should not receive the token anyway (urllib keeps the
+    Authorization header across redirects).  Shared with addons."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).hostname != urllib.parse.urlsplit(req.full_url).hostname:
+            new.remove_header("Authorization")
+        return new
+
+
+_opener = urllib.request.build_opener(NoAuthOffHost)
+
+
 def _open(url: str, headers: dict | None = None, timeout=30):
     req = urllib.request.Request(url, headers={**UA, **(headers or {})})
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return _opener.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise NeedToken(str(e.code)) from None
@@ -367,7 +382,8 @@ _BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 def safe_name(name: str) -> str:
     """A plain file name (no folders, no characters Windows does not allow) for a name a site or the
     browser gave."""
-    name = _BAD_NAME_CHARS.sub("_", Path(str(name or "").replace("\\", "/")).name).strip().rstrip(".")
+    # the last part after a folder separator (not Path().name: "a:b.x" would lose "a:" as a drive name)
+    name = _BAD_NAME_CHARS.sub("_", str(name or "").replace("\\", "/").rsplit("/", 1)[-1]).strip().rstrip(".")
     if not name or name.startswith("."):
         raise ValueError("ファイル名が正しくありません")
     return name
@@ -478,6 +494,8 @@ def _incomplete(tmp: Path, name: str, expect: int | None, listed: int | None = N
         try:
             with open(tmp, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
+                if n > min(size - 8, 100 << 20):   # not a header length (some other file): never read GBs for it
+                    return "ファイルの先頭が読めません"
                 hdr = json.loads(f.read(n))
             end = 8 + n + max((v["data_offsets"][1] for k, v in hdr.items() if k != "__metadata__"), default=0)
         except (OSError, ValueError, KeyError, TypeError, struct.error):
@@ -523,7 +541,7 @@ def classify_local(path: Path, name: str) -> dict:
 def begin_upload(name: str) -> tuple[dict, Path]:
     """A file dropped in the browser (e.g. downloaded from PixAI).  The server streams the request body
     into the returned path, then calls finish_upload()."""
-    name = Path(name).name
+    name = safe_name(name)   # e.g. "a:b.safetensors" would otherwise write to an NTFS stream of "a"
     if not name.lower().endswith(SAFE_EXT):
         raise ValueError("safetensors か GGUF のファイルだけを追加できます（.ckpt / .pt などは、読み込むとプログラムが動く形式のため扱いません）")
     key = hashlib.sha1(f"upload:{name}:{time.time()}".encode()).hexdigest()[:12]
