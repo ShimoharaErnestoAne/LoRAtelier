@@ -71,6 +71,7 @@ def load_i2t():
     mod.HeadDetector.model_path = mod.HEAD_MODEL_PATH
     mod.POSE_MODEL_PATH = MODELS_DIR / "pose" / "rtmpose-s_body7_256x192.onnx"
     mod.ERA_MODEL_PATH = MODELS_DIR / "style" / "anime_style_ages_mobilenetv3.onnx"
+    mod.RATING_MODEL_PATH = MODELS_DIR / "rating" / "anime_rating_mobilenetv3.onnx"   # PixAI Tagger のレーティング
     mod.MOSS_CATALOG_PATH = MODELS_DIR / "moss_catalog" / "index.json"   # LoRAtelier reads the same file (moss_catalog.py)
     mod.TRANSLATIONS_PATH = DATA_DIR / "translations.json"
     mod.USER_DICT_DIR = DATA_DIR / "dict"
@@ -118,7 +119,7 @@ def consts() -> dict:
         "look_part_labels_ja": m.LOOK_PART_LABELS_JA, "look_parts_menu": m.LOOK_PARTS_MENU,
         "strength_groups": m.STRENGTH_GROUPS, "strength_weight": m.STRENGTH_WEIGHT,
         "extra_kinds": m.EXTRA_KINDS, "extra_short_ja": m.EXTRA_SHORT_JA, "extra_button_rows": m.EXTRA_BUTTON_ROWS,
-        "help_sections": m.HELP_SECTIONS, "vlm_catalog": m.VLM_CATALOG, "default_config": m.DEFAULT_CONFIG,
+        "help_sections": m.HELP_SECTIONS, "vlm_catalog": m.VLM_CATALOG, "joycaption_model": m.JOYCAPTION_MODEL, "default_config": m.DEFAULT_CONFIG,
         "keypoints": m.KEYPOINTS, "pose_bones": m.POSE_BONES, "pose_template": m.POSE_TEMPLATE,
         "pose_template_size": m.POSE_TEMPLATE_SIZE, "pose_min_conf": m.POSE_MIN_CONF,
         "face_models_ja": m.FACE_MODELS_JA, "pose_model_mb": m.POSE_MODEL_MB, "image_exts": m.IMAGE_EXTS,
@@ -508,6 +509,21 @@ def _checkpoint(rid, cancel):
     return check
 
 
+def _plamo_english(vlm, word: str, keep) -> str:
+    """One Japanese word into English with PLaMo 3 Translate (its PFML3 prompt with lang en, raw, as i2t does for
+    Japanese), with the situation put before it (i2t.PLAMO_CONTEXT: a tag / short phrase, or a sentence for the
+    models told in sentences such as Krea 2 / MOSS-Image).  A tag answers with its first line, a sentence whole."""
+    prose = i2t.looks_like_sentence(word)
+    req = {"model": vlm.model, "stream": False, "raw": True,
+           "prompt": i2t.plamo_prompt(word, "en", i2t.PLAMO_CONTEXT[("en", "prose" if prose else "tags")]),
+           "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64 + 3 * len(word), "stop": i2t.PLAMO_STOP}}
+    if keep is not None:
+        req["keep_alive"] = keep
+    data = vlm._http("/api/generate", req, abortable=True)
+    lines = [x.strip() for x in str(data.get("response") or "").split("\n") if x.strip()]
+    return (" ".join(lines) if prose else (lines or [""])[0])
+
+
 def _translate_en(rid, req, cancel):
     """Japanese typed on the image page that the dictionary does not know -> English, registered in
     translations.json with readings.  A word whose English is already in the dictionary under another Japanese is
@@ -517,9 +533,23 @@ def _translate_en(rid, req, cancel):
     keep = 0 if cfg.get("low_vram", True) else None
     check = _checkpoint(rid, cancel)
     words = i2t.dedup([str(w).strip() for w in req.get("words") or [] if str(w).strip()])
-    vlm = _text_llm(cfg, cancel)
-    _progress(rid)(f"英語に訳しています ({len(words)} 個、{vlm.model})...")
-    answers = _ask_list(vlm, TO_ENGLISH_PROMPT, words, keep, check)
+    vlm = _text_llm(cfg, cancel)   # the readings below need a model that follows instructions
+    tr = str(cfg.get("translate_model") or "")
+    if i2t.is_plamo_translate(tr):   # 訳のモデル PLaMo 3 Translate: it translates into English as well
+        pv = i2t.OllamaVLM(cfg["ollama_host"], tr, int(cfg.get("ollama_timeout") or i2t.VLM_TIMEOUT))
+        pv.cancel_event = cancel
+        _job["vlm"] = pv
+        _progress(rid)(f"英語に訳しています ({len(words)} 個、{tr})...")
+        answers = []
+        for w in words:
+            check()
+            answers.append(_plamo_english(pv, w, keep))
+        _job["vlm"] = vlm
+        used = tr
+    else:
+        _progress(rid)(f"英語に訳しています ({len(words)} 個、{vlm.model})...")
+        answers = _ask_list(vlm, TO_ENGLISH_PROMPT, words, keep, check)
+        used = vlm.model
     table, mine = chip_table(), i2t.load_translations()
     new, known, failed = {}, {}, []
     for ja, en in zip(words, answers):
@@ -535,7 +565,7 @@ def _translate_en(rid, req, cancel):
         new[ja] = key
     if new and not i2t.save_translations(mine):
         raise ValueError("辞書を保存できませんでした")
-    out = {"translated": new, "known": known, "failed": failed, "model": vlm.model}
+    out = {"translated": new, "known": known, "failed": failed, "model": used}
     need = [(en, ja) for ja, en in new.items() if _KANJI.search(ja)]
     if need:
         try:

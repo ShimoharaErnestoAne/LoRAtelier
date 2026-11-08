@@ -405,6 +405,7 @@ def start_download(url: str, name: str, site: str, token: str | None = None, var
     real = _civitai_url(url, token) if site == "civitai" else url
     headers = _hf_headers(token) if site == "huggingface" else {}
     threading.Thread(target=_download, args=(st, real, name, headers, variant_hint), daemon=True).start()
+    bus.publish("download", id=key, state="running")   # the job page shows it at once
     return st
 
 

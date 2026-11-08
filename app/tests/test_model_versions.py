@@ -131,12 +131,25 @@ def test_generation_uses_the_light_file(env, monkeypatch):
 
 def test_no_experimental_marks_left(env):
     from lorastudio import models
-    for v in ("qwen_image", "qwen_image21", "zimage_turbo", "zimage_base", "krea2"):
+    # 2026-11-07: no model is marked 試験導入・動作未確認; the lists show 検証済み once it worked on the user's PC
+    for v in models.VARIANTS:
         assert not models.VARIANTS[v].get("experimental") and "試験" not in models.VARIANTS[v]["label"]
+        assert "未確認" not in models.VARIANTS[v]["label"]
         assert models.experimental_note(v) is None
     for c in models.CATALOG:
-        if c["variant"] in ("qwen_image", "qwen_image21", "zimage_turbo", "zimage_base"):
-            assert not c.get("experimental") and "試験" not in c.get("note", "")
+        assert not c.get("experimental") and "試験" not in c.get("note", "") and "確認していません" not in c.get("note", "")
+        assert "動作を確認していない" not in c.get("note", "")
+
+
+def test_worked_once_is_recorded(env):
+    from lorastudio import config, models
+    config.settings().set("models", [{"id": "a", "name": "A", "variant": "moss_image_sft", "family": "moss_image", "files": {}}])
+    models.registry.mark_checked("a", "gen")
+    first = models.registry.get("a")["checked"]["gen"]
+    models.registry.mark_checked("a", "gen", "lora")
+    c = models.registry.get("a")["checked"]
+    assert c["gen"] == first and "lora" in c
+    models.registry.mark_checked(None, "gen")   # a workflow with no registered model: nothing
 
 
 def test_system_ram_is_read():

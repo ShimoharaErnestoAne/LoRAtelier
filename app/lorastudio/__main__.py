@@ -86,7 +86,13 @@ def main():
     ap.add_argument("--port", type=int, default=config.PORT)
     args = ap.parse_args()
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    from .procjob import bind_children_to_this_process, exit_with_console, hold_instance_lock, open_browser
+    import os
+    from .procjob import (RESTART_ENV, bind_children_to_this_process, exit_with_console, hold_instance_lock, open_browser,
+                          wait_for_instance_lock)
+    # started by 設定 → 再起動: the old server ends right after starting this one and holds the lock until then
+    if os.environ.pop(RESTART_ENV, None) is not None:
+        print("LoRAtelier を再起動しています（前のウィンドウが閉じるのを待っています）...")
+        wait_for_instance_lock(config.DATA_DIR / "app.lock")
 
     # Already running (e.g. start.bat double-clicked twice)?  Open the existing one instead of starting a
     # second server on the same data: that one would mark the first one's training as interrupted.  A
@@ -112,6 +118,7 @@ def main():
     bind_children_to_this_process()
     exit_with_console()
     from . import server
+    server.LAUNCH = {"port": args.port, "no_browser": args.no_browser}   # for 設定 → 再起動
 
     # restore queues after the server is already answering (startup never waits for this)
     threading.Thread(target=server.resume_pending_on_startup, daemon=True).start()

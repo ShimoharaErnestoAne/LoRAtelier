@@ -76,6 +76,46 @@ def open_browser(url: str) -> None:
     webbrowser.open(url)
 
 
+RESTART_ENV = "LORASTUDIO_RESTART"   # set for a server started by relaunch(): it waits for the old one to end
+
+
+def relaunch(args: list[str]) -> None:
+    """Start a new server in a new console window for 設定 → 再起動.  It is started outside the job (or it would end
+    with this process) and waits for the instance lock, so this process can end right after (the caller does that).
+    The environment is passed on as it is (PYTHONPATH, LORASTUDIO_LISTEN of start_intranet.bat), and the window
+    pauses on a failed start like start.bat does.  Raises RuntimeError when the new window cannot be started."""
+    import os
+    env = dict(os.environ, **{RESTART_ENV: str(os.getpid())})
+    try:
+        start_in_new_window([sys.executable, "-m", "lorastudio", *args], env)
+    except OSError as e:
+        raise RuntimeError("新しいウィンドウを開けなかったため、再起動できませんでした。今のウィンドウを閉じて、"
+                           f"start.bat から起動し直してください（{e}）") from e
+
+
+def start_in_new_window(cmd: list[str], env: dict):
+    """cmd in a new console window, outside this process's job (it outlives this process)."""
+    import subprocess
+    if sys.platform != "win32":
+        return subprocess.Popen(cmd, env=env, start_new_session=True)
+    line = subprocess.list2cmdline(cmd)
+    # /s /c "...": cmd takes the text between the outer quotes as it is (the quoted python path stays quoted)
+    return subprocess.Popen(f'cmd.exe /s /c "chcp 65001 >nul & {line} & if errorlevel 1 pause"', env=env,
+                            creationflags=0x01000000 | 0x00000010,   # BREAKAWAY_FROM_JOB | NEW_CONSOLE
+                            stdin=subprocess.DEVNULL, close_fds=True)
+
+
+def wait_for_instance_lock(path, timeout: float = 90) -> bool:
+    """For a server started by relaunch(): the old server still holds the lock for a moment while it ends."""
+    import time
+    end = time.time() + timeout
+    while not hold_instance_lock(path):
+        if time.time() > end:
+            return False
+        time.sleep(0.3)
+    return True
+
+
 _instance = None   # the open lock file, held for the life of the process
 
 

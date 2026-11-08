@@ -39,3 +39,40 @@ def test_children_end_when_the_server_is_killed():
             break
         time.sleep(0.1)
     assert not _alive(child)
+
+
+RELAUNCHER = """
+import subprocess, sys, time
+sys.path.insert(0, {root!r})
+from lorastudio.procjob import bind_children_to_this_process, start_in_new_window
+assert bind_children_to_this_process()
+code = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(120)"
+p = start_in_new_window([sys.executable, "-c", code, {out!r}], dict(__import__("os").environ))
+print(p.pid, flush=True)
+time.sleep(120)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object")
+def test_restart_window_outlives_the_old_server(tmp_path):
+    """設定 → 再起動: the new server's window is started outside the job, so it keeps running when the old server
+    ends (which ends everything in its job).  The path has a space and Japanese to check the cmd quoting."""
+    out = tmp_path / "再起動 テスト" / "pid.txt"
+    out.parent.mkdir()
+    parent = subprocess.Popen([sys.executable, "-c", RELAUNCHER.format(root=str(ROOT), out=str(out))],
+                              stdout=subprocess.PIPE, text=True)
+    cmd_pid = int(parent.stdout.readline())
+    try:
+        for _ in range(100):
+            if out.exists() and out.read_text():
+                break
+            time.sleep(0.1)
+        child = int(out.read_text())
+        parent.kill()
+        parent.wait()
+        time.sleep(1.0)
+        assert _alive(child)
+    finally:
+        subprocess.run(["taskkill", "/PID", str(cmd_pid), "/T", "/F"], capture_output=True)
+        if parent.poll() is None:
+            parent.kill()

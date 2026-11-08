@@ -371,6 +371,7 @@ button.armed { background: var(--bad); color: #fff; border-color: var(--bad); }
 .jk-train { background: #3b7fd9; } .jk-gen { background: #8a5cc9; } .jk-eval { background: #2f9e6e; } .jk-imagegen { background: #d9822b; } .jk-i2t { background: #b0577f; }
 .jk-other { background: #7a7a7a; } .jk-task { background: var(--accent); color: var(--accent-ink); }
 .jk-done { background: var(--ok); } .jk-failed { background: var(--bad); } .jk-cancelled { background: #7a7a7a; }
+.jk-dl { background: #2f8fa0; }
 .jtask { border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin: 8px 0; display: flex; flex-direction: column; gap: 6px; }
 .jsteps { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; }
 .jstep { padding: 2px 10px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }

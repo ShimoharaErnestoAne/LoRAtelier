@@ -579,6 +579,8 @@ def run(eid: str):
         _update(eid, status="cancelled", message=f"中止しました（{len(images)} 枚は残っています）", images=images)
     else:
         _update(eid, status="done", message="完了", images=images)
+    if images:   # the model worked on this PC (検証済み in the model lists)
+        registry.mark_checked(s.get("model_id"), "gen")
     if s.get("thumb_for"):
         _preset_thumb_done(s["thumb_for"], eid, img_dir / images[0]["file"] if images else None, "サムネイルの生成を中止しました")
     _arm_idle_stop()
@@ -656,6 +658,8 @@ def _run_workflow(eid: str, s: dict):
         _update(eid, status="cancelled", message=f"中止しました（{len(images)} 枚は残っています）", images=images)
     else:
         _update(eid, status="done", message="完了", images=images)
+    if images and wf_model:   # the registered model the workflow used worked on this PC
+        registry.mark_checked(wf_model.get("id"), "gen")
     _arm_idle_stop()
 
 

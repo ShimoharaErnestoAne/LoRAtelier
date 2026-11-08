@@ -115,7 +115,8 @@ function connectEvents() {
   es.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "queue" || (m.type === "run" && m.status)) refreshQueueSoon();
-    if (S.route[0] === "jobs" && ["queue", "run", "gen", "imagegen", "eval", "pipeline", "i2t"].includes(m.type)) refreshJobsSoon();
+    if (S.route[0] === "jobs" && ["queue", "run", "gen", "imagegen", "eval", "pipeline", "i2t", "download"].includes(m.type)) refreshJobsSoon();
+    if (m.type === "download") refreshStatusSoon();   // the header's ダウンロード中 count
     if (m.type === "images" && S.project && m.project === S.project.id) refreshImagesBg();
     else if (m.type === "identity" && S.project && m.project === S.project.id) refreshImagesBg();
     else if (m.type === "run" && S.project && m.project === S.project.id) onRunEvent(m);
@@ -172,6 +173,12 @@ async function refreshStatus() {
     jp.title = "ジョブの一覧を開きます";
     jp.onclick = () => { location.hash = "#/jobs"; };
   } else jp.hidden = true;
+  if (st.downloads) {   // downloads run beside the queue: shown in the same pill, which opens the job page
+    jp.hidden = false;
+    jp.textContent = (st.job || (st.queue_paused && st.queued && st.queued.length) ? jp.textContent + "・" : "") + `ダウンロード中 ${st.downloads} 件`;
+    jp.title = "ジョブの一覧を開きます";
+    jp.onclick = () => { location.hash = "#/jobs"; };
+  }
   const w = st.worker || "";
   if (st.gpu_owner) { ap.hidden = false; ap.textContent = `AI解析: ${st.gpu_owner}のため待機`; }
   else if (w.startsWith("loading")) { ap.hidden = false; ap.textContent = `AI準備中: ${w.split(":")[1]}`; }
@@ -1576,7 +1583,17 @@ async function renderGen() {
 
 function genModelLabel(m) {
   const v = m.variant_info && m.variant_info.label;
-  return `${m.name}（${v || (m.family === "sdxl" ? "SDXL 系・系統未確認" : m.family)}）`;
+  return `${m.name}（${v || (m.family === "sdxl" ? "SDXL 系" : m.family)}）`;
+}
+
+/* 画像生成 / LoRA 作成: 検証済み once it worked on this PC (an image generated with the model; comparison images made
+   with a LoRA trained on it), 未確認 until then.  Nothing says a model "may not work". */
+function modelChecksHtml(checked) {
+  const c = checked || {};
+  const one = (k, label, how) => c[k]
+    ? `<span style="color:var(--ok)" title="${esc(new Date(c[k] * 1000).toLocaleString("ja-JP"))} にこの PC で動きました">${label} 検証済み</span>`
+    : `<span class="muted" title="${esc(how)}">${label} 未確認</span>`;
+  return `<span class="small">${one("gen", "画像生成", "このモデルで画像を 1 回生成すると「検証済み」になります")} ・ ${one("lora", "LoRA 作成", "このモデルで学習した LoRA の比較画像ができると「検証済み」になります")}</span>`;
 }
 
 const GEN_FAMILIES = ["sdxl", "anima", "qwen_image", "qwen_image21", "krea2", "zimage", "moss_image"];
@@ -1594,7 +1611,7 @@ function genModelOptions(lib, selected) {
     const v = m.variant_info && m.variant_info.label;
     // 学習 対応 / 非対応: the checks made before training starts (train_errors), the reasons on hover
     const te = m.train_errors || [];
-    add(f, `<option value="${m.id}" ${m.id === selected ? "selected" : ""} title="${esc(te.length ? "学習には使えません: " + te.join(" ") : "")}">${esc(f.split(/[\\/]/).pop())}（${esc(v || "SDXL 系・系統未確認")}・学習 ${te.length ? "非対応" : "対応"}）</option>`);
+    add(f, `<option value="${m.id}" ${m.id === selected ? "selected" : ""} title="${esc(te.length ? "学習には使えません: " + te.join(" ") : "")}">${esc(f.split(/[\\/]/).pop())}（${esc(v || "SDXL 系")}・学習 ${te.length ? "非対応" : "対応"}）</option>`);
   }
   // every other model file in the folders is listed too: one that can generate is set up when chosen
   // (pickFileModel asks for its text encoder / VAE when they are not found by name); others say why not
@@ -2396,10 +2413,39 @@ async function drawJobs() {
   if (_jobsAgain) { _jobsAgain = false; return drawJobs(); }
   const el = $("#jobs-body");
   if (!el || !q) return;
-  const openDetails = !!$("#jb-ended[open]");
+  const openDetails = !!$("#jb-ended[open]"), openDl = !!$("#jb-dlended[open]");
   el.innerHTML = (d.old ? `<div class="jpaused">LoRAtelier を起動し直すと、このページのすべての機能（止める・一時停止・LoRA 作成タスク）が使えるようになります。</div>` : "")
-    + jobsCurrentHtml(q) + jobsI2tHtml(q) + jobsQueueHtml(q) + jobsTasksHtml(d, openDetails);
+    + jobsCurrentHtml(q) + jobsI2tHtml(q) + jobsDownloadsHtml(q, openDl) + jobsQueueHtml(q) + jobsTasksHtml(d, openDetails);
   bindJobs(el, q);
+  // the byte counts of a download are not sent as events: read again while one runs
+  clearTimeout(_jobsDlTimer);
+  if ((q.downloads || []).some((x) => x.state === "running")) _jobsDlTimer = setTimeout(refreshJobsSoon, 1500);
+}
+let _jobsDlTimer = null;
+
+/* ダウンロード: the models added in 設定 and the files from links / dropped files, with how far each has come.
+   They run beside the GPU queue (not one at a time); a running one can be stopped (the half-fetched file is removed). */
+function jobsDownloadsHtml(q, openEnded) {
+  if (!("downloads" in q)) return "";   // an app started before this section existed
+  const gb = (b) => (b / 1e9).toFixed(1);
+  const run = q.downloads.filter((x) => x.state === "running"), ended = q.downloads.filter((x) => x.state !== "running");
+  const ENDED = { done: "完了", failed: "失敗", cancelled: "中止" };
+  const row = (x) => {
+    const pct = x.total_bytes ? Math.min(100, Math.round(x.done_bytes / x.total_bytes * 100)) : null;
+    return `<div class="jnow" data-dl="${esc(x.key)}">
+      <div class="jnow-head"><span class="jkind jk-dl">${esc(x.what)}</span><span class="jnow-title">${esc(x.name)}</span></div>
+      <div class="jbar ${pct == null ? "indet" : ""}"><span style="${pct == null ? "" : `width:${pct}%`}"></span></div>
+      <div class="row small"><span>${esc(x.message || "ダウンロード中")}</span>
+        <span class="muted">${gb(x.done_bytes || 0)}${x.total_bytes ? ` / ${gb(x.total_bytes)}` : ""} GB${pct == null ? "" : `（${pct}%）`}</span>
+        <div class="spacer"></div>${x.cancel ? `<button class="small danger" data-dlstop="${esc(x.cancel)}">中止</button>` : ""}</div></div>`;
+  };
+  return `<section class="panel jb ${run.length ? "jb-now" : ""}"><h2>ダウンロード <span class="muted">${run.length} 件</span></h2>
+    <div class="muted small">設定画面で追加したモデルと、リンクから取得しているファイルです。GPU の順番待ちとは別に、並んで進みます。中止すると、途中までのファイルは消します。</div>
+    ${run.length ? run.map(row).join("") : `<div class="muted" style="margin-top:6px">ダウンロード中のものはありません。</div>`}
+    ${ended.length ? `<details id="jb-dlended" ${openEnded ? "open" : ""} style="margin-top:10px"><summary class="small">終わったダウンロード（${ended.length} 件、アプリを終了すると消えます）</summary>
+      ${ended.map((x) => `<div class="jrow"><span class="jkind jk-${x.state === "done" ? "done" : x.state === "failed" ? "failed" : "cancelled"}">${ENDED[x.state] || esc(x.state)}</span>
+        <span class="jtitle">${esc(x.name)} <span class="muted">${esc(x.what)}</span></span>${x.error ? `<div class="small err jmsg">${esc(x.error)}</div>` : ""}</div>`).join("")}</details>` : ""}
+  </section>`;
 }
 /* Progress events can come several times a second: redraw at most about once a second, and not while a
    stop button waits for its second click (a redraw would reset it). */
@@ -2532,6 +2578,7 @@ function bindJobs(el, q) {
   $$("[data-tc]", el).forEach((b) => b.onclick = () => confirmClick(b, "もう一度押すと取り消し",
     () => act(b, `/api/tasks/${b.closest("[data-tid]").dataset.tid}/cancel`)));
   if ($("#tk-clear", el)) $("#tk-clear", el).onclick = (e) => act(e.target, "/api/tasks/clear");
+  $$("[data-dlstop]", el).forEach((b) => b.onclick = () => confirmClick(b, "もう一度押すと中止", () => act(b, b.dataset.dlstop)));
 }
 
 /* Masked training (masks.py): the loss counts mainly inside an automatic mask of the person (or of the background
@@ -3449,6 +3496,15 @@ function bindStorage(root) {
   watchStorageMove();
 }
 
+/* 画像生成の詳細設定のサンプラー・スケジューラー (ComfyUI の KSampler の名前。よく使うものを先に。ays・gits は
+   ComfyUI-ppm のスケジューラー)。一覧にない値 (画像から読み込んだ設定など) は、その値も選べるように先頭に足す */
+const IG_SAMPLERS = ["euler_ancestral", "euler", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_sde", "dpmpp_3m_sde", "dpmpp_2s_ancestral",
+  "uni_pc", "ddim", "lcm", "res_multistep", "er_sde", "euler_cfg_pp", "euler_ancestral_cfg_pp", "heun", "heunpp2", "dpm_2", "dpm_2_ancestral",
+  "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral_cfg_pp", "dpmpp_sde_gpu", "dpmpp_2m_cfg_pp", "dpmpp_2m_sde_heun", "dpmpp_2m_sde_heun_gpu",
+  "dpmpp_3m_sde_gpu", "ddpm", "ipndm", "ipndm_v", "deis", "res_multistep_cfg_pp", "res_multistep_ancestral", "res_multistep_ancestral_cfg_pp",
+  "gradient_estimation", "sa_solver", "seeds_2", "seeds_3", "uni_pc_bh2"];
+const IG_SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple", "beta", "kl_optimal", "ddim_uniform", "linear_quadratic", "ays", "ays+", "ays_30", "gits"];
+
 async function renderSettings() {
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>設定</span>`;
@@ -3462,7 +3518,9 @@ async function renderSettings() {
     <div class="panel" style="margin-bottom:14px"><h2>環境</h2>
       <div>GPU: ${st.gpus.length ? st.gpus.map((g) => `${esc(g.name)}（VRAM ${Math.round(g.vram_total_mb / 1024)}GB）`).join(", ") : `<span class="err">NVIDIA GPU が見つかりません（素材の編集は可能、学習は不可）</span>`}</div>
       <div>学習エンジン環境: ${st.train_env ? "導入済み" : `<span class="err">未導入（setup.bat を実行してください）</span>`} ・ 評価用 ComfyUI: ${st.comfy_available ? "導入済み" : `<span class="err">未導入</span>`}</div>
-      <div class="muted small">AI 解析: ${esc(workerLabel(st.worker))}。画像は外部に送信しません（すべてこの PC で処理します）。初回の解析時に解析用 AI モデル（合計 約 15GB）を取得します。</div></div>
+      <div class="muted small">AI 解析: ${esc(workerLabel(st.worker))}。画像は外部に送信しません（すべてこの PC で処理します）。初回の解析時に解析用 AI モデル（合計 約 15GB）を取得します。</div>
+      ${st.can_restart ? `<div class="row" style="margin-top:10px" id="s-rs"><button id="s-restart">LoRAtelier を再起動</button>
+        <span class="muted small">新しいウィンドウで起動し直し、今のウィンドウは閉じます。この画面は起動が終わると自動で読み込み直します。</span></div>` : ""}</div>
     <div class="panel" style="margin-bottom:14px"><h2>表示</h2>
       <label class="row"><input type="checkbox" id="s-blur" ${st.blur_images === true ? "checked" : ""}> 画像をぼかして表示する</label>
       <div class="muted small">画面に出る画像をすべてぼかします。画像にマウスを乗せると右上に目のボタンが出て、押すとその画像だけ表示され、もう一度押すとまたぼけます。画像そのもののクリックは、ぼかしていないときと同じ動き（拡大や選択）になります。目で表示した画像は、拡大したときも表示されます。見た目だけの設定で、学習・解析・生成や画像ファイルには影響しません。</div></div>
@@ -3489,8 +3547,7 @@ async function renderSettings() {
         <b>${esc(m.name)}</b>${m.variant ? `<span class="kind">${esc(m.variant_info.label || m.variant)}</span>` : ""}
         ${famVariants(m.family).length > 1 && (!m.variant || m.needs_variant || (m.auto && !m.variant_confirmed)) ? `<select data-variant="${m.id}">
           <option value="">${m.variant ? "系統（推定）を確認してください" : "系統を選んでください（学習に必要）"}</option>${famVariants(m.family).map(([k, v]) => `<option value="${k}" ${k === m.variant ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select>` : ""}
-        ${m.variant_info.verified ? `<span class="small" style="color:var(--ok)">検証済み</span>` : m.variant_info.experimental ?
-          `<span class="small warntext" title="${esc(m.variant_info.note || "")}">試験導入・動作未確認（動かない可能性があります）</span>` : `<span class="small warntext">未検証</span>`}
+        ${modelChecksHtml(m.checked)}
         ${m.missing.length ? `<span class="err small">ファイルが見つかりません: ${m.missing.join(", ")}</span>` : ""}
         <span class="muted small">${Object.entries(m.files).map(([k, p]) => `${k}: ${esc(p)}${m.hash && m.hash[k] ? "" : "（ハッシュ計算中）"}`).join("<br>")}</span>
         <div class="spacer"></div><button data-del="${m.id}">登録解除</button></div>`).join("") : `<div class="muted">まだありません。</div>`}</div>
@@ -3575,6 +3632,17 @@ async function renderSettings() {
       toast(r.keep_train_cache ? "学習用キャッシュを残します" : `学習用キャッシュを消しました（${(r.freed / 1e9).toFixed(1)}GB）`);
     } catch (err) { e.target.checked = !e.target.checked; fail(err); }
   };
+  if ($("#s-restart")) $("#s-restart").onclick = async (e) => {
+    e.target.disabled = true;
+    let d;
+    try { d = await api("/api/restart"); } catch (err) { e.target.disabled = false; return fail(err); }
+    if (!d.losses.length) return restartApp(st.boot);
+    const row = $("#s-rs");
+    row.innerHTML = `<div><b>今再起動すると、次のものが止まります。再起動しますか？</b>${d.losses.map((x) => `<div class="small">・${esc(x)}</div>`).join("")}
+      <div class="row" style="margin-top:6px"><button id="s-rs-yes" class="danger">再起動する</button><button id="s-rs-no">やめる</button></div></div>`;
+    $("#s-rs-no").onclick = () => renderSettings();
+    $("#s-rs-yes").onclick = () => restartApp(st.boot);
+  };
   $("#s-lo-count").onclick = async (e) => {
     e.target.disabled = true; e.target.textContent = "容量を数えています…";
     let d;
@@ -3598,6 +3666,25 @@ async function renderSettings() {
     try { await api("/api/ui", { method: "PUT", body: { blur_images: e.target.checked } }); }
     catch (err) { e.target.checked = !e.target.checked; document.documentElement.classList.toggle("blurimg", e.target.checked); fail(err); }
   };
+}
+
+/* 設定 → 再起動: the server starts a new one in a new window and ends; this page waits for the new one (another boot
+   time in /api/status) and loads itself again.  The new one may take a while (ComfyUI and the workers start later). */
+async function restartApp(oldBoot) {
+  const row = $("#s-rs");
+  const say = (t, err) => { if (row) row.innerHTML = `<span class="small ${err ? "err" : ""}">${esc(t)}</span>`; };
+  try { await api("/api/restart", { body: {} }); } catch (err) { say(err.message || String(err), true); return; }
+  say("再起動しています。新しいウィンドウで起動が終わるまでお待ちください…");
+  const end = Date.now() + 120000;
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 1500));
+    try {
+      const st = await api("/api/status");
+      if (st.boot !== oldBoot) { location.reload(); return; }
+    } catch { /* the old one has ended and the new one is not answering yet */ }
+  }
+  say("2 分待っても新しい起動を確認できませんでした。新しいウィンドウにエラーが出ていないか確認してください。"
+    + "別のポートで起動した場合は、ブラウザーに新しいタブが開きます。", true);
 }
 
 /* ------------------------------------------------------------------ add from a link / a dropped file */
@@ -3790,16 +3877,16 @@ async function drawCatalog() {
     const choices = Object.entries(x.choices || {}).map(([k, opts]) => `<select data-choice="${x.id}" data-key="${k}">${opts.map((o) =>
       `<option value="${o.id}" ${o.id === x.recommended[k] ? "selected" : ""}>${esc(o.label)}${o.id === x.recommended[k] ? "（この PC に推奨）" : ""}</option>`).join("")}</select>`).join("");
     const state = x.deferred ? `<span class="small muted">準備中（積み残し）</span>` :
-      x.installed_model ? `<span class="small" style="color:var(--ok)">追加済み</span>` :
+      x.installed_model ? `${x.checked ? modelChecksHtml(x.checked) + " " : ""}<span class="small" style="color:var(--ok)">追加済み</span>` :
       s && s.state === "running" ? `<span class="small">${esc(s.message || "")} ${(s.done_bytes / 1e9).toFixed(1)} / ${(s.total_bytes / 1e9).toFixed(1)} GB</span>
         ${s.cancel ? "" : `<button class="small" data-dlcancel="${x.id}">キャンセル</button>`}` :
       s && s.state === "done" ? `<span class="small" style="color:var(--ok)">完了</span>` :
       `${choices}${x.gated ? `<input type="password" placeholder="HF アクセストークン" data-tok="${x.id}" style="width:170px">` : ""}<button data-dl="${x.id}">追加する</button>`;
     return `<div style="padding:8px 0;border-bottom:1px solid var(--line)"><div class="row"><b>${esc(x.name)}</b>
-        ${x.default ? `<span class="kind">標準</span>` : ""}${x.experimental ? `<span class="small warntext">試験導入・動作未確認</span>` : ""}
+        ${x.default ? `<span class="kind">標準</span>` : ""}
         <span class="muted small">約 ${x.size_gb}GB ・ ライセンス: ${esc(x.license)}${x.gated ? " ・ ログインと同意が必要" : ""}</span>
         <div class="spacer"></div>${state}</div>
-      ${x.note ? `<div class="small ${x.experimental ? "warntext" : "muted"}">${esc(x.note)}</div>` : ""}
+      ${x.note ? `<div class="small muted">${esc(x.note)}</div>` : ""}
       ${x.min_ram && cat.ram_gb && cat.ram_gb < x.min_ram - 2 && !x.installed_model ? `<div class="small warntext">この PC のメインメモリは ${Math.round(cat.ram_gb)}GB です。このモデルの学習には ${x.min_ram}GB を推奨します（足りないと学習が非常に遅くなるか、途中で失敗することがあります）。</div>` : ""}
       ${s && s.error ? `<div class="err small">${esc(s.error)}</div>` : ""}
       ${s && s.state === "cancelled" ? `<div class="muted small">ダウンロードをキャンセルしました。途中までのファイルは消してあります。</div>` : ""}</div>`;
@@ -4106,7 +4193,7 @@ async function renderImageGen() {
         <div class="row small muted" style="margin-top:2px">パソコンの中の LLM（Ollama）が、指示に合わせてプロンプトとネガティブを書き換えます。文章は外部に送りません。
           <span>使う LLM <select id="ig-llm" class="small"><option value="">読み込み中…</option></select></span></div></div>` : ""}
       <label>ネガティブ</label><div><div class="small warntext" id="ig-negnote" hidden></div><textarea id="ig-neg" rows="5" placeholder="例: lowres, bad anatomy, bad hands, watermark">${esc(f.negative || "")}</textarea></div>
-      <label></label><div id="ig-ja" class="small"></div>
+      <label></label><div><div id="ig-ja" class="small"></div><div id="ig-trm" class="small" hidden></div></div>
       <label>画像サイズ</label><div><div class="row" id="ig-sizes"></div>
         <div class="row" style="margin-top:4px"><span class="small muted">幅</span><input type="number" id="ig-w" step="16" min="512" max="2048" style="width:90px" value="${esc(f.width || S.ig.native)}">
           <span class="small muted">高さ</span><input type="number" id="ig-h" step="16" min="512" max="2048" style="width:90px" value="${esc(f.height || S.ig.native)}">
@@ -4123,15 +4210,18 @@ async function renderImageGen() {
       <div class="fields" style="margin-top:8px">
         ${[["steps", "ステップ数", "number"], ["cfg", "CFG", "number"], ["sampler", "サンプラー", "text"], ["scheduler", "スケジューラー", "text"], ["clip_skip", "Clip skip", "number"], ["seed", "seed（空欄で毎回ランダム）", "number"]].map(([k, label, t]) => {
           const v = k === "seed" ? (f.seed ?? "") : (sm[k] ?? "");
+          const choices = k === "sampler" ? IG_SAMPLERS : k === "scheduler" ? IG_SCHEDULERS : null;
+          const input = choices
+            ? `<select data-igs="${k}"><option value="">初期値（モデルに合わせる）</option>${[...new Set([...(v ? [v] : []), ...choices])].map((x) => `<option value="${esc(x)}" ${x === v ? "selected" : ""}>${esc(x)}</option>`).join("")}</select>`
+            : `<input type="${t}" step="any" data-igs="${k}" value="${esc(v)}" placeholder="${esc(k === "seed" ? "" : ds[k] ?? "")}">`;
           return `<div class="field"><div class="lab"><span>${label}</span>${k !== "seed" ? `<span>初期値 <span data-igd="${k}">${esc(ds[k] ?? "")}</span></span>` : ""}</div>
-            <input type="${t}" step="any" data-igs="${k}" value="${esc(v)}" placeholder="${esc(k === "seed" ? "" : ds[k] ?? "")}"></div>`; }).join("")}
+            ${input}</div>`; }).join("")}
         ${fastField("igs", sm.fast, ds)}
         <div class="field"><div class="lab"><span>白飛びを抑える</span><span>初期値 使わない</span></div>
           <select data-igs="rescale"><option value="">使わない</option><option value="on" ${sm.rescale === "on" ? "selected" : ""}>使う</option></select>
           <div class="muted small">CFG を高くしたときの白飛びや色の濃くなりすぎを抑えます（NoobAI の v-pred 系などで起きやすい）。</div></div>
         ${igExtraFields(f)}
       </div>
-      <datalist id="ig-scheds">${["normal", "karras", "exponential", "sgm_uniform", "simple", "beta", "kl_optimal", "ays", "ays+", "ays_30", "gits"].map((x) => `<option value="${x}">`).join("")}</datalist>
       <div class="muted small" style="margin-top:4px">空欄の項目は、モデルに合わせた初期値で生成します。スケジューラーの ays・gits は、少ないステップでも仕上がりやすい種類です。</div>
     </details>
     <div id="ig-check" style="margin-top:8px"></div>
@@ -4147,7 +4237,6 @@ async function renderImageGen() {
   igDrawCheck(S.ig.check, S.ig.notes);
   igDrawHistory();
   $$("#ig-pos, #ig-neg, #ig-left, #ig-right, #ig-w, #ig-h, #ig-count, [data-igs], #ig-vae, #ig-te, #ig-attn").forEach((x) => { x.oninput = igSaveSoon; x.onchange = igSaveSoon; });
-  $("[data-igs=scheduler]")?.setAttribute("list", "ig-scheds");
   $("#ig-pos").addEventListener("input", debounce(() => igTrig(), 200));
   $("#ig-w").onchange = $("#ig-h").onchange = () => { igDrawSizes(); igSaveSoon(); };
   igDrawInit();
@@ -4191,7 +4280,7 @@ async function renderImageGen() {
   $("#ig-reset").onclick = igReset;
   $("#ig-lang").onclick = () => igSetJa(!IGJ.on);
   $$("#ig-pos, #ig-neg").forEach((x) => { x.addEventListener("input", igJaNoteSoon); attachTagComplete(x, { escape: true, sep: true, ja: () => IGJ.on, moss: () => modelFamily($("#ig-model").value) === "moss_image" }); });
-  if (IGJ.on) igJaShow();
+  if (IGJ.on) { igJaShow(); igTrModel(); }
   $("#ig-rescan").onclick = async () => {
     try { await igSave(); await renderImageGen(); toast("モデルの一覧を読み直しました"); } catch (e) { fail(e); }
   };
@@ -4646,6 +4735,92 @@ async function igSetJa(on) {
   try { localStorage.setItem("igJa", IGJ.on ? "1" : "0"); } catch (e) { /* storage unavailable */ }
   $("#ig-lang").textContent = IGJ.on ? "English" : "日本語";
   igJaNote();
+  igTrModel();
+}
+
+/* 訳のモデル as a pull-down (i2t settings and 画像生成): the known translation models by name, the models
+   already in Ollama (when known), and 「ほかのモデル（名前を入れる）」 for anything else. */
+const TR_LABELS = [[/index-translate-2b/i, "Index-Translate 2B"], [/plamo-3-translate-2b/i, "PLaMo 3 Translate 2B"], [/plamo-3-translate-8b/i, "PLaMo 3 Translate 8B"]];
+function trModelLabel(name) {
+  const hit = TR_LABELS.find(([re]) => re.test(name));
+  return hit ? hit[1] : name.replace(/^hf\.co\//, "");
+}
+function trModelPickerHtml(id, cur, choices, installed) {
+  const have = installed ? new Set(installed) : null;
+  const tag = (m) => (have ? (have.has(m) ? "（取得済み）" : "（未取得）") : "");
+  const known = [...new Set(choices.filter(Boolean))];
+  const others = have ? [...have].filter((m) => !known.includes(m)) : [];
+  const custom = cur && !known.includes(cur) && !others.includes(cur);
+  const opt = (m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""} title="${esc(m)}">${esc(trModelLabel(m) + tag(m))}</option>`;
+  return `<select id="${id}">${known.map(opt).join("")}
+      ${others.length ? `<optgroup label="Ollama にあるほかのモデル">${others.map(opt).join("")}</optgroup>` : ""}
+      <option value="__other" ${custom ? "selected" : ""}>ほかのモデル（名前を入れる）</option></select>
+    <input type="text" id="${id}-name" value="${custom ? esc(cur) : ""}" placeholder="Ollama のモデル名" style="width:260px" ${custom ? "" : "hidden"}>`;
+}
+/* the chosen name ("" while 「ほかのモデル」 has no name yet); onPick runs when the choice is complete */
+function trModelPickerBind(id, onPick) {
+  const sel = $("#" + id), box = $("#" + id + "-name");
+  sel.onchange = () => {
+    box.hidden = sel.value !== "__other";
+    if (sel.value === "__other") { box.focus(); if (box.value.trim()) onPick(box.value.trim()); }
+    else onPick(sel.value);
+  };
+  box.onchange = () => { if (box.value.trim()) onPick(box.value.trim()); };
+}
+function trModelPickerValue(id) {
+  const sel = $("#" + id);
+  return sel.value === "__other" ? $("#" + id + "-name").value.trim() : sel.value;
+}
+
+/* 訳のモデル (shown while 日本語 is on): the Ollama model the 「Ollama で訳す」 buttons use.  It is i2t's own setting
+   (translate_model, the same as on the i2t page), with i2t's choices (PLaMo 3 Translate 2B / 8B ...);
+   「取得」 pulls the model into Ollama as the i2t page does. */
+async function igTrModel() {
+  const el = $("#ig-trm");
+  if (!el) return;
+  if (!IGJ.on) { el.hidden = true; return; }
+  let st;
+  try { st = await api("/api/i2t/state"); } catch (e) { el.hidden = true; return; }
+  if (!st.available || !$("#ig-trm") || !IGJ.on) { el.hidden = true; return; }
+  const cur = st.config.translate_model || "", pulling = st.job && st.job.op === "pull";
+  const choices = [...new Set([cur, ...(st.consts.translate_choices || [])].filter(Boolean))];
+  el.hidden = false;
+  el.innerHTML = `<div class="row"><span>訳のモデル</span>
+      ${trModelPickerHtml("ig-trname", cur, choices, null)}
+      <button class="small" id="ig-trpull" title="入れたモデルを Ollama に取得します。数 GB のダウンロードになることがあります">取得</button>
+      <button class="small" id="ig-trstop" ${pulling ? "" : "hidden"}>中止</button>
+      <span class="muted" id="ig-trmsg">${pulling ? esc(st.job.message || "取得中…") : ""}</span></div>
+    <div class="muted">PLaMo を選ぶと、日本語にするときも英語にするときも PLaMo が訳します（ほかの翻訳専用のモデルは日本語にするときだけ使い、英語にするときは i2t の VLM が訳します）。初めて使うモデルは「取得」でダウンロードしてください（中止しても、次は続きから取得します）。</div>`;
+  const save = async (name) => {   // the whole i2t settings are sent back (i2t keeps them as one file)
+    const s = await api("/api/i2t/state");
+    const cfg = { ...s.config, translate_model: name };
+    await api("/api/i2t/config", { method: "PUT", body: cfg });
+    if (typeof I !== "undefined" && I.cfg) I.cfg.translate_model = name;   // the i2t page's copy does not write the old one back
+  };
+  trModelPickerBind("ig-trname", async (name) => {
+    try { await save(name); toast(`訳のモデルを ${trModelLabel(name)} にしました`); } catch (err) { fail(err); }
+  });
+  $("#ig-trstop").onclick = async () => { try { await api("/api/i2t/cancel", { body: {} }); } catch (err) { fail(err); } };
+  $("#ig-trpull").onclick = async () => {
+    const name = trModelPickerValue("ig-trname");
+    if (!name) { $("#ig-trname-name").focus(); return; }
+    let job;
+    try { job = await api("/api/i2t/job", { body: { op: "pull", name, host: st.config.ollama_host } }); } catch (err) { fail(err); return; }
+    $("#ig-trpull").disabled = true; $("#ig-trstop").hidden = false;
+    $("#ig-trmsg").textContent = job.message || `${name} を取得しています…`;
+    const done = await i2tJobWait(job.rid, () => !!$("#ig-trm"), (t) => { const m = $("#ig-trmsg"); if (m) m.textContent = t; });
+    if (!done) return;
+    if (done.ok) {
+      try { await save(name); } catch (err) { fail(err); }
+      toast(`${name} を取得しました。訳のモデルにしました`);
+      igTrModel();
+    } else {
+      const m = $("#ig-trmsg"), b = $("#ig-trpull"), x = $("#ig-trstop");
+      if (m) m.textContent = done.error || "取得できませんでした";
+      if (b) b.disabled = false;
+      if (x) x.hidden = true;
+    }
+  };
 }
 
 /* Under the negative: Japanese that must be registered before generating, and English words with no

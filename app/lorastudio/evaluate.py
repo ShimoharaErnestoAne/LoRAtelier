@@ -1535,6 +1535,9 @@ def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, mod
         info["other_models"] = other_models_summary(snap["kind"], results, scores, extras) if ok else None
         info["notes"] = list(notes)
     project.q("UPDATE evals SET status='done', results=? WHERE id=?", (json.dumps(info, ensure_ascii=False), eval_id))
+    if done:   # a LoRA trained on this model gave images in ComfyUI: training and generation worked on this PC
+        from .models import registry
+        registry.mark_checked(model.get("id"), "gen", "lora")
     bus.publish("eval", project=project.id, run=run_id, eval=eval_id, status="done")
     return info
 

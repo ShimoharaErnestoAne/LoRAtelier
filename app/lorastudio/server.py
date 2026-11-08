@@ -26,7 +26,7 @@ from .evaluate import EXTRA_MODELS_KEY, MAX_EXTRA_MODELS, _extra_spec, comfy, de
 from .export import export as do_export
 from .gpu import gpu, query_gpus
 from . import addons, i2tlink, imagegen, linking, loraconf, moss_catalog, multichar, pipeline, projectio, promptedit, relocate, remote, traincache
-from .models import FAMILY_FILES, FAMILY_LABEL, VARIANTS, detect, hasher, library, registry
+from .models import FAMILY_FILES, FAMILY_LABEL, VARIANTS, catalog_entry, detect, hasher, library, registry
 from .store import ProjectManager, ProjectMoving, default_trigger
 from .training import (ACTIVE, QUEUE_FILE, STATUS_LABEL, Job, Runner, create_run, model_train_errors, preflight, resume_block_reason,
                        state_is_complete)
@@ -126,7 +126,73 @@ def status():
         "blur_images": config.settings().get("blur_images", False), "keep_train_cache": traincache.keep(),
         "queued": [{"project": j.project.id, "run": j.run_id} for j in runner.jobs],
         "first_run_done": bool(config.settings().get("models")),   # no file checks: asked every 4 s
+        "downloads": sum(1 for d in _downloads_view() if d["state"] == "running"),
+        "boot": BOOT, "can_restart": LAUNCH is not None,
     }
+
+
+LAUNCH: dict | None = None   # how this server was started (set by __main__; None in tests): 設定 → 再起動 needs it
+
+
+def _restart_losses() -> list[str]:
+    """What a restart stops now, for the question before it (nothing listed: it restarts at once)."""
+    out = []
+    cur = runner.current
+    if cur:
+        v = _job_view(cur)
+        what = (f"学習 #{v['run']}" if v["kind"] == "train" else v["label"] or "処理")
+        where = f"「{v['project_name']}」の" if v["project_name"] and v["kind"] != "imagegen" else ""
+        out.append(f"{where}{what}が途中で止まります" + ("（再起動後は「中断」になり、保存した地点があれば学習の履歴から続きを再開できます）"
+                                                    if v["kind"] == "train" else ""))
+    waiting = [j for j in runner.jobs if getattr(j, "task", None) is not None]
+    if waiting:
+        out.append(f"順番待ちの画像の生成・比較画像 {len(waiting)} 件は、再起動後に自動では始まりません（予約した学習は順番待ちのまま残ります）")
+    dl = sum(1 for d in _downloads_view() if d["state"] == "running")
+    if dl:
+        out.append(f"ダウンロード中の {dl} 件が止まります")
+    if analyzer.queue_size():
+        out.append("素材の解析が止まります（再起動後に続きから解析します）")
+    return out
+
+
+@app.get("/api/restart")
+def restart_check():
+    return {"losses": _restart_losses(), "can_restart": LAUNCH is not None}
+
+
+@app.post("/api/restart")
+def restart_app():
+    """設定 → 再起動: a new server is started in a new window, then this one ends (its window closes, and ComfyUI, the
+    workers and training end with it).  The open page waits for the new one and reloads itself."""
+    from .procjob import relaunch
+    if LAUNCH is None:
+        raise HTTPException(409, "この起動方法では再起動できません。start.bat から起動してください。")
+    try:
+        relaunch(["--port", str(LAUNCH["port"])] + (["--no-browser"] if LAUNCH.get("no_browser") else []))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    def end():
+        time.sleep(0.8)   # the answer reaches the page first
+        os._exit(0)       # exit code 0: start.bat does not pause, so its window closes
+    threading.Thread(target=end, daemon=True, name="restart").start()
+    return {"ok": True, "boot": BOOT}
+
+
+def _downloads_view() -> list[dict]:
+    """Every download of this session for the job page, newest first: the models of 設定 → モデルの追加 (addons) and
+    the files from links / dropped files (remote).  cancel: how it is stopped (None: it cannot be)."""
+    out = []
+    for cid, st in list(addons.state().items()):
+        e = catalog_entry(cid) or {}
+        out.append({"key": f"model:{cid}", "what": "モデル", "name": e.get("name") or cid, "cancel": f"/api/downloads/{cid}/cancel",
+                    **{k: st.get(k) for k in ("state", "done_bytes", "total_bytes", "message", "error", "started")}})
+    for st in remote.state():
+        up = st.get("src") == "upload"
+        out.append({"key": f"link:{st['id']}", "what": "ファイルの受け取り" if up else "リンクから取得", "name": st.get("name") or "",
+                    "cancel": None if up else f"/api/import/download/{st['id']}/cancel",
+                    **{k: st.get(k) for k in ("state", "done_bytes", "total_bytes", "message", "error", "started")}})
+    return sorted(out, key=lambda d: -(d.get("started") or 0))
 
 
 @app.get("/api/events")
@@ -2390,7 +2456,8 @@ def queue_state():
     cur = runner.current
     return {"current": _current_view(cur) if cur else None,
             "waiting": [_job_view(j) for j in runner.waiting()], "paused": runner.paused,
-            "i2t": i2tlink.client.view()}   # 画像からプロンプト: its own worker, shown on the job page too
+            "i2t": i2tlink.client.view(),   # 画像からプロンプト: its own worker, shown on the job page too
+            "downloads": _downloads_view()}
 
 
 @app.post("/api/queue/pause")

@@ -442,6 +442,9 @@ function onI2tEvent(m) {
       iStatus("MOSS-Image のキャラ一覧を取得しました");
       if (I.afterDownload) { const f = I.afterDownload; I.afterDownload = null; setTimeout(f, 50); }
     } else if (op === "face_models") iStatus("顔用のモデルを取得しました");
+    else if (op === "pull" && I.pullDescriber === m.value.name) {   // 説明を書かせるモデルとして取得: VLM の欄は変えない
+      I.pullDescriber = null; iStatus(`${m.value.name} を取得しました`); iProbeOllama(); if ($("#s-i2t")) drawI2tSettings();
+    }
     else if (op === "pull" && I.pullTranslate === m.value.name) {   // 訳のモデルとして取得: VLM の欄は変えない
       I.pullTranslate = null;
       iStatus(`${m.value.name} を取得しました（訳のモデル）`);
@@ -673,6 +676,65 @@ function iShowOllama() {   // the 「Ollama: …」 line, on the i2t page and on
   el.textContent = `Ollama: 接続OK (画像対応 ${o.vision.length} / 全 ${o.models.length})` + (I.cfg.engine === "hybrid" && !has ? `　選んだモデル ${I.cfg.ollama_model} は未取得です（設定の「追加 (pull)」で取得できます）` : "");
 }
 
+/* 訳のモデル on the settings page: a pull-down (app.js trModelPickerHtml), marked 取得済み／未取得 once Ollama answered */
+function iDrawTrPicker() {
+  const box = $("#s-tr-box");
+  if (!box) return;
+  box.innerHTML = trModelPickerHtml("s-tr", I.cfg.translate_model, I.c.translate_choices || [], I.ollama.ok && I.ollama.models.length ? I.ollama.models : null);
+  trModelPickerBind("s-tr", (name) => iSet("translate_model", name));
+}
+
+/* VLM のモデル (settings): one pull-down.  Image-capable models in Ollama come first (取得済み), then the models of
+   「導入...」's list not pulled yet (未取得, with their size; 「取得」 downloads the chosen one), then 「ほかのモデル」 for
+   a name or a Hugging Face URL.  Before Ollama answers, the list has no 取得済み / 未取得 marks. */
+function iDrawVlmPicker() {
+  const box = $("#s-vlm-box");
+  if (!box) return;
+  const cur = I.cfg.ollama_model || "", cat = I.c.vlm_catalog || [];
+  const have = I.ollama.ok ? new Set(I.ollama.models || []) : null;
+  const opt = (v, label) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""} title="${esc(v)}">${esc(label)}</option>`;
+  let body, listed;
+  if (have) {
+    const got = [...new Set([...(I.ollama.vision || []), ...cat.map(([n]) => n).filter((n) => have.has(n)), ...(I.cfg.ollama_models || []).filter((n) => have.has(n))])];
+    const notGot = cat.filter(([n]) => !have.has(n));
+    listed = [...got, ...notGot.map(([n]) => n)];
+    body = (got.length ? `<optgroup label="取得済み">${got.map((n) => opt(n, `${n}（取得済み）`)).join("")}</optgroup>` : "")
+      + (notGot.length ? `<optgroup label="未取得（選んで「取得」でダウンロード）">${notGot.map(([n, size, need]) => opt(n, `${n}（未取得・${size}GB・VRAM ${need}GB〜）`)).join("")}</optgroup>` : "");
+  } else {
+    listed = cat.map(([n]) => n);
+    body = listed.map((n) => opt(n, n)).join("");
+  }
+  // the model in use that is not in the list (pulled by name, or a model Ollama does not report as image-capable)
+  const extra = cur && !listed.includes(cur) ? opt(cur, cur + (have ? (have.has(cur) ? "（取得済み・画像を読めるか不明）" : "（未取得）") : "")) : "";
+  box.innerHTML = `<select id="s-vlm" style="max-width:520px">${extra}${body}<option value="__other">ほかのモデル（名前か URL を入れる）</option></select>
+    <input type="text" id="s-vlm-name" placeholder="Ollama のモデル名 / Hugging Face の URL" style="width:300px" hidden>`;
+  const mark = () => {   // 「取得」 only for a model Ollama does not have yet
+    const b = $("#s-pull"), name = trModelPickerValue("s-vlm"), got = !!(have && name && have.has(name));
+    if (b) { b.disabled = got; b.textContent = got ? "取得済み" : "取得"; }
+  };
+  trModelPickerBind("s-vlm", (name) => { iSet("ollama_model", name); iShowOllama(); mark(); });
+  $("#s-vlm").addEventListener("change", mark);
+  mark();
+}
+
+/* 先に説明を書かせる (describer_model): 使わない / JoyCaption。「取得」は JoyCaption がまだ Ollama に無いときだけ */
+function iDrawDescPicker() {
+  const box = $("#s-desc-box");
+  if (!box) return;
+  const joy = I.c.joycaption_model, cur = I.cfg.describer_model || "";
+  const have = I.ollama.ok ? new Set(I.ollama.models || []) : null;
+  const mark = have ? (have.has(joy) ? "（取得済み）" : "（未取得）") : "";
+  box.innerHTML = `<select id="s-desc"><option value="">使わない</option>
+    <option value="${esc(joy)}" ${cur === joy ? "selected" : ""}>JoyCaption Beta One${mark}</option>
+    ${cur && cur !== joy ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : ""}</select>`;
+  const btn = () => {
+    const b = $("#s-desc-pull"), v = $("#s-desc").value, got = !v || !!(have && have.has(v));
+    if (b) { b.hidden = !v; b.disabled = got; b.textContent = got ? "取得済み" : "取得"; }
+  };
+  $("#s-desc").onchange = (e) => { iSet("describer_model", e.target.value); btn(); };
+  btn();
+}
+
 async function iProbeOllama(askSetup) {
   if (!$("#i-ollama") && !$("#s-i2t-ollama")) return;
   I.ollama = { ...I.ollama, checking: true };
@@ -681,9 +743,10 @@ async function iProbeOllama(askSetup) {
     const v = await api("/api/i2t/call", { body: { fn: "probe_ollama", args: [I.cfg.ollama_host, I.cfg.ollama_model], timeout: 180 } }).then((r) => r.value);
     I.ollama = { ok: true, models: v.models, vision: v.vision, error: null };
     iShowOllama();
-    if ($("#s-vlm-list")) {
-      $("#s-vlm-list").innerHTML = [...new Set([...v.vision, ...(I.cfg.ollama_models || []), I.cfg.ollama_model].filter(Boolean))].map((m) => `<option value="${esc(m)}">`).join("");
-      $("#s-tr-list").innerHTML = [...new Set([...v.models, I.cfg.translate_model, ...(I.c.translate_choices || [])].filter(Boolean))].map((m) => `<option value="${esc(m)}">`).join("");
+    if ($("#s-vlm-box")) {
+      iDrawVlmPicker();
+      iDrawDescPicker();
+      iDrawTrPicker();
     }
   } catch (e) {
     I.ollama = { ok: false, models: [], vision: null, error: e.message };
@@ -754,11 +817,11 @@ function iTaggerDialog(why) {
   const d = iModal(`<h3>タガーモデルの取得</h3>
     <div class="small">${why === "first" ? "はじめまして。画像を解析するタガーモデルを取得します（初回のみ）。" : `設定されているタガーモデル (${esc(cur)}) がまだ取得されていません。`}</div>
     <div class="small muted">保存先: ${esc(I.c.models_dir)}</div>
-    <div style="margin:8px 0">${names.map(([k, v]) => `<label class="small" style="display:block"><input type="radio" name="i-tg" value="${k}" ${k === cur ? "checked" : ""}> ${esc(k)}　${esc(v.label)}　[${v.ready ? "取得済み" : "未取得"}]</label>`).join("")}</div>
+    <div style="margin:8px 0"><select id="i-tg" class="small" style="max-width:600px">${names.map(([k, v]) => `<option value="${esc(k)}" ${k === cur ? "selected" : ""}>${esc(k)}（${esc(v.label)}・${v.ready ? "取得済み" : "未取得"}）</option>`).join("")}</select></div>
     <div class="small muted">迷ったら eva02-large（最高精度）を選んでください。</div>
     <div class="row" style="margin-top:12px"><button class="primary" data-ok>ダウンロードして使う</button><button data-cancel>あとで</button></div>`);
   const go = () => {
-    const name = $("input[name=i-tg]:checked", d).value;
+    const name = $("#i-tg", d).value;
     iCloseModal();
     if (I.c.tagger_models[name].ready) { iSet("tagger_model", name); iStatus(`${name} を使用します`); if (why === "run") iAnalyze(); if ($("#s-i2t")) drawI2tSettings(); return; }
     I.afterDownload = why === "run" ? iAnalyze : null;
@@ -782,8 +845,6 @@ async function drawI2tSettings() {
     } catch (e) { host.innerHTML = `<div class="panel"><h2>画像からプロンプト（i2t）</h2><div class="err small">${esc(e.message)}</div></div>`; return; }
   }
   const f = I.cfg, c = I.c;
-  const vlmChoices = [...new Set([...(I.ollama.vision || []), ...(f.ollama_models || []), f.ollama_model].filter(Boolean))];
-  const allModels = [...new Set([...(I.ollama.models || []), f.translate_model, ...(c.translate_choices || [])].filter(Boolean))];
   const chk = (k, label) => `<label class="small" style="display:block"><input type="checkbox" data-sk="${k}" ${f[k] ? "checked" : ""}> ${label}</label>`;
   const num = (k, label) => `<label class="small">${label} <input type="number" step="0.05" min="0.01" max="0.99" data-sn="${k}" value="${f[k]}" style="width:70px"></label>`;
   const panel = (title, body) => `<div class="panel" style="margin-bottom:10px"><h3 style="margin:0 0 6px">${title}</h3>${body}</div>`;
@@ -793,10 +854,12 @@ async function drawI2tSettings() {
     ${panel("タガー", `<label class="small">モデル <select id="s-tagger">${Object.entries(c.tagger_models).map(([k, v]) => `<option value="${k}" ${f.tagger_model === k ? "selected" : ""}>${esc(k)} ${esc(v.label)}${v.ready ? " / 取得済み" : ""}</option>`).join("")}</select></label>
       <button class="small" id="s-tagger-get">取得...</button>
       <div class="row" style="margin-top:6px">しきい値 ${num("general_threshold", "一般")}${num("character_threshold", "キャラクター")}${num("style_threshold", "画風")}</div>`)}
-    ${panel("VLM (Ollama)", `<div class="row"><label class="small">モデル <input type="text" list="s-vlm-list" id="s-vlm" value="${esc(f.ollama_model)}" style="width:280px"></label><datalist id="s-vlm-list">${vlmChoices.map((m) => `<option value="${esc(m)}">`).join("")}</datalist>
-        <button class="small" id="s-pull">追加 (pull)</button><button class="small" id="s-stop" ${I.job ? "" : "hidden"}>■ 中止</button></div>
-      <div class="small muted">Ollama のモデル名か、Hugging Face の URL（GGUF のリポジトリ）を入れて「追加 (pull)」で取得します。</div>
-      <div class="row"><label class="small">訳のモデル <input type="text" list="s-tr-list" id="s-tr" value="${esc(f.translate_model)}" style="width:280px"></label><datalist id="s-tr-list">${allModels.map((m) => `<option value="${esc(m)}">`).join("")}</datalist><button class="small" id="s-tr-pull">取得</button><span class="small muted">結果の日本語訳用（PLaMo 3 Translate の 2B・8B も選べます）</span></div>
+    ${panel("VLM (Ollama)", `<div class="row"><span class="small">モデル</span><span id="s-vlm-box" class="small"></span>
+        <button class="small" id="s-pull">取得</button><button class="small" id="s-stop" ${I.job ? "" : "hidden"}>■ 中止</button></div>
+      <div class="small muted">「未取得」のモデルは、選んで「取得」を押すとダウンロードします。一覧にないモデルは「ほかのモデル」を選び、Ollama のモデル名か Hugging Face の URL（GGUF のリポジトリ）を入れて「取得」します。</div>
+      <div class="row"><span class="small">先に説明を書かせる</span><span id="s-desc-box" class="small"></span><button class="small" id="s-desc-pull">取得</button></div>
+      <div class="small muted">JoyCaption（画像の説明を書くことに特化したモデル、約 5.8GB）に先に画像の説明を書かせ、それを参考にして上のモデルがプロンプトを作ります。細かいところを拾いやすくなる見込みですが、1 枚ごとの時間は長くなります。書いた説明は結果の「分析」の欄に出ます。</div>
+      <div class="row"><span class="small">訳のモデル</span><span id="s-tr-box" class="small"></span><button class="small" id="s-tr-pull">取得</button><span class="small muted">結果の日本語訳用です。「未取得」のものは「取得」でダウンロードしてから使います</span></div>
       <div class="row"><label class="small">Ollama URL <input type="text" id="s-host" value="${esc(f.ollama_host)}" style="width:220px"></label><button class="small" id="s-reconnect">再接続</button><button class="small" id="s-setup">導入...</button></div>`)}
     ${panel("プロンプトの書き方", `${chk("quality_tags", "品質タグ (masterpiece, best quality ...) を先頭に付ける")}
       ${chk("use_break", "複数人物は BREAK で人物ごとに区切る (SDXL 系。Regional Prompter などで使う)")}
@@ -820,16 +883,28 @@ async function drawI2tSettings() {
     const v = Math.min(0.99, Math.max(0.01, Math.round(+b.value * 100) / 100));
     b.value = v; iSet(b.dataset.sn, v);
   });
-  $("#s-vlm").onchange = (e) => iSet("ollama_model", e.target.value.trim());
-  $("#s-tr").onchange = (e) => iSet("translate_model", e.target.value.trim());
-  $("#s-tr-pull").onclick = () => {
-    const name = $("#s-tr").value.trim();
+  iDrawVlmPicker();
+  iDrawDescPicker();
+  iDrawTrPicker();
+  $("#s-desc-pull").onclick = () => {
+    const name = $("#s-desc").value;
     if (!name) return;
+    iConfirm("説明を書かせるモデルを取得します", `${name} を Ollama に取得します（約 5.8GB）。中止しても、次回は続きから取得します。`, "取得する",
+      () => { I.pullDescriber = name; iStartJob("pull", { name, host: I.cfg.ollama_host }, `${name} を取得中...`); });
+  };
+  $("#s-tr-pull").onclick = () => {
+    const name = trModelPickerValue("s-tr");
+    if (!name) { $("#s-tr-name").focus(); return; }
     iConfirm("訳のモデルを取得します", `${name} を Ollama に取得します（ollama pull）。数 GB のダウンロードになることがあります。中止しても、次回は続きから取得します。`, "取得する",
       () => { I.pullTranslate = name; iStartJob("pull", { name, host: I.cfg.ollama_host }, `${name} を取得中...`); });
   };
   $("#s-host").onchange = (e) => { let h = e.target.value.trim(); if (h && !/^https?:\/\//.test(h)) h = "http://" + h; iSet("ollama_host", h.replace(/\/+$/, "")); e.target.value = I.cfg.ollama_host; };
-  $("#s-pull").onclick = () => iPull($("#s-vlm").value);
+  $("#s-pull").onclick = () => {
+    const name = trModelPickerValue("s-vlm");
+    if (!name) { $("#s-vlm-name").focus(); return; }
+    if (I.ollama.ok && I.ollama.models.includes(name)) { toast(`${name} は取得済みです`); return; }
+    iPull(name);
+  };
   $("#s-stop").onclick = iCancel;
   $("#s-reconnect").onclick = async () => { await api("/api/i2t/config", { method: "PUT", body: I.cfg }).catch(fail); iProbeOllama(); };
   $("#s-setup").onclick = iOllamaSetupDialog;
@@ -864,9 +939,10 @@ async function iOllamaSetupDialog() {
     <div class="row"><label class="small">モデル保存先 <input type="text" id="o-mdir" value="${esc(info.models_dir || "")}" style="width:360px"></label></div>
     <div class="small muted" id="o-space"></div>
     <div class="small" style="margin-top:8px"><b>使うモデル (PC のスペックから判定)</b></div>
-    ${I.c.vlm_catalog.map(([name, size, need, desc]) => `<label class="small" style="display:block"><input type="radio" name="o-model" value="${esc(name)}" ${name === pick ? "checked" : ""}>
-      ${esc(name)}　${have.has(name) ? "取得済み" : size + " GB"}　VRAM ${need}GB〜　[${name === fit.recommend ? "推奨" : esc(fit.fit[name])}]　<span class="muted">${esc(desc)}</span></label>`).join("")}
-    <label class="small" style="display:block"><input type="radio" name="o-model" value="__other" ${I.c.vlm_catalog.some(([n]) => n === pick) ? "" : "checked"}> その他 (名前を入力) <input type="text" id="o-other" value="${I.c.vlm_catalog.some(([n]) => n === pick) ? "" : esc(pick)}" style="width:240px"></label>
+    <div class="row small"><select id="o-model" style="max-width:640px">${I.c.vlm_catalog.map(([name, size, need]) => `<option value="${esc(name)}" ${name === pick ? "selected" : ""}>${esc(name)}（${have.has(name) ? "取得済み" : size + "GB"}・VRAM ${need}GB〜・${name === fit.recommend ? "推奨" : esc(fit.fit[name])}）</option>`).join("")}
+      <option value="__other" ${I.c.vlm_catalog.some(([n]) => n === pick) ? "" : "selected"}>ほかのモデル（名前を入れる）</option></select>
+      <input type="text" id="o-other" value="${I.c.vlm_catalog.some(([n]) => n === pick) ? "" : esc(pick)}" placeholder="Ollama のモデル名" style="width:240px" ${I.c.vlm_catalog.some(([n]) => n === pick) ? "hidden" : ""}></div>
+    <div class="small muted" id="o-desc"></div>
     <label class="small" style="display:block;margin-top:6px"><input type="checkbox" id="o-pull" checked> 続けて選択したモデルを取得する (未取得のとき)</label>
     <div class="row" style="margin-top:12px"><button class="primary" data-ok>${{ install: "ダウンロードしてインストール", start: "Ollama を起動して使う", connect: "この設定で使う" }[state]}</button><button data-cancel>閉じる</button>
       <span class="small muted">管理者権限は不要です。</span></div>`);
@@ -880,9 +956,17 @@ async function iOllamaSetupDialog() {
   };
   space();
   $$("#o-mdir, #o-dir", d).forEach((x) => x.onchange = space);
+  const desc = () => {
+    const v = $("#o-model").value, e = I.c.vlm_catalog.find(([n]) => n === v);
+    $("#o-other").hidden = v !== "__other";
+    $("#o-desc").textContent = e ? e[3] : "";
+    if (v === "__other") $("#o-other").focus();
+  };
+  $("#o-model").onchange = desc;
+  desc();
   $("[data-cancel]", d).onclick = () => { iCloseModal(); iStatus("Ollama の導入サポートを閉じました"); };
   $("[data-ok]", d).onclick = () => {
-    const r = $("input[name=o-model]:checked", d).value;
+    const r = $("#o-model").value;
     const model = r === "__other" ? $("#o-other").value.trim() : r;
     if (!model) { toast("モデルの名前を入れてください", "err"); return; }
     iSet("ollama_model", model);

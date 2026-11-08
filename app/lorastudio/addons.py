@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -357,9 +358,10 @@ def start(cid: str, token: str | None = None, choices: dict | None = None) -> di
             return _state[cid]
         files = resolve_files(entry, choices)
         total = int(sum(f[2] for f in files.values()) * 1e9)
-        st = {"state": "running", "done_bytes": 0, "total_bytes": total, "error": None, "message": "準備中"}
+        st = {"state": "running", "done_bytes": 0, "total_bytes": total, "error": None, "message": "準備中", "started": time.time()}
         _state[cid] = st
     threading.Thread(target=_work, args=(entry, files, token, st), daemon=True, name=f"addon-{cid}").start()
+    bus.publish("download", id=cid, state="running")
     return st
 
 
@@ -439,5 +441,7 @@ def catalog_view() -> list[dict]:
         rec = {k: recommend(c, k) for k in c.get("choices", {})}
         files = resolve_files(c, rec)
         out.append({**c, "files": files, "size_gb": round(sum(f[2] for f in files.values()), 1), "recommended": rec,
-                    "installed_model": m["id"] if m else None, "dl": _state.get(c["id"])})
+                    "installed_model": m["id"] if m else None, "dl": _state.get(c["id"]),
+                    # what worked with it on this PC (an add-on to a model has no record of its own)
+                    "checked": (m.get("checked") or {}) if m and not c.get("merge") else None})
     return out

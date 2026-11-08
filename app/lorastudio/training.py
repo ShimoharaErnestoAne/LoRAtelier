@@ -269,8 +269,6 @@ def preflight(project, used_images: list[dict], values: dict) -> dict:
     from .models import experimental_note
     if experimental_note(model["variant"]):
         warnings.append(experimental_note(model["variant"]))
-    if not VARIANTS[model["variant"]]["verified"]:
-        warnings.append(f"「{VARIANTS[model['variant']]['label']}」はこのツールでの実学習検証が未完了です。")
     enh = None
     if meta.get("kind") == "enhance":
         from . import enhance

@@ -901,6 +901,8 @@ def run_batch(project, bid: int):
     flag = control.get(project.id, bid)
     control.clear(project.id, bid)
     total_done = project.q("SELECT COUNT(*) c FROM gen_images WHERE batch_id=?", (bid,))[0]["c"]
+    if total_done:   # the model worked on this PC (検証済み in the model lists)
+        registry.mark_checked(spec.get("gen_model_id"), "gen")
     if flag == "stop":
         _set_status(project, bid, "cancelled", f"中止しました（{total_done} 枚は残っています）")
     elif flag == "pause" and total_done < len(spec["shots"]):

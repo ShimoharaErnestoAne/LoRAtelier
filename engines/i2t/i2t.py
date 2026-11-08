@@ -77,6 +77,14 @@ TAGGER_MODELS: dict[str, tuple[str, str]] = {
     "wd-swinv2-tagger-v3": ("SmilingWolf/wd-swinv2-tagger-v3", "バランス / 467MB"),
     "wd-convnext-tagger-v3": ("SmilingWolf/wd-convnext-tagger-v3", "軽量 / 395MB"),
     "wd-vit-tagger-v3": ("SmilingWolf/wd-vit-tagger-v3", "最軽量 / 379MB"),
+    # PixAI Tagger v0.9 (Apache-2.0)。wd-eva02-large-tagger-v3 を土台に、2025-01 までの Danbooru で学習し直したもの
+    # (約 13,500 語。新しい作品のキャラに強い)。DeepGHS の ONNX 版を使う。レーティングは出さないので、
+    # deepghs/anime_rating (MIT、約 17MB) で補う (RATING_MODEL_URL)
+    "pixai-tagger-v0.9": ("deepghs/pixai-tagger-v0.9-onnx", "新しいキャラに強い (2025-01 まで) / 1.27GB"),
+    # Camie Tagger v2 (GPL-3.0。モデルはこの PC にダウンロードして使い、i2t と一緒には配らない)。ViT-B/16 を土台に
+    # 約 70,500 語 (一般・キャラ・作品・絵師・メタ・年・レーティング) を出す。配布元の camie-tagger-v2.onnx と
+    # camie-tagger-v2-metadata.json を使い、語彙は WD と同じ selected_tags.csv の形に直して置く (camie_tags_csv)
+    "camie-tagger-v2": ("Camais03/camie-tagger-v2", "語彙が多い (約 7 万語。GPL-3.0) / 789MB"),
 }
 DEFAULT_TAGGER = "wd-eva02-large-tagger-v3"
 
@@ -180,6 +188,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ollama_model": "qwen3-vl:8b-instruct",
     "ollama_models": [],  # 手動で追加した VLM 名 (検出一覧に無くても候補に出す)
     "ollama_timeout": 300,  # 秒。VRAM 不足などで VLM が載らない場合はここで諦めてタガー結果を返す
+    "describer_model": "",  # 先に画像の説明を書かせるモデル (JOYCAPTION_MODEL など)。空なら使わない
     "last_dir": "",
     "vlm_seconds": {},  # VLM ごとに前回の分析にかかった秒数 (進み具合の見込みに使う)
     # 撮影プリセット (「構図と強さ」欄のプルダウン)。{"name": 画面の表示, "prompt": 入れる英語}。ここを書き換えて追加・編集できる
@@ -220,6 +229,19 @@ VLM_NUM_PREDICT_REFS = 2800  # 複数枚モードは項目 (ポーズ / 服装) 
 # 1200 では考えるだけで打ち切られて本文が空になっていた
 VLM_NUM_PREDICT_THINKING = 4096
 VLM_TIMEOUT = 300  # 秒 (config.json の ollama_timeout で上書き可)
+
+# 説明を先に書かせるモデル (describer_model)。JoyCaption Beta One (Llama 3.1 8B + SigLIP の LLaVA 型、画像の説明を
+# 書くことに特化し、内容で断らない) の GGUF。この Hugging Face のリポジトリは画像用の部品 (mmproj) も含み、Ollama の
+# pull で一緒に入る (Q4_K_M 4.9GB + 0.9GB)。指示に従って JSON を埋めるのは得意ではないので、いつもの VLM の代わりには
+# せず、書いた説明をいつもの VLM に参考として渡す (Engine._describe)
+JOYCAPTION_MODEL = "hf.co/cinnabrad/llama-joycaption-beta-one-hf-llava-mmproj-gguf:Q4_K_M"
+DESCRIBER_PROMPT = "Write a long detailed description for this image."   # JoyCaption Beta One の配布元の例と同じ
+DESCRIBER_SYSTEM = "You are a helpful image captioner."
+DESCRIBER_VLM = (
+    "A captioning model wrote this description of image 1 before you. Use it to notice details you might miss "
+    "(clothing parts, accessories, small objects, background, lighting, art style), but check each detail against "
+    "the image and the tagger tags and drop what you cannot see; do not copy its wording:\n{text}"
+)
 
 ProgressFn = Callable[[str], None]
 
@@ -493,16 +515,69 @@ def make_onnx_session(path: Path, cpu_only: bool = False) -> Any:
         return make_onnx_session(path, cpu_only=True)
 
 
+def tagger_is_pixai(name: str) -> bool:
+    """PixAI Tagger (入力は RGB・NCHW・-1〜1 で正方形に引き伸ばす。レーティングは別のモデルで補う)。"""
+    return name.startswith("pixai-")
+
+
+# レーティングを出さないタガー (PixAI) のレーティング。safe / r15 / r18 の 3 つを WD の呼び方に直して使う
+RATING_MODEL_URL = f"{HF_ENDPOINT}/deepghs/anime_rating/resolve/main/mobilenetv3_v1_pruned_ls0.1/model.onnx"
+RATING_MODEL_PATH = MODELS_DIR / "rating" / "anime_rating_mobilenetv3.onnx"
+RATING_LABELS = ["general", "sensitive", "explicit"]   # safe / r15 / r18 の順
+CAMIE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)   # ImageNet
+CAMIE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def tagger_is_camie(name: str) -> bool:
+    """Camie Tagger (入力は縦横比を保って 512 に縮め、ImageNet の平均色で余白を埋める。出力はロジット)。"""
+    return name.startswith("camie-")
+
+
+# Camie の分類 → WD の selected_tags.csv の category (0 一般 / 1 絵師 / 3 作品 / 4 キャラ / 5 メタ / 9 レーティング)。
+# 年 (year_2005 など) は WD に無いので 7 にする (タグとしては使わない)
+CAMIE_CATEGORY = {"general": 0, "artist": 1, "copyright": 3, "character": 4, "meta": 5, "year": 7, "rating": 9}
+
+
+def camie_tags_csv(metadata_path: Path, csv_path: Path) -> None:
+    """Camie の metadata.json (idx_to_tag・tag_to_category) を WD と同じ selected_tags.csv の形にする。
+    レーティングは rating_general などの名前を WD の呼び方 (general / sensitive / questionable / explicit) に直す。"""
+    meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+    mapping = meta["dataset_info"]["tag_mapping"]
+    idx_to_tag, tag_to_cat = mapping["idx_to_tag"], mapping["tag_to_category"]
+    tmp = csv_path.with_name(csv_path.name + ".part")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["tag_id", "name", "category", "count"])
+        for i in range(len(idx_to_tag)):
+            tag = idx_to_tag[str(i)]
+            cat = CAMIE_CATEGORY.get(tag_to_cat.get(tag, "general"), 0)
+            w.writerow([i, tag[len("rating_"):] if cat == 9 and tag.startswith("rating_") else tag, cat, 0])
+    os.replace(tmp, csv_path)
+
+
 def download_tagger(name: str, progress: DownloadProgress | None = None, cancel: threading.Event | None = None) -> None:
     """タガーモデル一式 (selected_tags.csv, model.onnx) を Hugging Face から models/ に取得する。"""
     if name not in TAGGER_MODELS:
         raise ValueError(f"未知のタガーモデルです: {name}")
     repo = TAGGER_MODELS[name][0]
     model_path, csv_path = tagger_files(name)
+    if tagger_is_camie(name):   # 配布元のファイル名で取って、model.onnx / selected_tags.csv として置く
+        meta_path = model_path.with_name("metadata.json")
+        if not model_file_ok(meta_path):
+            download_file(f"{HF_ENDPOINT}/{repo}/resolve/main/camie-tagger-v2-metadata.json", meta_path, progress,
+                          label=f"{name} / metadata", cancel=cancel)
+        if not csv_path.is_file():
+            camie_tags_csv(meta_path, csv_path)
+        if not model_file_ok(model_path):
+            download_file(f"{HF_ENDPOINT}/{repo}/resolve/main/camie-tagger-v2.onnx", model_path, progress,
+                          label=f"{name} / model", cancel=cancel)
+        return
     for fname, dest in (("selected_tags.csv", csv_path), ("model.onnx", model_path)):
         if dest.is_file() and (fname != "model.onnx" or model_file_ok(dest)):
             continue
         download_file(f"{HF_ENDPOINT}/{repo}/resolve/main/{fname}", dest, progress, label=f"{name} / {fname}", cancel=cancel)
+    if tagger_is_pixai(name) and not model_file_ok(RATING_MODEL_PATH):
+        download_file(RATING_MODEL_URL, RATING_MODEL_PATH, progress, label="anime_rating", cancel=cancel)
 
 
 class WD14Tagger:
@@ -524,7 +599,28 @@ class WD14Tagger:
         self.cpu_only = cpu_only
         first = self.session.get_inputs()[0]
         self.input_name = first.name
-        self.size = first.shape[1] if isinstance(first.shape[1], int) else 448
+        self.pixai = tagger_is_pixai(name)
+        self.camie = tagger_is_camie(name)
+        self.logits = False   # 出力がロジット (sigmoid で確率にする) か
+        if self.camie:   # NCHW (1, 3, 512, 512)。出力は initial / refined_predictions (ロジット) / selected_candidates
+            self.size = first.shape[2] if isinstance(first.shape[2], int) else 512
+            outs = [o.name for o in self.session.get_outputs()]
+            self.outputs = ["refined_predictions"] if "refined_predictions" in outs else None
+            self.logits = True
+            self.rating_session = None
+        elif self.pixai:   # NCHW (1, 3, 448, 448)。出力は prediction (確率) / embedding / logits
+            self.size = first.shape[2] if isinstance(first.shape[2], int) else 448
+            outs = [o.name for o in self.session.get_outputs()]
+            self.outputs = ["prediction"] if "prediction" in outs else None
+            if not model_file_ok(RATING_MODEL_PATH):
+                if progress:
+                    progress("レーティングの判定モデルをダウンロード中 (17MB)... 初回のみ")
+                download_file(RATING_MODEL_URL, RATING_MODEL_PATH, None, label="anime_rating")
+            self.rating_session = make_onnx_session(RATING_MODEL_PATH, cpu_only)
+        else:
+            self.size = first.shape[1] if isinstance(first.shape[1], int) else 448
+            self.outputs = None
+            self.rating_session = None
 
         self.names: list[str] = []
         self.categories: list[int] = []
@@ -539,6 +635,16 @@ class WD14Tagger:
         canvas = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
         canvas.alpha_composite(rgba)
         rgb = canvas.convert("RGB")
+        if self.camie:   # 配布元の onnx_inference.py: 縦横比を保って LANCZOS で縮め、(124, 116, 104) で 512 四方に、ImageNet の正規化
+            w, h = rgb.size
+            nw, nh = (self.size, max(1, int(self.size * h / w))) if w > h else (max(1, int(self.size * w / h)), self.size)
+            square = Image.new("RGB", (self.size, self.size), (124, 116, 104))
+            square.paste(rgb.resize((nw, nh), Image.LANCZOS), ((self.size - nw) // 2, (self.size - nh) // 2))
+            arr = (np.asarray(square, dtype=np.float32) / 255.0 - CAMIE_MEAN) / CAMIE_STD
+            return np.ascontiguousarray(arr.transpose(2, 0, 1)[None].astype(np.float32))
+        if self.pixai:   # 配布元の preprocess.json: 448x448 に引き伸ばし (bilinear)、0〜1、平均 0.5・標準偏差 0.5、CHW
+            arr = (np.asarray(rgb.resize((self.size, self.size), Image.BILINEAR), dtype=np.float32) / 255.0 - 0.5) / 0.5
+            return np.ascontiguousarray(arr.transpose(2, 0, 1)[None])
         w, h = rgb.size
         side = max(w, h)
         square = Image.new("RGB", (side, side), (255, 255, 255))
@@ -550,11 +656,10 @@ class WD14Tagger:
     def predict(self, image: Image.Image, general_th: float, character_th: float, flip: bool = False) -> TagResult:
         """flip=True なら左右反転した画像でもタグ付けし、確率を平均する (しきい値の近くのタグの揺れを減らす。時間は 2 倍)。
         タガーの語彙に左右 (left / right) を含む一般タグは無いので、反転してもタグの意味は変わらない。"""
-        probs = self.session.run(None, {self.input_name: self.preprocess(image)})[0][0]
+        probs = self._probs(image)
         if flip:
-            mirrored = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-            probs = (probs + self.session.run(None, {self.input_name: self.preprocess(mirrored)})[0][0]) / 2
-        ratings: dict[str, float] = {}
+            probs = (probs + self._probs(image.transpose(Image.Transpose.FLIP_LEFT_RIGHT))) / 2
+        ratings: dict[str, float] = self.rate(image) if self.rating_session is not None else {}
         general: list[tuple[str, float]] = []
         characters: list[tuple[str, float]] = []
         general_probs: dict[str, float] = {}
@@ -571,6 +676,24 @@ class WD14Tagger:
         characters.sort(key=lambda t: -t[1])
         rating = max(ratings, key=ratings.get) if ratings else "unknown"
         return TagResult(rating, ratings.get(rating, 0.0), general, characters, general_probs)
+
+    def _probs(self, image: Image.Image) -> np.ndarray:
+        out = np.asarray(self.session.run(self.outputs, {self.input_name: self.preprocess(image)})[0][0], dtype=np.float32)
+        return 1.0 / (1.0 + np.exp(-out)) if self.logits else out
+
+    def rate(self, image: Image.Image) -> dict[str, float]:
+        """レーティングを出さないタガーのレーティング (deepghs/anime_rating。imgutils と同じ 384x384・-1〜1・CHW)。"""
+        rgba = image.convert("RGBA")
+        canvas = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        canvas.alpha_composite(rgba)
+        arr = (np.asarray(canvas.convert("RGB").resize((384, 384), Image.BILINEAR), dtype=np.float32) / 255.0 - 0.5) / 0.5
+        inp = self.rating_session.get_inputs()[0].name
+        out = np.asarray(self.rating_session.run(None, {inp: np.ascontiguousarray(arr.transpose(2, 0, 1)[None])})[0][0],
+                         dtype=np.float64)
+        if not (out.min() >= 0 and abs(out.sum() - 1.0) < 1e-3):   # 確率でなければ softmax
+            out = np.exp(out - out.max())
+            out /= out.sum()
+        return {label: float(p) for label, p in zip(RATING_LABELS, out)}
 
 
 # タグごとのしきい値 (全体のしきい値より低い方を使う)。Danbooru の全年齢 532 枚で実測し (2026-09-27)、
@@ -5381,6 +5504,25 @@ class OllamaVLM:
         return obj
 
 
+    def describe(self, image: Image.Image) -> str:
+        """画像の説明を書かせる (describer_model。JoyCaption など、説明を書くことに特化したモデル)。"""
+        if "vision" not in self.capabilities():
+            raise OllamaError(f"モデル {self.model} は画像入力に対応していません。")
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "stream": False,
+            "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 600},
+            "messages": [
+                {"role": "system", "content": DESCRIBER_SYSTEM},
+                {"role": "user", "content": DESCRIBER_PROMPT, "images": [self.encode_image(image)]},
+            ],
+        }
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+        data = self._chat(payload)
+        text = str((data.get("message") or {}).get("content") or "")
+        return re.sub(r"(?s)^\s*<think>.*?</think>", "", text).strip()
+
     def analyze_detail(self, image: Image.Image, tags: list[str], with_build: bool,
                        keep_alive: int | str | None = None, medium_hint: str = "",
                        face: Image.Image | None = None) -> dict[str, Any]:
@@ -5820,6 +5962,31 @@ class Engine:
         self._vlm.keep_alive = 0 if self._low_vram() else None
         self._vlm.cancel_event = self._cancel
         return self._vlm
+
+    def _describer_label(self) -> str:
+        name = str(self.cfg.get("describer_model") or "")
+        return "JoyCaption" if name == JOYCAPTION_MODEL else name
+
+    def _describe(self, image: Image.Image, vlm: OllamaVLM, warnings: list[str]) -> str:
+        """describer_model が設定されていれば、いつもの VLM の前に画像の説明を書かせる。失敗しても解析は続ける
+        (理由は warnings に入れる)。いつもの VLM を続けて読むので、省 VRAM 設定ならすぐ VRAM から降ろす。"""
+        name = str(self.cfg.get("describer_model") or "").strip()
+        if not name or name == vlm.model:
+            return ""
+        self._check()
+        self.progress(f"{self._describer_label()} で画像の説明を書いています... (「■ 中止」で止められます)")
+        writer = OllamaVLM(vlm.host, name, vlm.timeout)
+        writer.keep_alive = 0 if self._low_vram() else None
+        writer.cancel_event = self._cancel
+        try:
+            return writer.describe(image)
+        except OperationCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001 - 説明が書けなくても、いつもの VLM で続ける
+            if self._cancel.is_set():
+                raise OperationCancelled() from e
+            warnings.append(f"{self._describer_label()} の説明をスキップしました: {describe_error(e)}")
+            return ""
 
     @staticmethod
     def _open(path: Path) -> Image.Image:
@@ -6925,6 +7092,9 @@ class Engine:
                     f"\nThe tagger suggests {hint_count} people ({', '.join(hint_tags)}). Fill persons with one "
                     "entry per person and keep each person's attributes separate."
                 )
+            described = self._describe(image, vlm, result.warnings)
+            if described:
+                guidance += "\n" + DESCRIBER_VLM.format(text=described)
             separate = tuple(slot for slot, _, _ in vlm_refs if slot in VLM_SEPARATE_SLOTS)
             parts: dict[str, dict[str, Any]] = {}
             for slot, ref_image, ref_tags in vlm_refs:
@@ -6966,6 +7136,8 @@ class Engine:
         result.out = out
         result.model = vlm.model
         result.analysis = llm_text(out.get("analysis"))
+        if described:   # 説明を書かせたモデルの文も分析の欄に残す (いつもの VLM が何を参考にしたかわかるように)
+            result.analysis = (result.analysis + "\n\n" if result.analysis else "") + f"[{self._describer_label()} の説明]\n{described}"
         result.notes = llm_text(out.get("notes"))
         result.natural_prompt = llm_text(out.get("natural_prompt"))
         result.extra_tags = clean_llm_tags(out.get("extra_tags"))
@@ -7904,18 +8076,40 @@ def is_translation_model(name: str) -> bool:
     return "index-translate" in name.lower() or is_plamo_translate(name)
 
 
-def plamo_prompt(text: str, lang: str = "ja") -> str:
-    """PFML3 の翻訳依頼 (chat_template.jinja の出力と同じ。原文に予約の <|plamo:...|> があれば崩して渡す)。"""
+# 訳す前に挟む「状況の説明」(PFML3 の context 要素。配布元の説明では、原文を解釈するための参考の文)。
+# 一般向けの翻訳モデルなので、何も渡さないと Danbooru タグを直訳したり、訳さずに写したりする。
+# タグ・短い語句と、英語の文で内容を伝えるモデル (Krea 2・MOSS-Image・Qwen-Image など) の文とで分ける
+PLAMO_CONTEXT = {
+    ("ja", "tags"): "画像生成 AI のプロンプトに並べる英語のタグや短い語句を、1 行に 1 つずつ日本語にします。"
+                    "多くはアニメ絵の Danbooru タグで、服装・髪・体の部位・ポーズ・表情・画角・背景・画質を表す語です。"
+                    "タグとしての意味で、短い日本語にします。",
+    ("ja", "prose"): "画像生成 AI に、作りたい画像の内容を説明する英語の文です。"
+                     "人物・服装・場面・光・撮り方が伝わる、自然な日本語にします。",
+    ("en", "tags"): "画像生成 AI のプロンプトに書く語です。Danbooru タグのような、短い英語の語句にします。",
+    ("en", "prose"): "画像生成 AI に、作りたい画像の内容を英語の文で伝えるためのものです。自然な英語の文にします。",
+}
+
+
+def looks_like_sentence(text: str) -> bool:
+    """タグ・短い語句ではなく文 (英語は 6 語以上か文の句読点、日本語は句点か 25 文字以上)。"""
+    t = text.strip()
+    return len(t.split()) >= 6 or bool(re.search(r"[.!?。！？]", t)) or (" " not in t and len(t) >= 25)
+
+
+def plamo_prompt(text: str, lang: str = "ja", context: str | None = None) -> str:
+    """PFML3 の翻訳依頼 (chat_template.jinja の出力と同じ。原文に予約の <|plamo:...|> があれば崩して渡す)。
+    context は dataset の直後に入れる状況の説明。"""
     text = text.replace("<|plamo:", "<| plamo:")
-    return ("<|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>" + text
+    ctx = "<|plamo:tag|>context<|plamo:msg|>" + context.replace("<|plamo:", "<| plamo:") if context else ""
+    return ("<|plamo:tag|>dataset<|plamo:msg|>translation" + ctx + "<|plamo:tag|>input<|plamo:msg|>" + text
             + "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>" + lang + "<|plamo:msg|>")
 
 
-def _translate_plain(vlm: "OllamaVLM", text: str, keep_alive: int | str | None) -> str:
+def _translate_plain(vlm: "OllamaVLM", text: str, keep_alive: int | str | None, context: str | None = None) -> str:
     if is_plamo_translate(vlm.model):
         req: dict[str, Any] = {
-            "model": vlm.model, "stream": False, "raw": True, "prompt": plamo_prompt(text),
-            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64 + 40 * (text.count("\n") + 1),
+            "model": vlm.model, "stream": False, "raw": True, "prompt": plamo_prompt(text, "ja", context),
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 64 + 40 * (text.count("\n") + 1) + len(text),
                         "stop": PLAMO_STOP},
         }
         if keep_alive is not None:
@@ -7940,16 +8134,33 @@ def translate_chips_ja(vlm: "OllamaVLM", words: list[str], keep_alive: int | str
     out: dict[str, str] = {}
     words = dedup([w for w in words if w])
     if is_translation_model(vlm.model):
-        for start in range(0, len(words), TRANSLATE_BATCH):
+        plamo = is_plamo_translate(vlm.model)
+        tag_ctx = PLAMO_CONTEXT[("ja", "tags")] if plamo else None
+        prose = [w for w in words if plamo and looks_like_sentence(w)]   # 文は 1 つずつ (並べると混ざる)
+        tags = [w for w in words if w not in prose]
+        got: dict[str, str] = {}
+        alone: set[str] = set()
+        for start in range(0, len(tags), TRANSLATE_BATCH):
             if checkpoint is not None:
                 checkpoint()  # 一時停止・中止はまとめて訳す単位の切れ目で
-            batch = words[start:start + TRANSLATE_BATCH]
-            lines = [x.strip() for x in _translate_plain(vlm, "\n".join(batch), keep_alive).split("\n") if x.strip()]
+            batch = tags[start:start + TRANSLATE_BATCH]
+            lines = [x.strip() for x in _translate_plain(vlm, "\n".join(batch), keep_alive, tag_ctx).split("\n") if x.strip()]
             if len(lines) != len(batch):  # 行の数が合わなければ並び順で結び付けられないので、1 つずつ訳し直す
-                lines = [_translate_plain(vlm, w, keep_alive).split("\n")[0].strip() for w in batch]
-            for word, ja in zip(batch, lines, strict=True):
-                if ja and ja.lower() != word.lower():  # 訳さずに写しただけ (1girl など) は入れない (英語のまま表示)
-                    out[word.lower()] = ja
+                lines = [_translate_plain(vlm, w, keep_alive, tag_ctx).split("\n")[0].strip() for w in batch]
+                alone.update(batch)
+            got.update(zip(batch, lines, strict=True))
+        if plamo:  # 並べて渡すと訳さずに写すことがあるので、写しただけの語は 1 つだけで渡し直す
+            for w in [w for w in tags if w not in alone and (got.get(w) or "").lower() == w.lower()]:
+                if checkpoint is not None:
+                    checkpoint()
+                got[w] = _translate_plain(vlm, w, keep_alive, tag_ctx).split("\n")[0].strip()
+        for w in prose:
+            if checkpoint is not None:
+                checkpoint()
+            got[w] = "".join(x.strip() for x in _translate_plain(vlm, w, keep_alive, PLAMO_CONTEXT[("ja", "prose")]).split("\n") if x.strip())
+        for word, ja in got.items():
+            if ja and ja.lower() != word.lower():  # 訳さずに写しただけ (1girl など) は入れない (英語のまま表示)
+                out[word.lower()] = ja
         return out
     thinking = "thinking" in vlm.capabilities()
     for start in range(0, len(words), TRANSLATE_BATCH):
@@ -8321,6 +8532,31 @@ VLM_CATALOG: list[tuple[str, float, int, str]] = [
     ("qwen3.5:4b", 3.4, 6, "Qwen3.5 の軽量版 (画像も読める)"),
     ("qwen3.5:9b", 6.6, 10, "Qwen3.5。MOSS-Image のテキストエンコーダーと同じ系統"),
     ("qwen3.5:27b", 17.0, 24, "Qwen3.5 の高精度版。RTX 3090 / 4090 級"),
+    # Gemma 4 (Google。全サイズが画像を読める)。大きさは ollama.com/library/gemma4 の表示。26b は MoE (動くのは約 4B 分)
+    ("gemma4:e4b", 6.6, 8, "Gemma 4 の軽量版"),
+    ("gemma4:12b", 7.7, 10, "Gemma 4"),
+    ("gemma4:26b", 16.0, 20, "Gemma 4 の MoE 版。大きさの割に速い"),
+    ("gemma4:31b", 19.0, 24, "Gemma 4 の高精度版。RTX 3090 / 4090 級"),
+    # Gemma 4 の検閲なし版 (huihui_ai、abliteration で答えを断る働きを外したもの。画像を見る力は元と同じ)。
+    # 大きさは ollama.com/huihui_ai/gemma-4-abliterated/tags の表示 (e4b は公式より大きい)。31b は作り直した v2
+    ("huihui_ai/gemma-4-abliterated:e4b", 9.6, 12, "Gemma 4 の検閲なし版 (軽量)"),
+    ("huihui_ai/gemma-4-abliterated:12b", 7.6, 10, "Gemma 4 の検閲なし版"),
+    ("huihui_ai/gemma-4-abliterated:26b", 18.0, 22, "Gemma 4 の検閲なし版 (MoE)"),
+    ("huihui_ai/gemma-4-abliterated:31b-v2", 20.0, 24, "Gemma 4 の検閲なし版 (高精度)。RTX 3090 / 4090 級"),
+    # Qwen3.6 / Qwen3.8 (画像も読める。27b 以上しかない)。大きさは ollama.com/library/qwen3.6・qwen3.8 の表示
+    ("qwen3.6:27b", 17.0, 24, "Qwen3.6。RTX 3090 / 4090 級"),
+    ("qwen3.6:35b-a3b", 23.0, 24, "Qwen3.6 の MoE 版 (動くのは約 3B 分)。大きさの割に速い"),
+    ("qwen3.8:27b", 18.0, 24, "Qwen3.8。RTX 3090 / 4090 級"),
+    # Qwen の検閲なし版 (huihui_ai、abliteration)。大きさは ollama.com/huihui_ai/... の表示。
+    # 名前の付いた派生版 (9b-Claude など、別の目的で追加学習したもの) は入れない
+    ("huihui_ai/qwen3-vl-abliterated:8b-instruct", 6.1, 8, "Qwen3-VL の検閲なし版 (2025 年のまま更新なし)"),
+    ("huihui_ai/qwen3.5-abliterated:4B", 3.3, 6, "Qwen3.5 の検閲なし版 (軽量)"),
+    ("huihui_ai/qwen3.5-abliterated:9b", 6.6, 10, "Qwen3.5 の検閲なし版"),
+    ("huihui_ai/qwen3.5-abliterated:27b", 17.0, 24, "Qwen3.5 の検閲なし版 (高精度)。RTX 3090 / 4090 級"),
+    ("huihui_ai/qwen3.6-abliterated:27b", 17.0, 24, "Qwen3.6 の検閲なし版。RTX 3090 / 4090 級"),
+    ("huihui_ai/qwen3.6-abliterated:35b-a3b", 24.0, 24, "Qwen3.6 の検閲なし版 (MoE)"),
+    ("huihui_ai/qwen3.8-abliterated:27b-q3_K", 14.0, 16, "Qwen3.8 の検閲なし版を強く縮めたもの (16GB 向け。精度は少し落ちる)"),
+    ("huihui_ai/qwen3.8-abliterated:27b-q4_K_M", 18.0, 24, "Qwen3.8 の検閲なし版。RTX 3090 / 4090 級"),
 ]
 VLM_SIZES = {name: size for name, size, _, _ in VLM_CATALOG}
 

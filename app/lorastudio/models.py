@@ -10,14 +10,16 @@ import json
 import re
 import struct
 import threading
+import time
 import uuid
 from pathlib import Path
 
 from . import config
 
 # verified: whether this variant has actually been trained + loaded in ComfyUI in this repo's
-# verification log (docs/VERIFICATION.md).  Unverified variants are shown with a warning.
-# experimental: added on trial with an engine that does not officially support it yet; the UI says it may not work.
+# verification log (docs/VERIFICATION.md); kept as a record, not shown.  The model lists show 検証済み / 未確認 from what
+# worked on the user's own PC (Registry.mark_checked).  Nothing is marked "may not work" (2026-11-07, the user:
+# a model of a supported base is compatible as a rule, and the developer's checks are not the last word).
 VARIANTS = {
     "illustrious": {"family": "sdxl", "label": "Illustrious XL 系 (SDXL)", "caption": "tags", "prediction": "eps", "verified": True},
     "noobai_eps": {"family": "sdxl", "label": "NoobAI-XL eps 系 (SDXL)", "caption": "tags", "prediction": "eps", "verified": False},
@@ -52,10 +54,10 @@ VARIANTS = {
                     "prediction": "flow", "verified": False},
     # MOSS-Image, trained with sd-scripts v0.12.1 (docs/moss_image_train_network.md).
     # SFT and Base share the DiT structure: the variant comes from the file name, else the user picks it.
-    "moss_image_sft": {"family": "moss_image", "label": "MOSS-Image SFT（試験導入・動作未確認）", "caption": "natural",
-                       "prediction": "flow", "verified": False, "experimental": True},
-    "moss_image_base": {"family": "moss_image", "label": "MOSS-Image Base（試験導入・動作未確認）", "caption": "natural",
-                        "prediction": "flow", "verified": False, "experimental": True},
+    "moss_image_sft": {"family": "moss_image", "label": "MOSS-Image SFT", "caption": "natural",
+                       "prediction": "flow", "verified": False},
+    "moss_image_base": {"family": "moss_image", "label": "MOSS-Image Base", "caption": "natural",
+                        "prediction": "flow", "verified": False},
 }
 UNAVAILABLE_NOTE: dict[str, str] = {}
 KREA2_NOTE = ("Krea 2 の学習には RAW 版の本体（bf16、約 26GB）が必要です。Turbo 版や量子化した版は、画像生成と素材の生成にだけ使えます。"
@@ -65,8 +67,7 @@ QWEN_IMAGE_NOTE = ("Qwen-Image-2512 は 20B の大きなモデルです。学習
 ANIMA29_NOTE = ("Anima 2.9B は、Anima の層を 28 から 40 に増やしたモデルです（試作版）。テキストエンコーダーと VAE は Anima と同じものを使います。"
                 "Anima（2B）で作った LoRA は層の並びが違うため、効き方が変わることがあります。")
 ZIMAGE_NOTE = "Turbo 系で学習するときは、Turbo 用の学習アダプター（約 0.3GB）を使います。"
-MOSS_NOTE = ("MOSS-Image は試験導入中です。このツールでは動作を確認していないため、生成や学習が動かない可能性があります。"
-             "学習には MOSS-Image に対応した新しい版の学習エンジン（sd-scripts v0.12.1）を別に入れて使います。")
+MOSS_NOTE = ("学習には MOSS-Image に対応した新しい版の学習エンジン（sd-scripts v0.12.1）を別に入れて使います。")
 QWEN21_NOTE = ("学習には、Qwen-Image-2.1 に対応した学習エンジン（musubi-tuner の開発版）を別に入れて使います。"
                "Qwen-Image-2.1 は Qwen Research License のモデルで、商用には使えません。")
 
@@ -251,7 +252,7 @@ CATALOG = [
          "vae": ("Comfy-Org/z_image", "split_files/vae/ae.safetensors", 0.34, "vae")},
      "needs": {"tokenizers": [["Tongyi-MAI/Z-Image", ["tokenizer/*"]]]}},
     *[{"id": f"moss_image_{v}", "variant": f"moss_image_{v}", "name": f"MOSS-Image {v.upper() if v == 'sft' else 'Base'}",
-       "license": "Apache-2.0", "gated": False, "experimental": True,
+       "license": "Apache-2.0", "gated": False,
        "note": ("仕上げ済みの版で、画像の生成に向いています。" if v == "sft" else "仕上げ前の元のモデルです。") +
                "本体・テキストエンコーダー・VAE を合わせて約 15GB（VRAM 16GB の場合）を取得します。お使いの GPU に合わせて、"
                "VRAM 20GB 未満では本体を、24GB 未満ではテキストエンコーダーを INT8 版にします。VRAM 8GB では学習できません。" + MOSS_NOTE,
@@ -277,12 +278,12 @@ CATALOG = [
     # cfg 1", commit 2026-10-20; same SHA256 as the Civitai file that post used), at strength 1.  The older files are
     # still used when they are the ones there.  Generation only: comparisons stay on the normal 25-step sampling.
     {"id": "moss_image_sft_dmd", "variant": "moss_image_sft", "name": "MOSS-Image SFT 8 ステップ高速生成 LoRA",
-     "license": "Apache-2.0", "gated": False, "merge": True, "experimental": True,
+     "license": "Apache-2.0", "gated": False, "merge": True,
      "needs_model": "先に MOSS-Image SFT を追加してください。この LoRA は MOSS-Image SFT に追加して使います。",
      "note": "MOSS-Image SFT の画像生成と素材生成を、25 ステップから 8 ステップ（CFG なし）に減らす LoRA です（lodestones 氏作の DMD2 版。Base 用として公開されたもので、SFT でも使えるという報告があります）。"
              "生成のときだけ使い、学習と比較画像には使いません。Base 版には使えません。"
              "以前の版を取得済みのときは、この版に切り替わります。"
-             "MOSS-Image SFT を登録してあれば、そのモデルに追加します。本体が INT8 版のときに効果が出るかは確認していません。",
+             "MOSS-Image SFT を登録してあれば、そのモデルに追加します。",
      "files": {"fast": ("lodestones/MOSS-Image-Base-8-steps-dmd", "lora_dmd2.safetensors", 1.19, "loras",
                         "moss_image_8steps_dmd2.safetensors")}},
     # akhaliq's 4-step distillation of MOSS-Image SFT, warm-started from lodestones' 8-step DMD.
@@ -291,11 +292,11 @@ CATALOG = [
     # DiT).  moss_image_sft_4step_v2.0 is the repo's frozen v2.0 file (lora.safetensors moves on).  Unverified here,
     # also on the INT8 DiT.
     {"id": "moss_image_sft_4step", "variant": "moss_image_sft", "name": "MOSS-Image SFT 4 ステップ高速生成 LoRA",
-     "license": "Apache-2.0", "gated": False, "merge": True, "experimental": True,
+     "license": "Apache-2.0", "gated": False, "merge": True,
      "needs_model": "先に MOSS-Image SFT を追加してください。この LoRA は MOSS-Image SFT に追加して使います。",
      "note": "MOSS-Image SFT の画像生成と素材生成を 4 ステップ（CFG なし）にする LoRA です（akhaliq 氏作、v2.0）。"
              "生成画面の「高速生成」で、8 ステップの LoRA と選べます。生成のときだけ使い、学習と比較画像には使いません。Base 版には使えません。"
-             "作者は bf16 版の本体で試しています。本体が INT8 版のときに効果が出るかは確認していません。",
+             "作者は bf16 版の本体で試しています。",
      "files": {"fast4": ("akhaliq/MOSS-Image-SFT-4-steps", "moss_image_sft_4step_v2.0.safetensors", 1.19, "loras")}},
     {"id": "krea2_raw", "variant": "krea2", "name": "Krea 2 RAW", "license": "Krea 2 の利用条件（モデルのページで確認）", "gated": True,
      "merge": True,
@@ -1116,6 +1117,25 @@ class Registry:
                 if m["id"] == model_id:
                     m.update(kw)
             config.settings().set("models", models)
+
+    def mark_checked(self, model_id: str | None, *what: str) -> None:
+        """Record that the model worked on this PC: "gen" an image was generated with it, "lora" a LoRA trained on
+        it gave comparison images.  The first time only (the lists show 検証済み from then on)."""
+        if not model_id:
+            return
+        with self._lock:
+            models = config.settings().get("models", [])
+            changed = False
+            for m in models:
+                if m["id"] == model_id:
+                    c = dict(m.get("checked") or {})
+                    for w in what:
+                        if w not in c:
+                            c[w] = int(time.time())
+                            changed = True
+                    m["checked"] = c
+            if changed:
+                config.settings().set("models", models)
 
     def remove(self, model_id: str) -> None:
         with self._lock:
