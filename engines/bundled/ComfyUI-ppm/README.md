@@ -87,6 +87,38 @@ The stock box editor is a Vue-only widget: with Nodes 2.0 turned off, the classi
 - When `background` is connected, the canvas background and `width`/`height` are taken from the image after the node has run once.
 - `width`/`height` accept links (e.g. `Empty Latent Image (Aspect Ratio)` → `Latent to Width & Height`). The canvas adopts the size the node actually executed with and keeps the boxes in their relative positions in that frame.
 - A new value on the `bboxes` input re-initializes the canvas; canvas edits are kept until the upstream value changes again.
+- Clicking a box's number badge selects that box and raises it above the others, so a box can be picked out of a stack of overlapping ones.
+
+### Anima Reference (PPM)
+
+Adds `Anima Reference (PPM)`, `Anima Reference Guidance (PPM)`, `Reference Cond (PPM)`, and `Reference Gallery (PPM)` nodes that can load various Anima reference adapters, tune their settings, load and store reference images. All nodes have a description and tooltips inside ComfyUI.
+
+<img src="docs/anima_ref.png" alt="Anima Reference (PPM)" width="800">
+
+Modified implementation of [ComfyUI-Anima-Ref-Adapter by ArcAnima](https://github.com/ElectronGirl/ComfyUI-Anima-Ref-Adapter) and [SnapRef by ArcAnima](https://github.com/ArcAnima/SnapRef) that should be compatible with various model patches (i.e. CLIP NegPip) and guiders.
+
+Supported adapters (download and put them into `models/loras` folder):
+- For [circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima) and [Gazingstars123/Anima-2.9B](https://huggingface.co/Gazingstars123/Anima-2.9B) (works without convertion):
+    - [0ppxnhximxr/snapref-v1a](https://huggingface.co/0ppxnhximxr/snapref-v1a) / [0ppxnhximxr/snapref-v1b](https://huggingface.co/0ppxnhximxr/snapref-v1b) / [0ppxnhximxr/snapref-v2a-pre2](https://huggingface.co/0ppxnhximxr/snapref-v2a-pre2)
+    - [ElectronGirl/anima-ref-adapter](https://huggingface.co/ElectronGirl/anima-ref-adapter)
+
+For adjusting additional settings like reference guidance strength or fidelity at the cost of inference speed, add `Anima Reference Guidance (PPM)` node after `Anima Reference (PPM)`.
+
+#### Reference Gallery (PPM)
+
+Manages reference images as a gallery stored in `input/refs_ppm` and outputs them as `PPM_REF_COND`, so a whole library fits into one node instead of a pile of `Load Image` + `Reference Cond (PPM)` nodes.
+
+| character grid | per-reference settings |
+| --- | --- |
+| <img src="docs/ref_gallery_1.png" alt="Reference Gallery (PPM) character grid" width="420"> | <img src="docs/ref_gallery_2.png" alt="Reference Gallery (PPM) reference editor" width="420"> |
+
+- Each character corresponds to a folder inside `input/refs_ppm/`. New characters and images can be added with node buttons, with dragging images onto the grid, or with pasting them while the node is selected. Each character can have multiple images - you can manage them by pressing `Images` button, or by double clicking on a character.
+- Every character has its own optional global prompt/description - you can set it inside `Rename` menu.
+- Every reference image has its own optional prompt/description and strength, and can be switched off without deleting it. A reference with an empty prompt inherits the character prompt (when set).
+
+The example workflow with `toy_soldier` being picked in the gallery node:
+
+<img src="docs/ref_gallery_3.png" alt="Reference Gallery (PPM) in the anima_ref workflow" width="1200">
 
 ### Attention Selectors
 

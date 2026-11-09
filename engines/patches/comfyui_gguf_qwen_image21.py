@@ -19,15 +19,19 @@ NEW = '''        def forward_ggml_cast_weights(self, input, input_act=None, act_
 '''
 
 
+# the mark the fix leaves in ops.py; copies patched before the rename to LoRAtelier carry the old name
+MARKS = ("LoRAtelier patch", "LoRA Studio patch")
+
+
 def applied(repo: Path) -> bool:
     p = Path(repo) / "ops.py"
-    return p.exists() and "LoRAtelier patch" in p.read_bytes().decode("utf-8", "replace")
+    return p.exists() and any(m in p.read_bytes().decode("utf-8", "replace") for m in MARKS)
 
 
 def apply(repo: Path) -> None:
     p = Path(repo) / "ops.py"
     s = p.read_bytes().decode("utf-8")
-    if "LoRAtelier patch" in s:
+    if any(m in s for m in MARKS):
         return
     crlf = "\r\n" in s
     s = s.replace("\r\n", "\n")

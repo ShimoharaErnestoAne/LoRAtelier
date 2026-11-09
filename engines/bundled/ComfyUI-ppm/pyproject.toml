@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-ppm"
-version = "1.1.17"
+version = "1.1.25"
 description = "Attention Couple for SDXL and Anima; NegPiP (negative weights in prompts) for SDXL, Anima and MOSS-Image; etc."
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
@@ -21,8 +21,10 @@ preset = "default"
 search-path = ["./", "../../"]
 
 [tool.ruff]
+target-version = "py310"
 line-length = 120
 indent-width = 4
+preview = true
 lint.select = ["S307", "S102", "T", "W", "F", "I"]
 src = ["./", "../../"]
 

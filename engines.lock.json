@@ -13,17 +13,18 @@
     },
     "ComfyUI": {
       "url": "https://github.com/comfyanonymous/ComfyUI.git",
-      "commit": "b9b290e43f1eb379946dfeb013faf9bbefa1a618",
-      "license": "GPL-3.0 (separate process, not linked)"
+      "commit": "2c75dc1b379a59e0880619d029607af5169a62ef",
+      "license": "GPL-3.0 (separate process, not linked)",
+      "version": "v0.44.0"
     },
     "ComfyUI-ppm": {
       "url": "https://github.com/pamparamm/ComfyUI-ppm.git",
-      "commit": "543dbe3c16ceff63a193df8aa3a8f2e4a1859815",
+      "commit": "4826dfddfb75f8fe431a3627f407e9421418bcaf",
       "license": "AGPL-3.0-or-later (ComfyUI custom node in its own process; its unmodified source + LICENSE ship in engines/bundled/ComfyUI-ppm)",
       "optional": true,
       "path": "engines/ComfyUI/custom_nodes/ComfyUI-ppm",
       "env": "comfy",
-      "used_for": "NegPip（マイナスの強さ・MOSS-Image の強調）、左右で描き分ける（Attention Couple）、白飛びを抑える（RescaleCFGPost）、スケジューラー ays / gits。2026-10-26 の版はこの ComfyUI（10-19）より新しい部分（MOSS-Image Edit）が読めないため、10-23 の版"
+      "used_for": "NegPip（マイナスの強さ・MOSS-Image の強調）、左右で描き分ける（Attention Couple）、白飛びを抑える（RescaleCFGPost）、スケジューラー ays / gits。ComfyUI v0.44.0 で読み込めることを確かめた 11-07 の版（Anima と MOSS-Image の NegPip の修正を含む）"
     },
     "ComfyUI-Moss-Image-Edit-Native": {
       "url": "https://github.com/PedroMarinhoDev/ComfyUI-Moss-Image-Edit-Native.git",
@@ -32,16 +33,16 @@
       "optional": true,
       "path": "engines/ComfyUI/custom_nodes/ComfyUI-Moss-Image-Edit-Native",
       "env": "comfy",
-      "used_for": "MOSS-Image の編集用 LoRA（chinoll Moss-Image-Edit、akhaliq MOSS-Image-Edit-HQ）で、元画像をプロンプトの指示どおりに編集する。この ComfyUI（10-18）には MOSS の参照画像の仕組みがないため、このパックが ComfyUI のモデルに足す"
+      "used_for": "MOSS-Image の編集用 LoRA（chinoll Moss-Image-Edit、akhaliq MOSS-Image-Edit-HQ）で、元画像をプロンプトの指示どおりに編集する。ComfyUI v0.44.0 は MOSS の参照画像を自分で扱うため、このパックはモデルには手を加えず（起動時にそう表示する）、ノードと LoRA の読み替えだけを受け持つ"
     },
     "rgthree-comfy": {
       "url": "https://github.com/rgthree/rgthree-comfy.git",
-      "commit": "d7297b42f0fa78bec1c0411478f887423c249502",
+      "commit": "bc48c6aaeca87bedbc14245d89f9bc6be37a630e",
       "license": "MIT (ComfyUI custom node in its own process; fetched with git, not bundled)",
       "optional": true,
       "path": "engines/ComfyUI/custom_nodes/rgthree-comfy",
       "env": "comfy",
-      "used_for": "画像から読み込んだ workflow の rgthree のノード（SDXL Empty Latent Image など）を、そのまま使う。この ComfyUI（10-18）より前の 10-06 の版。pip の追加パッケージはなし"
+      "used_for": "画像から読み込んだ workflow の rgthree のノード（SDXL Empty Latent Image など）を、そのまま使う。10-30 の版（画像から読み込んだ workflow の Power Puter が使える属性を絞る修正を含む）。pip の追加パッケージはなし"
     },
     "ComfyUI-GGUF": {
       "url": "https://github.com/leejet/ComfyUI-GGUF.git",

@@ -584,7 +584,9 @@ class Comfy:
                                    "使っているため、評価用の ComfyUI を起動できません。そのプログラムを終了してから、もう一度実行してください。")
             self._close_log()
             log = self._log = open(config.DATA_DIR / "comfyui.log", "ab")
-            env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+            # COMFYUI_DISABLE_PRODUCT_TIPS: ComfyUI 0.44 writes Comfy-Org product tips to the log otherwise (an env var,
+            # not --disable-product-tips, which an older ComfyUI would refuse to start with)
+            env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", COMFYUI_DISABLE_PRODUCT_TIPS="1")
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
             self.proc = subprocess.Popen(
                 [str(config.COMFY_PYTHON), "main.py", "--listen", config.HOST, "--port", str(config.COMFY_PORT),
