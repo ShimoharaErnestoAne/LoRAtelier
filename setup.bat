@@ -2,10 +2,11 @@
 rem Keep the cmd part of this file ASCII only: cmd misreads lines with Japanese (UTF-8) text, even after
 rem chcp 65001, and runs pieces of them as commands.  The messages and the steps live in the PowerShell
 rem part at the end of the file (after the marker line), which cmd never reads.
+rem LS_SETUP, not start.bat's LS_SELF: start.bat calls this file and still needs its own path afterwards.
 chcp 65001 >nul
 cd /d "%~dp0"
-set "LS_SELF=%~f0"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = [IO.File]::ReadAllText($env:LS_SELF, [Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#' + 'POWERSHELL#'))"
+set "LS_SETUP=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = [IO.File]::ReadAllText($env:LS_SETUP, [Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#' + 'POWERSHELL#'))"
 set "RC=%errorlevel%"
 rem Called from start.bat and succeeded: continue to the app without pausing.
 if "%RC%"=="0" if defined LS_FROM_START exit /b 0

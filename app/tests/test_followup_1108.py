@@ -106,6 +106,23 @@ def test_start_bat_has_no_japanese_where_cmd_reads():
     assert "setup.bat を実行します" in msgs[1] and "起動できません" in msgs[2]
 
 
+def test_setup_bat_keeps_start_bats_path():
+    """start.bat calls setup.bat and then prints its own messages from LS_SELF; when setup.bat set LS_SELF to
+    itself, the message after a failed setup became a PowerShell error ("StartIndex cannot be less than zero")."""
+    setup = (ROOT.parent / "setup.bat").read_bytes().decode("utf-8")
+    assert "set \"LS_SELF=" not in setup and "$env:LS_SELF" not in setup
+    assert b"$env:LS_SELF" in (ROOT.parent / "start.bat").read_bytes()
+
+
+def test_bat_files_have_no_control_characters():
+    """A scripted edit once turned "envs\\app" into "envs<BEL>pp" (\\a); start.bat then never found its Python,
+    ran the setup on every start and refused to start after it."""
+    for name in ("start.bat", "setup.bat", "start_intranet.bat"):
+        b = (ROOT.parent / name).read_bytes()
+        assert not [c for c in b if c < 32 and c not in (9, 10, 13)], name
+    assert (ROOT.parent / "start.bat").read_bytes().count(b'"envs\\app\\Scripts\\python.exe"') == 3
+
+
 def _i2t():
     sys.path.insert(0, str(ROOT.parent / "engines" / "i2t"))
     import i2t

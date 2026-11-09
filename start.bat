@@ -6,13 +6,13 @@ chcp 65001 >nul
 cd /d "%~dp0"
 set "LS_SELF=%~f0"
 rem Setup first when it has not finished (stopped partway, the folder moved, or an update changed the
-rem dependencies).  This also finds an envspp Python that does not run.
-"envspp\Scripts\python.exe" setup_env.py --check >nul 2>nul
+rem dependencies).  This also finds an envs\app Python that does not run.
+"envs\app\Scripts\python.exe" setup_env.py --check >nul 2>nul
 if errorlevel 1 (
   call :say 1
   set "LS_FROM_START=1"
   call "%~dp0setup.bat"
-  "envspp\Scripts\python.exe" setup_env.py --check >nul 2>nul
+  "envs\app\Scripts\python.exe" setup_env.py --check >nul 2>nul
   if errorlevel 1 (
     call :say 2
     pause
@@ -20,7 +20,7 @@ if errorlevel 1 (
   )
 )
 set "PYTHONPATH=%~dp0app"
-"envspp\Scripts\python.exe" -m lorastudio %*
+"envs\app\Scripts\python.exe" -m lorastudio %*
 if errorlevel 1 pause
 exit /b
 
