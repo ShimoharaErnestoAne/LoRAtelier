@@ -48,7 +48,8 @@ def cache_get(key: str):
 
 
 def cache_put(key: str, value) -> None:
-    config.atomic_write_json(_cache_path(key), value)
+    # compact: an analysis holds a few thousand numbers, and one per indented line doubles the file
+    config.atomic_write_text(_cache_path(key), json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def _other_image(old_key: str | None, new_key: str) -> bool:
@@ -155,8 +156,9 @@ class WorkerClient:
 
     def call(self, op: str, timeout: float = 900, **kw) -> dict:
         with self._lock:
+            # (not for "release": that only frees memory - starting a new process for it would be the opposite)
             if (self.cpu_since and time.time() - self.cpu_since > GPU_RETRY_S and not self._pending
-                    and self.proc is not None and self.proc.poll() is None):
+                    and op != "release" and self.proc is not None and self.proc.poll() is None):
                 self._quit_locked()   # a GPU broken by a sleep or a driver reset often works again: try it
             if self.proc is None or self.proc.poll() is not None:
                 self._start()
@@ -264,6 +266,7 @@ class Analyzer:
     """Queues per project.  AI requests are processed one at a time on the GPU, highest priority
     first (e.g. the image the user is looking at)."""
     _multi_cache: tuple[float, list] = (0.0, [])   # (when, settings of the multi-character projects)
+    _taken: list = []   # items taken out of the queue that wait for the GPU, not `current` yet (always replaced, never changed in place)
 
     def __init__(self, projects):
         self.projects = projects
@@ -337,6 +340,7 @@ class Analyzer:
         """Drop a project's queued work and wait until the image being processed (if it is theirs) is done."""
         with self._qlock:
             self._queued = {it for it in self._queued if it[1] != pid}
+            self._taken = [it for it in self._taken if it[1] != pid]   # dropped when its turn comes (_dispatch_one)
         end = time.time() + wait
         while self.current and self.current[1] == pid and time.time() < end:
             time.sleep(0.1)
@@ -359,15 +363,16 @@ class Analyzer:
         mode = meta.get("caption_mode") or captions.default_caption_mode(meta)
         text = None
         if style == "tags":
+            key += captions.TAG_RULES
             text = captions.tag_caption(img["ai"], kind, outfit, trig, concept)
         elif mode == "tags":
-            key += ":t"
+            key += ":t" + captions.TAG_RULES
             text = captions.tag_sentence(img["ai"], kind, outfit, trig, concept)
         elif mode == "gen" and (img.get("gen") or {}).get("shot"):
             from .generate import gen_caption
             text = gen_caption(img["gen"]["shot"], kind, outfit, trig, captions.clothing_tags(img["ai"]))
             if text:
-                key += ":g"
+                key += ":g" + captions.TAG_RULES
         if text is None:
             return "vlm", key + (":mono" if mono else ""), None
         if mono:
@@ -519,9 +524,17 @@ class Analyzer:
             self._enqueue(8, (f"mask:{mode}", project.id, image_id))
 
     def queue_size(self) -> int:
-        # the priority queue may hold stale duplicates after re-prioritisation; count real pending items
+        # the priority queue may hold stale duplicates after re-prioritisation; count real pending items.
+        # Items taken out that still wait for the GPU (training / generation runs) are not done either
         with self._qlock:
-            return len(self._queued)
+            return len(self._queued) + len(self._taken)
+
+    def has_work(self, pid: str) -> bool:
+        """Work of this project is queued, waits for the GPU or is being done."""
+        with self._qlock:
+            cur = self.current
+            return (any(it[1] == pid for it in self._queued) or any(it[1] == pid for it in self._taken)
+                    or bool(cur and cur[1] == pid))
 
     def _more_captions(self, pid: str) -> list[int]:
         """Further queued captions of the same project, taken out of the queue to be written in one batch."""
@@ -547,12 +560,17 @@ class Analyzer:
             op, pid, image_id = item
             if op == "caption":
                 image_id = [image_id] + self._more_captions(pid)
+            with self._qlock:
+                self._taken = [(op, pid, i) for i in image_id] if op == "caption" else [item]
             try:
                 self._dispatch_one(op, pid, image_id, item)
             except Exception as e:   # one bad item must not stop the queue for the rest of the session
                 # RuntimeError carries a message for the user (e.g. the worker stopped restarting)
                 self._mark_failed(op, pid, image_id, str(e) if isinstance(e, RuntimeError) else
                                   f"解析中にエラーが起きました: {type(e).__name__}: {e}")
+            finally:
+                with self._qlock:
+                    self._taken = []
 
     def _mark_failed(self, op, pid, image_id, message):
         try:
@@ -566,19 +584,27 @@ class Analyzer:
                     self._set_mask(project, img, op.split(":", 1)[1], {"status": "failed", "error": message})
             else:
                 for i in image_id:
-                    project.set_fields(i, caption_status="failed")
-                    bus.image_changed(pid, i)
+                    # only the ones still waiting: part of the batch may already have its caption (cache, tags)
+                    if (project.image(i) or {}).get("caption_status") in ("pending", "running"):
+                        project.set_fields(i, caption_status="failed")
+                        bus.image_changed(pid, i)
         except Exception:
             pass   # the project is gone, or the database cannot be written either
 
-    def _dispatch_one(self, op, pid, image_id, item):
+    def _project(self, op, pid, image_id, item):
+        """The project of a queue item, or None when it is gone (deleted) or being moved (queued again for later)."""
         try:
-            project = self.projects.get(pid)
+            return self.projects.get(pid)
         except KeyError as e:
             from .store import ProjectMoving
             if isinstance(e, ProjectMoving):   # being moved to another place: do it once the move is over
                 items = [(op, pid, i) for i in image_id] if op == "caption" else [item]   # a caption batch: all of it
                 threading.Timer(10, lambda: [self._enqueue(5, it) for it in items]).start()
+            return None
+
+    def _dispatch_one(self, op, pid, image_id, item):
+        project = self._project(op, pid, image_id, item)
+        if project is None:
             return
         if not worker.available():
             if op.startswith("mask:"):
@@ -595,7 +621,16 @@ class Analyzer:
             bus.publish("analysis", state="paused", reason=gpu.owner)
             gpu.begin_analysis()
             bus.publish("analysis", state="running")
-        self.current = item
+            # the wait may have been a whole training run: the project may have been deleted or moved meanwhile
+            with self._qlock:
+                dropped = not self._taken
+            project = None if dropped else self._project(op, pid, image_id, item)
+            if project is None:
+                gpu.end_analysis()
+                return
+        with self._qlock:
+            self.current = item
+            self._taken = []
         try:
             if op == "analyze":
                 self._do_analyze(project, image_id)
@@ -713,7 +748,16 @@ class Analyzer:
         t = getattr(project, "_ident_timer", None)
         if t is not None:
             t.cancel()
-        project._ident_timer = threading.Timer(2.0, self.compute_identity, args=(project,))
+        self._identity_later(project, 2.0)
+
+    def _identity_later(self, project, seconds: float):
+        def run():
+            try:
+                if self.projects.get(project.id) is project:   # not deleted or moved meanwhile
+                    self.compute_identity(project)
+            except KeyError:
+                pass
+        project._ident_timer = threading.Timer(seconds, run)
         project._ident_timer.daemon = True
         project._ident_timer.start()
 
@@ -733,9 +777,12 @@ class Analyzer:
         if len(anime) >= 2:
             feats = [i["ai"]["ccip"] for i in anime]
             if not gpu.begin_analysis(timeout=0):
-                return  # GPU busy; recomputed after the next analysis
+                # GPU busy (training / generation): tried again later, not only after the next analysis - a new
+                # reference image or images analysed just before the training began would stay unjudged
+                self._identity_later(project, 60)
+                return
             try:
-                res = worker.call("ccip_diff", feats=feats, refs=feats, timeout=300)
+                res = worker.call("ccip_diff", feats=feats, timeout=300)   # no refs: all against all
             except RuntimeError:
                 return   # the worker stopped restarting: the image list shows that already
             finally:

@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -112,7 +113,7 @@ def consts() -> dict:
     m = i2t
     return {
         "version": m.__version__, "app_name": m.APP_NAME, "translate_choices": m.TRANSLATE_CHOICES,
-        "engines": m.ENGINES, "targets": m.TARGETS, "modes": m.MODES, "ref_slots": m.REF_SLOTS, "ref_what_ja": m.REF_WHAT_JA,
+        "engines": m.ENGINES, "targets": m.TARGETS, "modes": m.MODES, "restyle_modes": m.RESTYLE_MODES, "ref_slots": m.REF_SLOTS, "ref_what_ja": m.REF_WHAT_JA,
         "tagger_models": {k: {"repo": v[0], "label": v[1], "ready": m.tagger_ready(k)} for k, v in m.TAGGER_MODELS.items()},
         "mosaic_levels": {k: {kk: vv for kk, vv in v.items() if isinstance(vv, (str, int, float, bool))} for k, v in m.MOSAIC_LEVELS.items()},
         "camera_options": {d: [[v, lab] for v, lab, _tags in opts] for d, opts in m.CAMERA_OPTIONS.items()},
@@ -133,6 +134,12 @@ def consts() -> dict:
     }
 
 
+def consts_now() -> dict:
+    """The parts of consts() a download changes, in one call (the page asks on every open)."""
+    return {"tagger_ready": {k: i2t.tagger_ready(k) for k in i2t.TAGGER_MODELS},
+            "moss_catalog_ready": i2t.moss_catalog_ready()}
+
+
 def probe_ollama(host: str, model: str) -> dict:
     """Models on the Ollama server and which of them take images (the i2t window's 「Ollama: …」)."""
     models = i2t.OllamaVLM(host, model).list_models()
@@ -146,11 +153,74 @@ def probe_ollama(host: str, model: str) -> dict:
     return {"models": models, "vision": vision}
 
 
+_dict_lock = threading.RLock()   # translations.json / the readings file: read-modify-write from calls and jobs
+_dict_cache: dict = {"sig": None, "table": None}
+# Words a translation job did not translate (the model copied "1girl", or answered nothing): asking about them
+# after every analysis would start the same job each time.  Why a word came back untranslated is not known here
+# (a copy and an empty answer of an Ollama that was short of memory look the same), so a word is left out only
+# after it came back twice, only for a while, and never when the user presses 「日本語」 themselves (again=True).
+_SKIP_AFTER = 2
+_SKIP_SECONDS = 600
+_skip_words: dict[str, dict] = {}   # translation model -> {word: [times it came back untranslated, when last]}
+
+
+def _skipped(model: str) -> set:
+    now = time.time()
+    return {w for w, (n, t) in list(_skip_words.get(model, {}).items()) if n >= _SKIP_AFTER and now - t < _SKIP_SECONDS}
+
+
+def _note_untranslated(model: str, words: list, found: dict) -> list:
+    """After a translation job: the words it left untranslated (counted for _skipped; a translated one is forgotten)."""
+    seen, left, now = _skip_words.setdefault(model, {}), [], time.time()
+    for w in words:
+        key = str(w or "").lower()
+        if not key:
+            continue
+        if key in found:
+            seen.pop(key, None)
+        else:
+            seen[key] = [seen.get(key, [0, 0])[0] + 1, now]
+            left.append(w)
+    return left
+
+
+def _file_sig(path: Path):
+    try:
+        st = path.stat()
+        return (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (str(path), None, None)
+
+
+def _bundled_table() -> dict:
+    """i2t.load_tag_dictionary() (the bundled dictionary + dict/*.csv), read again only when a file changed."""
+    folder = i2t.USER_DICT_DIR
+    files = [i2t.BUNDLED_DICT_PATH, *(sorted(folder.glob("*.csv")) if folder.is_dir() else [])]
+    sig = tuple(_file_sig(f) for f in files)
+    with _dict_lock:
+        if _dict_cache["sig"] != sig:
+            _dict_cache.update(sig=sig, table=i2t.load_tag_dictionary())
+        return _dict_cache["table"]
+
+
 def chip_table() -> dict:
     """Bundled dictionary + dict/*.csv + translations.json (later ones win), as the window loads it."""
-    table = i2t.load_tag_dictionary()
+    table = dict(_bundled_table())
     table.update(i2t.load_translations())
     return table
+
+
+def _save_translations(table: dict) -> bool:
+    """i2t.save_translations, but through a temporary file: a reader never sees a half-written dictionary
+    (which reads as empty, and the next save would then drop every registered word)."""
+    try:
+        path = i2t.TRANSLATIONS_PATH
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(table, ensure_ascii=False, indent=1, sort_keys=True) + chr(10), "utf-8", newline=chr(10))
+        tmp.replace(path)
+        return True
+    except OSError:
+        return False
 
 
 def chips_ja(chunks: list[str], table: dict | None = None) -> list[str]:
@@ -158,12 +228,16 @@ def chips_ja(chunks: list[str], table: dict | None = None) -> list[str]:
     return [i2t.chip_label_ja(c, table) for c in chunks]
 
 
-def missing_ja(chunks: list[str], character_tags: list[str]) -> list[str]:
-    """Chunks the dictionaries do not know (character names are never translated nor sent to Ollama)."""
+def missing_ja(chunks: list[str], character_tags: list[str], again: bool = False) -> list[str]:
+    """Chunks the dictionaries do not know (character names are never translated nor sent to Ollama).
+    again: the user asked for Japanese themselves - the words left out of the automatic translation (see
+    _skip_words) are asked about as well."""
     table = chip_table()
     names = {i2t.chip_core(t)[0].lower() for t in character_tags}
+    skip = _skipped(str(i2t.load_config().get("translate_model") or "")) if _skip_words and not again else set()
     return i2t.dedup([core for core, _w in map(i2t.chip_core, chunks)
-                      if core and not i2t.lookup_ja(table, core) and core.lower() not in names])
+                      if core and not i2t.lookup_ja(table, core) and core.lower() not in names
+                      and core.lower() not in skip])
 
 
 def ja_table() -> dict:
@@ -201,26 +275,28 @@ def register_ja(en: str, ja: str, reading: str = "") -> dict:
         raise ValueError(f"「{ja}」の読みを、ひらがなで入れてください")
     if reading and not _HIRA.match(reading):
         raise ValueError("読みは、ひらがなで入れてください")
-    table = i2t.load_translations()
-    if ja:
-        table[key] = ja
-    else:
-        table.pop(key, None)
-    if not i2t.save_translations(table):
-        raise ValueError("辞書を保存できませんでした")
-    readings = _load_readings()
-    if ja and reading:
-        readings[key] = reading
-    else:
-        readings.pop(key, None)
-    if not _save_readings(readings):
-        raise ValueError("読みを保存できませんでした（訳は登録しました）")
+    with _dict_lock:
+        table = i2t.load_translations()
+        if ja:
+            table[key] = ja
+        else:
+            table.pop(key, None)
+        if not _save_translations(table):
+            raise ValueError("辞書を保存できませんでした")
+        readings = _load_readings()
+        if ja and reading:
+            readings[key] = reading
+        else:
+            readings.pop(key, None)
+        if not _save_readings(readings):
+            raise ValueError("読みを保存できませんでした（訳は登録しました）")
+    _skip_words.clear()   # a word registered by hand may be asked about again
     return {key: ja}
 
 
 def _save_readings(readings: dict) -> bool:
     try:
-        tmp = READINGS_PATH.with_suffix(".tmp")
+        tmp = READINGS_PATH.with_name(READINGS_PATH.name + ".tmp")
         tmp.write_text(json.dumps(readings, ensure_ascii=False, indent=1, sort_keys=True), "utf-8")
         tmp.replace(READINGS_PATH)
         return True
@@ -232,9 +308,28 @@ def _to_hira(t: str) -> str:
     return "".join(chr(ord(c) - 0x60) if "\u30a1" <= c <= "\u30f6" else c for c in str(t or "").strip())
 
 
+def _inside(path, folder: Path) -> Path:
+    """The path, when it is inside the folder (the page names files of i2t's own folders only)."""
+    p = Path(path).resolve()
+    if not p.is_relative_to(Path(folder).resolve()):
+        raise ValueError(f"この場所のファイルは扱えません: {path}")
+    return p
+
+
 def save_openpose(points, size, dest: str) -> str:
+    dest = str(_inside(dest, DATA_DIR))
     i2t.render_openpose(points, tuple(size)).save(dest)
     return dest
+
+
+def history_delete(stem: str) -> None:
+    if not stem or Path(str(stem)).name != str(stem):
+        raise ValueError(f"履歴の名前ではありません: {stem}")
+    i2t.history_delete(str(stem))
+
+
+def history_update_prompts(path, positive: str, negative: str) -> bool:
+    return i2t.history_update_prompts(_inside(path, i2t.HISTORY_DIR), positive, negative)
 
 
 def system_fit() -> dict:
@@ -252,7 +347,7 @@ CALLS = {
     # config
     "load_config": None, "save_config": None, "normalize_host": None, "find_look": None, "camera_tags": None,
     # history
-    "history_entries": None, "history_update_prompts": None, "history_delete": None,
+    "history_entries": None, "history_update_prompts": history_update_prompts, "history_delete": history_delete,
     # images
     "read_generation_info": None,
     # models
@@ -262,12 +357,12 @@ CALLS = {
     # Ollama / HF
     "probe_ollama": probe_ollama, "parse_hf_model": None, "check_hf_model": None, "gather_ollama_info": None,
     "system_fit": system_fit, "free_gb": None, "ollama_models_dir": None,
-    "consts": consts,
+    "consts": consts, "consts_now": consts_now,
 }
 
 
 def history_result(path: str) -> dict:
-    r, extra = i2t.history_result(Path(path))
+    r, extra = i2t.history_result(_inside(path, i2t.HISTORY_DIR))
     return {"result": dataclasses.asdict(r), "extra": extra}
 
 
@@ -281,13 +376,14 @@ def _call(rid: int, req: dict) -> None:
             raise ValueError(f"呼べない関数です: {name}")
         fn = CALLS[name] or getattr(i2t, name)
         args = list(req.get("args") or [])
-        if name in ("free_gb", "history_update_prompts") and args:
+        if name == "free_gb" and args:
             args[0] = Path(args[0])
         if name in ("read_generation_info",):
             args[0] = Path(args[0])
         if name == "save_config":           # the window saves its whole settings dict
             with _cfg_lock:
-                fn(args[0])
+                # ...except the measured VLM times: the page holds the copy it was opened with
+                fn({**args[0], "vlm_seconds": i2t.load_config().get("vlm_seconds") or {}})
                 value = i2t.load_config()
         else:
             value = fn(*args, **(req.get("kwargs") or {}))
@@ -300,7 +396,8 @@ def _call(rid: int, req: dict) -> None:
 # ------------------------------------------------------------------ analysis
 def _analyze(rid: int, req: dict) -> None:
     try:
-        cfg = {**i2t.load_config(), **(req.get("cfg") or {})}
+        saved = i2t.load_config()
+        cfg = {**saved, **(req.get("cfg") or {}), "vlm_seconds": saved.get("vlm_seconds") or {}}
         engine.cfg = cfg
         engine.progress = lambda m: emit({"event": "progress", "rid": rid, "message": str(m)})
         engine.fraction = lambda f, est=None: emit({"event": "fraction", "rid": rid, "value": f, "est": est})
@@ -355,12 +452,39 @@ def _keep_vlm_loaded(vlm) -> None:
     vlm._ls_keep = True
 
 
-def _kept_vlm() -> dict | None:
-    """The VLM this worker may have left loaded (sent with the reply so the server can unload it)."""
+def _kept_vlm() -> list[dict]:
+    """The VLM this worker may have left loaded (sent with the reply so the server can unload it when training
+    or generation takes the GPU).  With 省 VRAM off Ollama keeps it by its own rule and material analysis may
+    run beside it ("low_vram": False: unloaded for training / generation only)."""
     v = engine._vlm
-    if v is None or not engine._low_vram():
-        return None
-    return {"host": v.host, "model": v.model}
+    if v is None:
+        return []
+    return [{"host": v.host, "model": v.model, "low_vram": bool(engine._low_vram())}]
+
+
+def _job_keep(cfg: dict):
+    """keep_alive for the Ollama requests of a translation / reading job: with 省 VRAM on the model stays for the
+    job (i2t's own value 0 would load it again for every request) and _unload_used() frees it when the job ends."""
+    return VLM_KEEP if cfg.get("low_vram", True) else None
+
+
+def _unload_used(cfg: dict, *vlms) -> list[dict]:
+    """After a translation / reading job: 省 VRAM on -> unload the models now; off -> the ones Ollama still
+    holds, for the server (it unloads them when training or generation takes the GPU)."""
+    seen, out = set(), []
+    for v in vlms:
+        key = (getattr(v, "host", None), getattr(v, "model", None))
+        if v is None or None in key or key in seen:
+            continue
+        seen.add(key)
+        if cfg.get("low_vram", True):
+            try:
+                v.unload()
+            except Exception:
+                pass
+        else:
+            out.append({"host": key[0], "model": key[1], "low_vram": False})
+    return out
 
 
 def _wrap_engine_vlm(eng) -> None:
@@ -401,29 +525,40 @@ def _translate(rid, req, cancel):
     vlm = i2t.OllamaVLM(cfg["ollama_host"], model, int(cfg.get("ollama_timeout") or i2t.VLM_TIMEOUT))
     vlm.cancel_event = cancel
     _job["vlm"] = vlm
-    keep = 0 if cfg.get("low_vram", True) else None
+    keep = _job_keep(cfg)
     gate = _job["gate"]
+    used = [vlm]
 
     def checkpoint():
         if cancel.is_set():
             raise i2t.OperationCancelled()
         gate.wait(cancel.is_set, lambda: _progress(rid)("一時停止中 (「▶ 再開」で続きから)"))
 
-    _progress(rid)(f"日本語に訳しています ({len(req['words'])} 個、{model})...")
-    found = i2t.translate_chips_ja(vlm, req["words"], keep_alive=keep, checkpoint=checkpoint)
-    table = i2t.load_translations()
-    table.update(found)
-    i2t.save_translations(table)
-    out = {"translated": found, "model": model}
-    need = [(en, ja) for en, ja in found.items() if _KANJI.search(ja)]
-    if need:   # readings for the tag completion; the translations are kept even when this fails
-        try:
-            _progress(rid)(f"読みを調べています ({len(need)} 語)...")
-            out["readings"] = len(_store_readings(_text_llm(cfg, cancel), need, keep, checkpoint))
-        except i2t.OperationCancelled:
-            raise
-        except Exception as e:
-            out["readings_error"] = i2t.describe_error(e)
+    try:
+        _progress(rid)(f"日本語に訳しています ({len(req['words'])} 個、{model})...")
+        found = i2t.translate_chips_ja(vlm, req["words"], keep_alive=keep, checkpoint=checkpoint)
+        with _dict_lock:
+            table = i2t.load_translations()
+            table.update(found)
+            _save_translations(table)
+        # what it left untranslated: counted, so the same job does not start after every analysis (see missing_ja),
+        # and told to the page (0 語 with nothing said looks as if translation did not work at all)
+        left = _note_untranslated(str(cfg.get("translate_model") or ""), req["words"], found)
+        out = {"translated": found, "model": model, "untranslated": left}
+        need = [(en, ja) for en, ja in found.items() if _KANJI.search(ja)]
+        if need:   # readings for the tag completion; the translations are kept even when this fails
+            try:
+                _progress(rid)(f"読みを調べています ({len(need)} 語)...")
+                used.append(_text_llm(cfg, cancel))
+                out["readings"] = len(_store_readings(used[-1], need, keep, checkpoint))
+            except i2t.OperationCancelled:
+                raise
+            except Exception as e:
+                out["readings_error"] = i2t.describe_error(e)
+    finally:
+        kept = _unload_used(cfg, *used)
+    if kept:
+        out["vlm_kept"] = kept
     return out
 
 
@@ -495,10 +630,11 @@ def _store_readings(vlm, pairs: list[tuple[str, str]], keep, checkpoint) -> dict
         if r and _HIRA.match(r):
             got[i2t.chip_core(en)[0].lower()] = r
     if got:
-        readings = _load_readings()
-        readings.update(got)
-        if not _save_readings(readings):
-            raise ValueError("読みを保存できませんでした")
+        with _dict_lock:
+            readings = _load_readings()
+            readings.update(got)
+            if not _save_readings(readings):
+                raise ValueError("読みを保存できませんでした")
     return got
 
 
@@ -531,17 +667,29 @@ def _translate_en(rid, req, cancel):
     """Japanese typed on the image page that the dictionary does not know -> English, registered in
     translations.json with readings.  A word whose English is already in the dictionary under another Japanese is
     not registered over it ("known": the page writes the dictionary's Japanese instead)."""
-    import re
     cfg = i2t.load_config()
-    keep = 0 if cfg.get("low_vram", True) else None
+    vlm = _text_llm(cfg, cancel)   # the readings below need a model that follows instructions
+    used = [vlm]
+    try:
+        out = _translate_en_run(rid, req, cancel, cfg, vlm, used)
+    finally:
+        kept = _unload_used(cfg, *used)
+    if kept:
+        out["vlm_kept"] = kept
+    return out
+
+
+def _translate_en_run(rid, req, cancel, cfg, vlm, used):
+    import re
+    keep = _job_keep(cfg)
     check = _checkpoint(rid, cancel)
     words = i2t.dedup([str(w).strip() for w in req.get("words") or [] if str(w).strip()])
-    vlm = _text_llm(cfg, cancel)   # the readings below need a model that follows instructions
     tr = str(cfg.get("translate_model") or "")
     if i2t.is_plamo_translate(tr):   # 訳のモデル PLaMo 3 Translate: it translates into English as well
         pv = i2t.OllamaVLM(cfg["ollama_host"], tr, int(cfg.get("ollama_timeout") or i2t.VLM_TIMEOUT))
         pv.cancel_event = cancel
         _job["vlm"] = pv
+        used.append(pv)
         _progress(rid)(f"英語に訳しています ({len(words)} 個、{tr})...")
         answers = []
         for w in words:
@@ -553,21 +701,22 @@ def _translate_en(rid, req, cancel):
         _progress(rid)(f"英語に訳しています ({len(words)} 個、{vlm.model})...")
         answers = _ask_list(vlm, TO_ENGLISH_PROMPT, words, keep, check)
         used = vlm.model
-    table, mine = chip_table(), i2t.load_translations()
     new, known, failed = {}, {}, []
-    for ja, en in zip(words, answers):
-        en = re.sub(r"\s+", " ", en.replace("_", " ")).strip().strip(".").lower()
-        if not en or not re.search(r"[a-z]", en) or re.search(r"[\u3040-\u30ff\u3400-\u9fff]", en):
-            failed.append(ja)
-            continue
-        key = i2t.chip_core(en)[0].lower()
-        if key in table and table[key] != ja:
-            known[ja] = [key, table[key]]
-            continue
-        mine[key] = ja
-        new[ja] = key
-    if new and not i2t.save_translations(mine):
-        raise ValueError("辞書を保存できませんでした")
+    with _dict_lock:
+        table, mine = chip_table(), i2t.load_translations()
+        for ja, en in zip(words, answers):
+            en = re.sub(r"\s+", " ", en.replace("_", " ")).strip().strip(".").lower()
+            if not en or not re.search(r"[a-z]", en) or re.search(r"[\u3040-\u30ff\u3400-\u9fff]", en):
+                failed.append(ja)
+                continue
+            key = i2t.chip_core(en)[0].lower()
+            if key in table and table[key] != ja:
+                known[ja] = [key, table[key]]
+                continue
+            mine[key] = ja
+            new[ja] = key
+        if new and not _save_translations(mine):
+            raise ValueError("辞書を保存できませんでした")
     out = {"translated": new, "known": known, "failed": failed, "model": used}
     need = [(en, ja) for ja, en in new.items() if _KANJI.search(ja)]
     if need:
@@ -590,8 +739,14 @@ def _readings(rid, req, cancel):
         return {"found": 0, "asked": 0}
     vlm = _text_llm(cfg, cancel)
     _progress(rid)(f"読みを調べています ({len(pairs)} 語、{vlm.model})...")
-    got = _store_readings(vlm, pairs, 0 if cfg.get("low_vram", True) else None, _checkpoint(rid, cancel))
-    return {"found": len(got), "asked": len(pairs), "model": vlm.model}
+    try:
+        got = _store_readings(vlm, pairs, _job_keep(cfg), _checkpoint(rid, cancel))
+    finally:
+        kept = _unload_used(cfg, vlm)
+    out = {"found": len(got), "asked": len(pairs), "model": vlm.model}
+    if kept:
+        out["vlm_kept"] = kept
+    return out
 
 
 def _pose_estimate(rid, req, cancel):
@@ -663,7 +818,8 @@ def _run_job(rid: int, op: str, req: dict) -> None:
     cancel = _job["cancel"]
     try:
         value = JOBS[op](rid, req, cancel)
-        emit({"rid": rid, "ok": True, "value": value})
+        kept = value.pop("vlm_kept", None) if isinstance(value, dict) else None
+        emit({"rid": rid, "ok": True, "value": value, **({"vlm_kept": kept} if kept else {})})
     except i2t.OperationCancelled:
         emit({"rid": rid, "ok": False, "cancelled": True, "error": CANCEL_MESSAGES[op]})
     except Exception as e:
@@ -696,34 +852,47 @@ def main() -> None:
             req = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        op, rid = req.get("op"), req.get("rid")
-        if op == "cancel":
-            engine.cancel()
-            if _job["cancel"] is not None:
-                _job["cancel"].set()
-            if _job["vlm"] is not None:
-                _job["vlm"].abort()
-        elif op == "pause":
-            engine.pause_gate.pause()
-            if _job["gate"] is not None:
-                _job["gate"].pause()
-        elif op == "resume":
-            engine.pause_gate.resume()
-            if _job["gate"] is not None:
-                _job["gate"].resume()
-        elif op == "analyze" or op in JOBS:
-            if not _begin_job(rid):
-                emit({"rid": rid, "ok": False, "error": "ほかの処理の最中です。終わってからもう一度押してください。"})
-            elif op == "analyze":
-                # here, on the thread that also handles "cancel": a cancel sent right after this start is not wiped
-                engine.reset_cancel()
-                threading.Thread(target=_analyze, args=(rid, req), daemon=True).start()
-            else:
-                threading.Thread(target=_run_job, args=(rid, op, req), daemon=True).start()
-        elif op == "call":
-            threading.Thread(target=_call, args=(rid, req), daemon=True).start()
-        elif op == "ping":
-            emit({"rid": rid, "ok": True})
+        if not isinstance(req, dict):
+            continue
+        try:
+            _handle(req)
+        except Exception:   # the loop must outlive one request (ending it ends the worker)
+            sys.stderr.write(traceback.format_exc())
+
+
+def _handle(req: dict) -> None:
+    op, rid = req.get("op"), req.get("rid")
+    # the job may end between two looks at _job: each part is read once
+    cancel, gate, vlm = _job["cancel"], _job["gate"], _job["vlm"]
+    if op == "cancel":
+        engine.cancel()
+        if cancel is not None:
+            cancel.set()
+        if vlm is not None:
+            vlm.abort()
+    elif op == "pause":
+        engine.pause_gate.pause()
+        if gate is not None:
+            gate.pause()
+    elif op == "resume":
+        engine.pause_gate.resume()
+        if gate is not None:
+            gate.resume()
+    elif op == "analyze" or op in JOBS:
+        if not _begin_job(rid):
+            emit({"rid": rid, "ok": False, "error": "ほかの処理の最中です。終わってからもう一度押してください。"})
+            return
+        # here, on the thread that also handles "cancel": a cancel sent right after this start is not wiped.
+        # For every job: the engine's flag stays up after any cancel, and the detectors' downloads look at it
+        engine.reset_cancel()
+        if op == "analyze":
+            threading.Thread(target=_analyze, args=(rid, req), daemon=True).start()
+        else:
+            threading.Thread(target=_run_job, args=(rid, op, req), daemon=True).start()
+    elif op == "call":
+        threading.Thread(target=_call, args=(rid, req), daemon=True).start()
+    elif op == "ping":
+        emit({"rid": rid, "ok": True})
 
 
 if __name__ == "__main__":

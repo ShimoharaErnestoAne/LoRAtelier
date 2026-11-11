@@ -249,6 +249,11 @@ def parse_comfy(prompt_json: str) -> dict:
         if isinstance(inputs.get("lora_name"), str):
             w = _num(_scalar(graph, inputs.get("strength_model", inputs.get("strength"))))
             out["loras"].append({"name": inputs["lora_name"], "strength": 1.0 if w is None else w})
+        # rgthree's Power Lora Loader keeps its LoRAs as lora_1 = {"on", "lora", "strength"}, ...: the ones switched on
+        for v in inputs.values():
+            if isinstance(v, dict) and isinstance(v.get("lora"), str) and v["lora"].strip() and v["lora"] != "None" \
+                    and v.get("on", True) and (w := _num(v.get("strength"))) != 0:
+                out["loras"].append({"name": v["lora"], "strength": 1.0 if w is None else w})
         if ct == "SaveImage" and isinstance(inputs.get("filename_prefix"), str):
             if m := RE_OWN.match(inputs["filename_prefix"]):
                 out["own_entry"] = m.group(1)

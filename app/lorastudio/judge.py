@@ -53,8 +53,11 @@ def build_context(images: list[dict], meta: dict, identity: dict | None = None) 
         for _ in range(64):  # popcount
             ham += (x & np.uint64(1)).astype(np.int32)
             x >>= np.uint64(1)
-        sim = ham <= NEAR_DUP_HAMMING
-        emb = [(im.get("ai") or {}).get("embed") for im in cand]
+        # the hash is of the whole file: it says nothing about pictures cut out of it (the same file cropped
+        # twice would always be "similar"); cropped pictures are compared by their embedding only
+        whole = np.array([not im.get("crop") for im in cand])
+        sim = (ham <= NEAR_DUP_HAMMING) & whole[:, None] & whole[None, :]
+        emb =[(im.get("ai") or {}).get("embed") for im in cand]
         has = np.array([e is not None for e in emb])
         if has.sum() > 1:
             dim = len(next(e for e in emb if e is not None))
@@ -133,9 +136,18 @@ def check_image(im: dict, ctx: dict) -> dict:
             checks.append(_c("blur", "鮮明さ", "info", "推定", "低", "全体が柔らかい画像です。画風としてのぼかしなら問題ありません。"))
         else:
             checks.append(_c("blur", "鮮明さ", "warn", "推定", "中", "ピンぼけ・手ぶれの可能性があります。"))
-    if f.get("clip_dark", 0) > 0.5 or f.get("clip_bright", 0) > 0.6:
-        st = "info" if is_style else "warn"
-        checks.append(_c("exposure", "露出", st, "推定", "低", "白飛び・黒つぶれが多い画像です。" + ("画風の表現なら問題ありません。" if is_style else "")))
+    dark, bright = f.get("clip_dark", 0) > 0.5, f.get("clip_bright", 0) > 0.6
+    if bright and not dark and f.get("transparent_ratio", 0) > 0.3:
+        bright = False   # the white is the transparent part (told below), not the exposure
+    if dark or bright:
+        # an exposure fault only in a photograph: a flat white or black background is how illustrations are drawn
+        # (and what generated material looks like), so there - and before the analysis tells which it is - no warning
+        if (ai.get("domain") or {}).get("label") == "photo":
+            checks.append(_c("exposure", "露出", "info" if is_style else "warn", "推定", "低",
+                             "白飛び・黒つぶれが多い画像です。" + ("画風の表現なら問題ありません。" if is_style else "")))
+        else:
+            checks.append(_c("exposure", "露出", "info", "推定", "低",
+                             "白または黒の面が広い画像です。単色の背景や画風の表現なら問題ありません。"))
     if kind == "character" and captions.is_monochrome(im):
         checks.append(_c("mono", "白黒", "info", "推定", "中",
                          "白黒の画像です。髪や目などの色はこの画像からは学習されません。説明文に「monochrome」を付けて、"
@@ -382,8 +394,10 @@ def dataset_report(images: list[dict], results: dict[int, dict], meta: dict) -> 
             known = {k: v for k, v in fr.items() if k != "不明"}
             if known and max(known.values()) / m > 0.8:
                 notes.append({"level": "info", "text": f"構図が「{max(known, key=known.get)}」に集中しています。"})
-    else:
+    elif any(im.get("ai_status") in ("pending", "running") for im in used):
         notes.append({"level": "info", "text": "AI 解析の完了後に、構図・角度・背景などの偏りを表示します。"})
+    elif n >= 3:   # 1-2 images: nothing to compare (the count is told below); here the analyses failed
+        notes.append({"level": "info", "text": f"AI 解析の結果がある画像が {len(analysed)}/{n} 枚のため、構図・角度・背景などの偏りは表示できません。"})
     if kind == "concept":
         t_ = captions.CONCEPT_TARGETS[captions.concept_target(meta)]
         cov["concept_suggest"] = concept_suggest(analysed, meta.get("concept_words") or [], target=captions.concept_target(meta))

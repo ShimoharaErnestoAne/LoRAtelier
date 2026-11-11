@@ -39,6 +39,13 @@ _MALE_TEXT = re.compile(r"\b(1boy|boy|man|male|guy)\b")
 _LOWER = ("skirt", "shorts", "pants", "trousers", "jeans", "shoes", "boots", "sandals", "socks", "thighhighs",
           "kneehighs", "legwear", "pantyhose", "leggings", "stockings", "heels", "footwear", "barefoot", "garter")
 SHOWS_LOWER = {"cowboy": ("skirt", "shorts", "pants", "trousers", "jeans", "garter"), "full": _LOWER}
+# quality / meta words of prompts: the tag dictionary lists them, but the tagger does not read them from a picture
+# (always probability 0), so they are never asked tags
+META_WORDS = frozenset({
+    "masterpiece", "best quality", "high quality", "amazing quality", "great quality", "good quality", "normal quality",
+    "low quality", "worst quality", "bad quality", "absurdres", "highres", "lowres", "very aesthetic", "aesthetic",
+    "newest", "recent", "official art", "sharp focus",
+})
 
 
 @lru_cache(maxsize=1)
@@ -88,7 +95,7 @@ def requested(positive: str, caption_style: str) -> dict:
     tags = _tags(positive, caption_style)
     low = (positive or "").lower().replace("_", " ")
     have = set(tags)
-    out: dict = {"tags": [t for t in tags if t in vocabulary()]}
+    out: dict = {"tags": [t for t in tags if t in vocabulary() and t not in META_WORDS]}
     female = bool(_FEMALE_TEXT.search(low)) or bool(have & {"1girl", "2girls", "multiple girls", "mature female", "old woman"})
     male = bool(_MALE_TEXT.search(low)) or bool(have & {"1boy", "2boys", "multiple boys", "mature male", "old man"})
     if female != male:

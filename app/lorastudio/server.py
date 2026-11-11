@@ -32,9 +32,51 @@ from .training import (ACTIVE, QUEUE_FILE, STATUS_LABEL, Job, Runner, create_run
                        state_is_complete)
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
-HEAVY_AI_KEYS = {"embed", "ccip", "subject_embed"}
 
 app = FastAPI(title="LoRAtelier", docs_url=None, redoc_url=None)
+
+
+class OwnPagesOnly:
+    """The API has no login: it trusts whoever can reach it.  A page of another web site open in the same browser
+    can reach it too (a form or fetch aimed at 127.0.0.1), so:
+    * a request that changes something is refused unless this app's own page sent it (the browser's Sec-Fetch-Site,
+      or Origin compared with Host).  Programs that are not browsers send neither and pass, as before.
+    * while only this PC is listened to, the Host must be this PC's (a foreign name pointed at 127.0.0.1 - DNS
+      rebinding - would otherwise make this app's pages and images readable to that site)."""
+    LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            why = self.refusal(scope["method"], {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]})
+            if why:
+                await JSONResponse({"detail": why}, status_code=403)(scope, receive, send)
+                return
+        await self.inner(scope, receive, send)
+
+    @classmethod
+    def refusal(cls, method: str, h: dict) -> str | None:
+        host = h.get("host", "").lower()
+        if config.LISTEN in ("127.0.0.1", "localhost", "::1"):
+            name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+            if name.strip("[]") not in cls.LOCAL_HOSTS:
+                return "このアドレスでは開けません。http://127.0.0.1 から始まるアドレスで開いてください。"
+        if method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        site, origin = h.get("sec-fetch-site"), h.get("origin")
+        if site is not None:
+            cross = site not in ("same-origin", "none")
+        elif origin is not None:
+            from urllib.parse import urlsplit
+            cross = origin == "null" or urlsplit(origin).netloc.lower() != host
+        else:
+            cross = False
+        return "ほかのサイトのページからの操作は受け付けません。LoRAtelier の画面から操作してください。" if cross else None
+
+
+app.add_middleware(OwnPagesOnly)
 projects = ProjectManager()
 analyzer = Analyzer(projects)
 runner = Runner(projects)
@@ -104,8 +146,11 @@ def _after_train(project, run_id):
         if eid is not None:
             project.q("UPDATE evals SET status='failed', error=? WHERE id=?", (str(e), eid))
         msg = f"学習は完了しました。比較画像の生成に失敗: {e}"
+    # what was measured while it trained stays with the run: the loss curve of the history, and the mark that VRAM
+    # ran short (the next start warns that the same settings will be slow again)
+    kept = {k: v for k, v in (run.get("progress") or {}).items() if k in ("loss", "loss_hist", "speed", "vram_short")}
     runner._set(project, run_id, status="done", ended=time.time(),
-                progress={"phase": "done", "message": msg, "step": run["config"]["values"]["max_train_steps"],
+                progress={**kept, "phase": "done", "message": msg, "step": run["config"]["values"]["max_train_steps"],
                           "total": run["config"]["values"]["max_train_steps"]})
 
 
@@ -220,7 +265,9 @@ def list_models():
     library._repair_paths()   # files moved out of an old folder are found again (no-op when nothing is missing)
     out = registry.list()
     for m in out:
-        m["hash"] = {k: hasher.get(p) for k, p in m["files"].items()} if not m["missing"] else {}
+        # only the hashes that are known: listing the models must not start reading every model file on the disk
+        # (hundreds of GB with a ComfyUI folder added).  They are computed when a model is added, trained or exported
+        m["hash"] = {k: hasher.peek(p) for k, p in m["files"].items()} if not m["missing"] else {}
     return {"models": out, "variants": VARIANTS, "family_files": FAMILY_FILES, "misplaced": library.misplaced()}
 
 
@@ -587,12 +634,26 @@ def _clean_members(ids, own: str | None = None) -> list[str]:
 
 def _busy_reason(pid: str) -> str | None:
     """Work that still uses the project's files (training, comparison images, material generation)."""
-    jobs = ([runner.current] if runner.current else []) + list(runner.jobs)
+    with runner._cond:   # one look: a job ending between two reads of runner.current is not a job
+        cur = runner.current
+        jobs = ([cur] if cur else []) + list(runner.jobs)
     for j in jobs:
+        what = getattr(j, "label", None) or f"学習 #{j.run_id}"
         if j.project.id == pid:
-            what = getattr(j, "label", None) or f"学習 #{j.run_id}"
             return f"{what} が実行中または順番待ちです。止めてから操作してください。"
+        if j.run_id is not None and pid in _run_member_ids(j.project, j.run_id):
+            # a multi-character run copies its members' images when it starts
+            return f"複数キャラ LoRA の{what} が、このプロジェクトの画像を使います（実行中または順番待ち）。終わるか止めてから操作してください。"
     return None
+
+
+def _run_member_ids(project, run_id) -> set:
+    """Projects whose images a run of a multi-character project uses (only that part of the snapshot is read)."""
+    try:
+        rows = project.q("SELECT json_extract(config, '$.members') AS m FROM runs WHERE id=?", (run_id,))
+        return {m.get("pid") for m in json.loads(rows[0]["m"])} if rows and rows[0]["m"] else set()
+    except (sqlite3.Error, ValueError, TypeError, AttributeError):
+        return set()
 
 
 @app.post("/api/projects/import")
@@ -611,17 +672,23 @@ def import_project(file: UploadFile = File(...)):
 
 def _resume_analysis(p):
     """Queue again what was left unfinished (app closed meanwhile, or a project brought from a zip)."""
-    for im in p.images():
+    # only the state columns: the analysis results (thousands of numbers per image) are read - and then kept in
+    # memory - only for the images that need work, not for every image of every project at each start
+    rows = p.q("SELECT id, fast_status, ai_status, ai_key, caption_status, (ai IS NOT NULL AND ai != '') AS has_ai "
+               "FROM images WHERE removed=0 ORDER BY id")
+    mask_mode = analyzer.mask_mode(p) if rows else None   # once, not per image; None: the project trains without masks
+    for im in rows:
         if im["fast_status"] == "pending":
             analyzer.submit_fast(p, im["id"])
         elif im["ai_status"] in ("pending", "running"):
             analyzer.submit_ai(p, im["id"])
-        elif im["ai_status"] == "done" and not (im.get("ai_key") or "").startswith(ANALYZER_VERSION + ":"):
+        elif im["ai_status"] == "done" and not (im["ai_key"] or "").startswith(ANALYZER_VERSION + ":"):
             analyzer.submit_ai(p, im["id"], priority=8)   # analyzer changed: refresh in the background
         elif im["ai_status"] == "done":
-            if im["caption_status"] in ("pending", "running", "failed") and im.get("ai"):
+            if im["caption_status"] in ("pending", "running", "failed") and im["has_ai"]:
                 analyzer.ensure_caption(p, im["id"], force=True)   # a failed caption gets one more try
-            analyzer.ensure_mask(p, im["id"])   # masks waiting (or missing: not in a zip) are made
+            if mask_mode:
+                analyzer.ensure_mask(p, im["id"], mode=mask_mode)   # masks waiting (or missing: not in a zip) are made
 
 
 def _restore_exports(p) -> dict:
@@ -1186,6 +1253,28 @@ def relink(pid: str, body: dict):
 
 
 # ====================================================================== material generation
+_BATCH_SIZES: dict = {}   # (project, batch) -> (status, images shown, bytes) of batches that are not being written
+
+
+def _batch_size(p, bid: int, status: str, n_images: int) -> int:
+    """Bytes of a batch's folder.  The page asks for the whole state after every image a running batch makes: the
+    folders of the batches that are over are walked once, not each time."""
+    key, live = (p.id, bid), status in ("queued", "running")
+    hit = _BATCH_SIZES.get(key)
+    if hit and not live and hit[:2] == (status, n_images):
+        return hit[2]
+    d = generate.batch_dir(p, bid)
+    try:
+        size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.exists() else 0
+    except OSError:
+        size = 0
+    if live:
+        _BATCH_SIZES.pop(key, None)
+    else:
+        _BATCH_SIZES[key] = (status, n_images, size)
+    return size
+
+
 def _gen_state(p):
     recipe = p.meta("gen_recipe") or {}
     batches = []
@@ -1197,8 +1286,7 @@ def _gen_state(p):
                  "mismatch": promptkeep.reason(json.loads(r["prompt_check"])) if r["prompt_check"] else "",
                  "image_id": r["image_id"], "label": generate.shot_label(json.loads(r["shot"])), "prompt": r["prompt"]}
                 for r in rows if not r["deleted"]]
-        d = generate.batch_dir(p, b["id"])
-        size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.exists() else 0
+        size = _batch_size(p, b["id"], b["status"], len(imgs))
         batches.append({"id": b["id"], "created": b["created"], "status": b["status"], "message": b["message"],
                         "total": len(spec["shots"]), "remaining": len(spec["shots"]) - len(rows),
                         "gen_model_name": spec.get("gen_model_name"), "images": imgs, "size_mb": round(size / 2**20, 1)})
@@ -1449,9 +1537,17 @@ def gen_control(pid: str, bid: int, action: str):
         if st not in ("queued", "running"):
             raise HTTPException(400, "実行中の生成ではありません")
         if st == "queued":
-            # not started: a flag is enough (run_batch checks it first).  request("stop") would send ComfyUI's
-            # global /interrupt and fail whatever else is generating now (a comparison, the image page)
-            generate.control.flags[(p.id, bid)] = action
+            # not started: taken out of the queue here (left in, it stays listed as waiting and takes the GPU when
+            # its turn comes only to end at once).  request("stop") would send ComfyUI's global /interrupt and fail
+            # whatever else is generating now (a comparison, the image page)
+            if runner.drop_tasks(lambda j: j.project.id == p.id and getattr(j, "label", None) == f"素材生成 #{bid}"):
+                generate.control.flags.pop((p.id, bid), None)
+                if action == "stop":
+                    generate._set_status(p, bid, "cancelled", "開始前に中止しました")
+                    return {"message": "中止しました"}
+                generate._set_status(p, bid, "paused", "一時停止中（開始前）")
+                return {"message": "一時停止しました"}
+            generate.control.flags[(p.id, bid)] = action   # its turn has just come: run_batch checks the flag first
         else:
             generate.control.request(p.id, bid, action)
         msg = "一時停止を受け付けました。今の 1 枚が終わったら止まります。" if action == "pause" else "中止を受け付けました。"
@@ -1566,6 +1662,17 @@ def i2t_models_dir(body: dict):
     return {"models_dir": str(i2tlink.models_dir())}
 
 
+def _upright_size(im) -> list:
+    """[width, height] as the browser shows the image and as i2t analyses it: with the EXIF rotation applied
+    (a phone photo taken upright is stored sideways).  Read from the tag; the pixels are not decoded."""
+    w, h = im.size
+    try:
+        turned = im.getexif().get(0x0112) in (5, 6, 7, 8)
+    except Exception:
+        turned = False
+    return [h, w] if turned else [w, h]
+
+
 @app.post("/api/i2t/upload")
 async def i2t_upload(request: Request, name: str = "image.png"):
     from starlette.concurrency import run_in_threadpool
@@ -1573,7 +1680,7 @@ async def i2t_upload(request: Request, name: str = "image.png"):
     p = await run_in_threadpool(i2tlink.save_upload, name, data)
     try:
         with Image.open(p) as im:
-            size = list(im.size)
+            size = _upright_size(im)
     except Exception:
         p.unlink(missing_ok=True)
         raise HTTPException(400, "画像として開けません（PNG / JPEG / WebP / GIF / BMP / TIFF に対応）")
@@ -1614,7 +1721,7 @@ def i2t_use_file(body: dict):
     if not p:
         raise HTTPException(404, "画像が見つかりません")
     with Image.open(p) as im:
-        size = list(im.size)
+        size = _upright_size(im)
     return {"path": str(p), "name": p.name, "size": size, "geninfo": _i2t(lambda: i2tlink.client.call("read_generation_info", str(p)))}
 
 
@@ -1683,7 +1790,7 @@ def imagegen_state(limit: int = 30):
     ds, edit = imagegen.request_sampling(model, form)
     return {"form": form, "history": hist, "history_more": len(full) - len(hist), "default_sampling": ds, "edit": edit,
             "native": imagegen.native_size(model), "check": chk["errors"], "notes": chk["notes"],
-            "presets": _presets_view(), "attention": imagegen.attention_installed(),
+            "presets": _presets_view(full), "attention": imagegen.attention_installed(),
             "workflow": _workflow_view(form.get("workflow"))}
 
 
@@ -1697,10 +1804,11 @@ def _workflow_view(wid) -> dict | None:
     return m
 
 
-def _presets_view() -> list[dict]:
+def _presets_view(history: list | None = None) -> list[dict]:
     """Saved presets with what the list page needs now: whether the model file is still there, and the
-    thumbnail request's current state (順番待ち / 生成中 from the generation history)."""
-    status = {e["id"]: e["status"] for e in imagegen.history()}
+    thumbnail request's current state (順番待ち / 生成中 from the generation history; `history`: when the caller
+    has read it already)."""
+    status = {e["id"]: e["status"] for e in (imagegen.history() if history is None else history)}
     out = []
     for p in imagegen.presets():
         model = registry.get(p.get("model_id") or "")
@@ -1833,9 +1941,8 @@ def storage_items(kind: str):
 def _move_busy(pid: str) -> str | None:
     if why := _busy_reason(pid):
         return why
-    with analyzer._qlock:
-        if any(it[1] == pid for it in analyzer._queued) or (analyzer.current and analyzer.current[1] == pid):
-            return "画像の解析が残っています。解析が終わってから移してください。"
+    if analyzer.has_work(pid):   # queued, waiting for the GPU or being analysed now
+        return "画像の解析が残っています。解析が終わってから移してください。"
     if any(t.get("project") == pid and t.get("status") not in pipeline.ENDED for t in tasks.list()):
         return "LoRA 作成タスクが終わっていません。終わってから移してください。"
     return None
@@ -1947,10 +2054,16 @@ async def imagegen_pnginfo(request: Request):
     """「画像から設定を読み込む」: the prompt, model, LoRAs and parameters written in a generated image (the raw
     file as the body), matched with this PC's files.  The form is not changed here; the page puts them in."""
     from starlette.concurrency import run_in_threadpool
-    from . import pnginfo
     data = await _read_image_body(request, 100)
+    # the rest reads files (the history, the model folders, the workflow store): not on the event loop, where a slow
+    # drive would hold up every other request and the event stream
+    return await run_in_threadpool(_pnginfo_form, data)
+
+
+def _pnginfo_form(data: bytes) -> dict:
+    from . import pnginfo
     try:
-        info = await run_in_threadpool(pnginfo.read, data)
+        info = pnginfo.read(data)
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not info:
@@ -1965,7 +2078,11 @@ async def imagegen_pnginfo(request: Request):
                 "regions": {"left": s["regions"][0], "right": s["regions"][1]} if s.get("regions") else None,
                 "vae": s.get("vae") or "", "te": s.get("te") or "", "attention": s.get("attention") or "",
                 "workflow": s.get("workflow") or "", "workflow_offer": s.get("workflow") or ""}
-        missing = [] if registry.get(s["model_id"]) else ["生成モデルのファイルが見つかりません。モデルを選び直してください。"]
+        missing = []
+        if s.get("workflow") and not s.get("model_id"):
+            form.pop("model_id")   # made by running a workflow as it is: no model of the list was used (the form's stays)
+        elif not registry.get(s.get("model_id") or ""):
+            missing = ["生成モデルのファイルが見つかりません。モデルを選び直してください。"]
         return {"source": "LoRAtelier（この画面で生成した画像）", "form": form, "model_file": None, "notes": missing}
     notes = list(info["notes"])
     # a ComfyUI image: its workflow is kept, and generation runs it as it is unless the page turns that off
@@ -1975,12 +2092,12 @@ async def imagegen_pnginfo(request: Request):
         workflow = imagegen.comfyflow.save(info.pop("graph"), info["source"], imagegen.comfyflow.summary(info))
         if imagegen.comfyflow._known is None and comfy.running():   # node classes of the ComfyUI here, asked once
             try:
-                imagegen.comfyflow.remember_nodes(await run_in_threadpool(comfy._get, "/object_info", 30))
+                imagegen.comfyflow.remember_nodes(comfy._get("/object_info", 30))
             except (OSError, ValueError):
                 pass
         miss = imagegen.comfyflow.missing_nodes(imagegen.comfyflow.load(workflow["id"]))
         workflow["missing_nodes"] = miss
-    scan = await run_in_threadpool(library.scan)
+    scan = library.scan()
     form = {"positive": info["positive"], "negative": info["negative"], "seed": info["seed"],
             "sampling": {k: v for k, v in info["sampling"].items() if k in imagegen.SAMPLING_KEYS}, "regions": None}
     if info["width"] and info["height"]:
@@ -1997,7 +2114,7 @@ async def imagegen_pnginfo(request: Request):
         else:
             notes.append(f"モデル「{info['model_name']}」はこのパソコンのモデルのフォルダーに見つからなかったので、モデルは今のままです。")
     # the VAE / CLIP named in the image: from the vae / text_encoders folders; not found: the model's own
-    comp = await run_in_threadpool(library.companion_files)
+    comp = library.companion_files()
     for kind, key, what in (("vae", "vae_name", "VAE"), ("te", "te_name", "CLIP")):
         form[kind] = ""
         if info[key]:
@@ -2041,6 +2158,8 @@ def imagegen_start(body: dict):
 def imagegen_cancel(eid: str):
     if not imagegen.cancel(eid):
         raise HTTPException(400, "実行中・順番待ちの生成ではありません")
+    # still waiting: out of the queue too (left in, it is listed as waiting and takes the GPU only to end at once)
+    runner.drop_tasks(lambda j: getattr(j, "entry", None) == eid)
     return {"ok": True}
 
 
@@ -2237,7 +2356,10 @@ def _snapshot(p):
     ov = meta.get("train_overrides") or {}
     if not model or not model.get("variant") or not ov:
         return None
-    snap = presets.snapshot(model["family"], _defaults(meta, model, len(_used_images(p))), ov)
+    # the number of images in use only sets the automatic step count: judging every image of every other project
+    # (and keeping their analyses in memory) is needed only when the steps were changed
+    n = len(_used_images(p)) if presets._STEP_KEYS & set(ov) else 0
+    snap = presets.snapshot(model["family"], _defaults(meta, model, n), ov)
     return snap if snap["values"] or snap.get("fixed_steps") else None
 
 
@@ -2662,7 +2784,7 @@ def runs(pid: str):
         ck = p.checkpoints(r["id"])
         for c in ck:
             if c["kind"] == "state":
-                c["complete"] = state_is_complete(Path(c["path"]))
+                c["complete"] = _state_complete(c["path"])
         evals = [dict(e) for e in p.q("SELECT id, created, status, error FROM evals WHERE run_id=? ORDER BY id", (r["id"],))]
         out.append({"id": r["id"], "name": r["name"], "created": r["created"], "ended": r["ended"], "status": r["status"],
                     "status_label": STATUS_LABEL.get(r["status"], r["status"]),
@@ -2676,9 +2798,26 @@ def runs(pid: str):
     return out
 
 
+_STATE_CHECKS: dict = {}   # state folder -> (its files' names, sizes and times; complete?)
+
+
+def _state_complete(path: str) -> bool:
+    """training.state_is_complete, remembered while the folder's files stay as they are (the check opens every file
+    of the state, and the run list asks for every state of every run on each update)."""
+    try:
+        sig = tuple(sorted((f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in os.scandir(path)))
+    except OSError:
+        _STATE_CHECKS.pop(path, None)
+        return False
+    hit = _STATE_CHECKS.get(path)
+    if hit is None or hit[0] != sig:
+        hit = _STATE_CHECKS[path] = (sig, state_is_complete(Path(path)))
+    return hit[1]
+
+
 def _resume_state(run: dict, checkpoints: list[dict]) -> tuple[dict | None, str | None]:
     """The newest complete intermediate state and, if the run cannot continue from it, why."""
-    states = [c for c in checkpoints if c["kind"] == "state" and c["step"] is not None and state_is_complete(Path(c["path"]))]
+    states = [c for c in checkpoints if c["kind"] == "state" and c["step"] is not None and _state_complete(c["path"])]
     if not states:
         return None, "再開用の保存地点（オプティマイザー状態を含む）がありません。LoRA の途中保存からの完全な再開はできません。"
     st = max(states, key=lambda c: c["step"])
@@ -2694,7 +2833,18 @@ def _resume_info(run: dict, checkpoints: list[dict]) -> dict:
 
 @app.post("/api/projects/{pid}/runs/{rid}/stop")
 def run_stop(pid: str, rid: int, body: dict | None = None):
-    return runner.stop(P(pid), rid, force=bool((body or {}).get("force")))
+    p = P(pid)
+    res = runner.stop(p, rid, force=bool((body or {}).get("force")))
+    if not res.get("accepted"):
+        with runner._cond:
+            r = p.run(rid)
+            lost = bool(r and r["status"] in ACTIVE and r["created"] < BOOT and runner.find(pid, rid) is None)
+        if lost:   # nothing runs it: without this it could be neither stopped nor deleted
+            runner._set(p, rid, status="failed", ended=time.time(),
+                        error={"code": "interrupted", "message": "アプリの終了により中断されました。",
+                               "fixes": ["再開用の保存地点があれば「再開」できます"]})
+            return {"accepted": True, "message": "中断として記録しました。"}
+    return res
 
 
 @app.post("/api/projects/{pid}/runs/{rid}/resume")
@@ -2706,7 +2856,8 @@ def run_resume(pid: str, rid: int):
     st, why = _resume_state(r, p.checkpoints(rid))
     if not st or why:
         raise HTTPException(400, why)
-    runner.enqueue(p, rid, resume=st["path"])
+    if not runner.enqueue(p, rid, resume=st["path"]):
+        raise HTTPException(409, "この学習はすでに順番待ちか実行中です。")
     return {"resumed_from_step": st["step"]}
 
 
@@ -2756,13 +2907,21 @@ def run_log(pid: str, rid: int, tail: int = 200):
     if not r["run_dir"]:   # the run failed before its folder was made (Path("") would be the app's own folder)
         return {"text": ""}
     logs = sorted((Path(r["run_dir"]) / "logs").glob("*.log"))
+    # an error of the app itself around the engine (e.g. writing the training images failed) is recorded here
+    own = Path(r["run_dir"]) / "runner_error.log"
+    try:
+        own_text = own.read_text(encoding="utf-8", errors="replace").strip() if own.is_file() else ""
+    except OSError:
+        own_text = ""
+    if own_text:
+        own_text = "--- アプリ側のエラーの記録（runner_error.log）---\n" + own_text[-20_000:]
     if not logs:
-        return {"text": ""}
+        return {"file": str(own), "text": own_text} if own_text else {"text": ""}
     with open(logs[-1], "rb") as fh:   # only the end: a long run's log is large
         fh.seek(max(0, fh.seek(0, 2) - 200_000))
         data = fh.read().decode("utf-8", "replace")
     lines = [l for l in data.replace("\r", "\n").split("\n") if l.strip()]
-    return {"file": str(logs[-1]), "text": "\n".join(lines[-tail:])}
+    return {"file": str(logs[-1]), "text": "\n".join(lines[-tail:]) + ("\n\n" + own_text if own_text else "")}
 
 
 # ====================================================================== evaluation / export
@@ -3055,8 +3214,11 @@ app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 @app.exception_handler(Exception)
 def on_error(request, exc):
     import traceback
-    (config.DATA_DIR / "server_errors.log").open("a", encoding="utf-8").write(
-        time.strftime("%F %T ") + request.url.path + "\n" + traceback.format_exc() + "\n")
+    try:
+        with (config.DATA_DIR / "server_errors.log").open("a", encoding="utf-8") as f:
+            f.write(time.strftime("%F %T ") + request.url.path + "\n" + "".join(traceback.format_exception(exc)) + "\n")
+    except OSError:
+        pass
     return JSONResponse({"detail": f"内部エラー: {type(exc).__name__}: {exc}（詳細は設定画面の「ログ」欄で見られます）"}, status_code=500)
 
 
@@ -3067,6 +3229,8 @@ def _recover_project(p, order: dict, reserved: list) -> None:
     """resume_pending_on_startup for one project: runs, material batches, comparisons and analysis left running."""
     for r in p.runs():
         if r["created"] >= BOOT:   # started after this start (the page answers while this runs)
+            continue
+        if runner.find(p.id, r["id"]) is not None:   # an older run resumed since this start: it is the runner's now
             continue
         if r["status"] == "queued" and r["run_dir"] and (r["progress"] or {}).get("phase", "queued") == "queued":
             pos, resume = order.get((p.id, r["id"]), (None, None))
@@ -3080,10 +3244,24 @@ def _recover_project(p, order: dict, reserved: list) -> None:
                     runner._register_checkpoints(Job(p, r["id"]), out_dir, final=True)
                 except Exception:
                     pass
+            if r["status"] == "evaluating":
+                # the training itself had finished (the LoRA is written before this status is set): only the
+                # comparison images were cut off.  Not a failed run - and not one to "resume" over its last steps
+                total = (r["config"].get("values") or {}).get("max_train_steps")
+                kept = {k: v for k, v in (r["progress"] or {}).items() if k in ("loss", "loss_hist", "speed", "vram_short")}
+                runner._set(p, r["id"], status="done", ended=time.time(),
+                            progress={**kept, "phase": "done", "step": total, "total": total,
+                                      "message": "学習は完了しました。比較画像の生成はアプリの終了で中断されました（「比較を追加」でやり直せます）。"})
+                continue
             runner._set(p, r["id"], status="failed", ended=time.time(),
                         error={"code": "interrupted", "message": "アプリの終了により中断されました。",
                                "fixes": ["再開用の保存地点があれば「再開」できます"]})
+    with runner._cond:   # batches resumed since this start wait in the queue (or run): they are not leftovers
+        live = {getattr(j, "label", None) for j in ([runner.current] if runner.current else []) + list(runner.jobs)
+                if j.project.id == p.id}
     for b in p.q("SELECT id FROM gen_batches WHERE status IN ('queued','running') AND created < ?", (BOOT,)):
+        if f"素材生成 #{b['id']}" in live:
+            continue
         generate._set_status(p, b["id"], "paused", "アプリの終了で止まりました。「再開」で続きを生成できます。")
     for e in p.q("SELECT id FROM evals WHERE status IN ('queued','running') AND created < ?", (BOOT,)):
         p.q("UPDATE evals SET status='failed', error='アプリの終了により中断されました' WHERE id=?", (e["id"],))
@@ -3091,8 +3269,17 @@ def _recover_project(p, order: dict, reserved: list) -> None:
 
 
 def resume_pending_on_startup():
-    """After a restart, runs that were in progress are marked as interrupted (not silently resumed)."""
-    imagegen.recover()
+    """After a restart, runs that were in progress are marked as interrupted (not silently resumed).
+    Each stage is guarded on its own: an error in one (a history file or a project that cannot be read) must not
+    keep the later ones from running - the reserved runs and the LoRA tasks would wait for the whole session."""
+    def stage(what, fn, *args):
+        try:
+            return fn(*args)
+        except Exception:
+            _log_recovery_error(what)
+            return None
+
+    stage("画像生成の履歴", imagegen.recover)
     threading.Thread(target=projectio.empty_trash, daemon=True).start()
     try:
         saved = json.loads(QUEUE_FILE.read_text(encoding="utf-8")) if QUEUE_FILE.exists() else []
@@ -3100,22 +3287,35 @@ def resume_pending_on_startup():
         saved = []
     order = {(q.get("project"), q.get("run")): (i, q.get("resume")) for i, q in enumerate(saved) if isinstance(q, dict)}
     reserved = []   # runs reserved but not started yet: they keep their place in the queue
-    for info in projects.list():
-        if info.get("error"):   # a project whose database cannot be opened: the list shows it; nothing to recover
-            continue
-        try:
-            _recover_project(projects.get(info["id"]), order, reserved)
-        except KeyError:
-            continue
-        except Exception:   # one broken project must not leave every later one stuck as running
-            import traceback
-            (config.DATA_DIR / "server_errors.log").open("a", encoding="utf-8").write(
-                time.strftime("%F %T ") + f"startup recovery of {info.get('id')}\n" + traceback.format_exc() + "\n")
-    for _pos, _created, p, rid, resume in sorted(reserved, key=lambda x: (x[0], x[1])):
-        if resume and not Path(resume).exists():   # never train a resumed run again from the start over its saves
-            runner._set(p, rid, status="failed", ended=time.time(),
-                        error={"code": "interrupted", "message": "再開に使う保存地点が見つからないため、予約を取り消しました。",
-                               "fixes": ["学習の履歴で、ほかの保存地点から再開できるか確認する"]})
-            continue
-        runner.enqueue(p, rid, resume=resume)
-    tasks.recover()
+    try:
+        for info in stage("プロジェクトの一覧", projects.list) or []:
+            if info.get("error"):   # a project whose database cannot be opened: the list shows it; nothing to recover
+                continue
+            try:
+                _recover_project(projects.get(info["id"]), order, reserved)
+            except KeyError:
+                continue
+            except Exception:   # one broken project must not leave every later one stuck as running
+                _log_recovery_error(f"プロジェクト {info.get('id')}")
+        for _pos, _created, p, rid, resume in sorted(reserved, key=lambda x: (x[0], x[1])):
+            stage(f"予約した学習 #{rid}", _requeue_reserved, p, rid, resume)
+    finally:
+        tasks.recover()   # the LoRA tasks' thread starts only here
+
+
+def _log_recovery_error(what: str) -> None:
+    import traceback
+    try:
+        with (config.DATA_DIR / "server_errors.log").open("a", encoding="utf-8") as f:
+            f.write(time.strftime("%F %T ") + f"startup recovery: {what}\n" + traceback.format_exc() + "\n")
+    except OSError:
+        pass
+
+
+def _requeue_reserved(p, rid, resume) -> None:
+    if resume and not Path(resume).exists():   # never train a resumed run again from the start over its saves
+        runner._set(p, rid, status="failed", ended=time.time(),
+                    error={"code": "interrupted", "message": "再開に使う保存地点が見つからないため、予約を取り消しました。",
+                           "fixes": ["学習の履歴で、ほかの保存地点から再開できるか確認する"]})
+        return
+    runner.enqueue(p, rid, resume=resume)

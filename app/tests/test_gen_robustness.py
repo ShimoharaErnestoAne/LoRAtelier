@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import struct
 import sys
 import time
@@ -119,9 +120,12 @@ def test_replaced_model_is_linked_again(env):
     assert comfy.stage_model("checkpoints", str(other)) != name
     src.unlink()
     src.write_bytes(b"new")                                                    # downloaded again, same size
+    later = src.stat().st_mtime_ns + 5 * 10**9                                 # ...at another time
+    os.utime(src, ns=(later, later))
     from lorastudio.evaluate import COMFY_MODELS
-    comfy.stage_model("checkpoints", str(src))
-    assert (COMFY_MODELS / "checkpoints" / name).read_bytes() == b"new"
+    # a new name in ComfyUI, which keeps a loaded model by its name and would go on using the old one
+    again = comfy.stage_model("checkpoints", str(src))
+    assert again != name and (COMFY_MODELS / "checkpoints" / again).read_bytes() == b"new"
 
 
 def test_seed_must_fit_comfyui(env):

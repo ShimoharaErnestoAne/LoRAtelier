@@ -409,8 +409,14 @@ class ProjectManager:
         return None
 
     def list(self) -> list[dict]:
+        def mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:   # deleted since folders() looked
+                return 0.0
+
         out = []
-        for d in sorted(self.folders(), key=lambda p: p.stat().st_mtime, reverse=True):
+        for d in sorted(self.folders(), key=mtime, reverse=True):
             try:
                 p = self.get(d.name)
                 m = p.get_meta()
@@ -424,7 +430,11 @@ class ProjectManager:
             except ProjectMoving:
                 out.append({"id": d.name, "name": self._moving.get(d.name) or d.name, "moving": True,
                             "error": "ほかの置き場所へ移動中です。終わるまで開けません。"})
-            except sqlite3.Error as e:
+            except KeyError:
+                continue   # deleted (or moved away) since folders() looked
+            except (sqlite3.Error, OSError, ValueError) as e:
+                # one folder that cannot be read (a broken database or settings value, a drive that went away) is
+                # listed with its error; the other projects stay usable
                 out.append({"id": d.name, "name": d.name, "error": str(e)})
         return out
 

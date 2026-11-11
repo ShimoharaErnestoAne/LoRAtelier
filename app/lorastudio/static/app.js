@@ -12,10 +12,13 @@ async function api(path, opts = {}) {
   if (S.unloading) o.keepalive = true;   // pagehide: the request outlives the page
   if (opts.body instanceof FormData) o.body = opts.body;
   else if (opts.body !== undefined) { o.body = JSON.stringify(opts.body); o.headers["Content-Type"] = "application/json"; }
-  const r = await fetch(path, o);
-  let data = null;
-  try { data = await r.json(); } catch { /* empty */ }
+  let r, text = "";
+  // the server is not running (closed, restarting): say so instead of the browser's "Failed to fetch"
+  try { r = await fetch(path, o); text = await r.text(); } catch { throw new Error("LoRAtelier に接続できません（起動しているか確認してください）"); }
+  let data = null, parsed = !text;
+  try { if (text) { data = JSON.parse(text); parsed = true; } } catch { /* not JSON */ }
   if (!r.ok) throw new Error((data && data.detail) || `HTTP ${r.status}`);
+  if (!parsed) throw new Error("LoRAtelier から想定外の応答が返りました（起動し直してから、もう一度試してください）");
   return data;
 }
 
@@ -91,8 +94,17 @@ window.addEventListener("hashchange", route);
    nothing when the user has gone to another page meanwhile: a slow answer must not paint over the new page. */
 let NAV = 0;
 const navStale = (nav) => nav !== NAV;
+/* Fields that save on "change" (project name, trigger word, training settings ...): the browser sends that event
+   only when the field loses the focus, and not when the page under it is replaced (back button, Alt+←) or closed.
+   Taking the focus away first sends it while the old page's fields and project are still there. */
+function commitFocused() {
+  const a = document.activeElement;
+  if (a && a !== document.body && main.contains(a) && ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName)) a.blur();
+}
 function route() {
   NAV++;
+  main.style.minHeight = "";   // held by a settings page redraw that was still loading
+  commitFocused();
   flushSaves();   // the old page's inputs are still there
   const h = location.hash.replace(/^#\/?/, "");
   S.route = h ? h.split("/") : [];
@@ -119,6 +131,8 @@ let eventSrc = null;
 function connectEvents() {
   if (eventSrc || document.hidden) return;
   const es = eventSrc = new EventSource("/api/events");
+  // connected (again): what ended while no events came is asked for (the i2t page's running job; i2t.js)
+  es.onopen = () => { if (typeof iResync === "function") iResync(); };
   es.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "queue" || (m.type === "run" && m.status)) refreshQueueSoon();
@@ -131,12 +145,13 @@ function connectEvents() {
     else if (m.type === "checkpoints" && S.project && m.project === S.project.id) refreshRunsSoon();
     else if (m.type === "worker" || m.type === "analysis") refreshStatusSoon();
     // a finished download changes the model lists (whole page); otherwise only the download boxes, so fields being typed in stay
-    else if (m.type === "download") { if (S.route[0] === "settings") { if (m.state === "done") renderSettings(); else { drawCatalog(); drawImportState(); } } }
+    else if (m.type === "download") { if (S.route[0] === "settings") { if (m.state === "done") renderSettings(true); else { drawCatalog(); drawImportState(); } } }
     else if (m.type === "gen" && S.project && m.project === S.project.id) onGenEvent(m);
     else if (m.type === "imagegen" && S.route[0] === "gen") { if (m.progress) igOnProgress(m); else igReloadSoon(); }
     else if (m.type === "imagegen" && S.route[0] === "presets" && !m.progress) plReloadSoon();
     else if (m.type === "i2t" && m.event === "done" && m.op === "moss_catalog" && S.project && !["i2t", "settings"].includes(S.route[0])) {
       if (m.ok) refreshImagesBg(); else if (!m.cancelled) toast(m.error, "err");
+      if (!m.ok && $("#m-mosscat")) $("#m-mosscat").disabled = false;   // failed or stopped: the button can be pressed again
     }
     else if (m.type === "i2t" && (S.route[0] === "i2t" || S.route[0] === "settings")) onI2tEvent(m);
     else if (m.type === "import" && (m.failed || []).length) importFailed(m.failed);
@@ -192,6 +207,8 @@ async function refreshStatus() {
   else if (st.analysis_queue > 0) { ap.hidden = false; ap.textContent = `AI解析${w === "ready_cpu" ? "（GPU が使えないため CPU）" : ""} 残り${st.analysis_queue}`; }
   else ap.hidden = true;
   ap.title = w === "ready_cpu" ? workerLabel(w) : "";
+  // the material tab's start bar says whether a training of this project runs or waits: follows the status
+  if (S.project && $("#m-start")) refreshStartBarIfChanged();
 }
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 4000);
 
@@ -219,7 +236,15 @@ async function renderHome() {
   $("#crumbs").innerHTML = "";
   main.innerHTML = `<div class="muted">読み込み中…</div>`;
   let list = [], models = { models: [] };
-  try { [list, models] = await Promise.all([api("/api/projects"), api("/api/models")]); } catch (e) { if (!navStale(nav)) fail(e); }
+  try { [list, models] = await Promise.all([api("/api/projects"), api("/api/models")]); }
+  catch (e) {
+    // not drawn as an empty list: that looks as if the projects and the models were gone
+    if (navStale(nav)) return;
+    main.innerHTML = `<div class="err">プロジェクトの一覧を読み込めませんでした: ${esc(e.message)}</div>
+      <div style="margin-top:8px"><button id="home-retry">読み込み直す</button></div>`;
+    $("#home-retry").onclick = renderHome;
+    return;
+  }
   if (navStale(nav)) return;
   const noModel = !models.models.length;
   main.innerHTML = `
@@ -534,9 +559,10 @@ async function newMultiForm(models) {
 
 /* The キャラ tab of a multi-character project: the member projects, each opened and edited on its own. */
 async function renderMembers() {
-  const p = S.project;
+  const p = S.project, nav = NAV;
   let list = [];
   try { list = (await api("/api/projects")).filter((x) => x.kind === "character" && x.source !== "multi" && !x.error && !(p.members || []).includes(x.id)); } catch { /* the add list stays empty */ }
+  if (navStale(nav) || !$("#tab")) return;   // another tab or page was opened meanwhile: its contents stay
   const mem = p.member_info || [];
   $("#tab").innerHTML = `<div class="panel">
     <h2>まとめるキャラ</h2>
@@ -551,7 +577,13 @@ async function renderMembers() {
   </div>
   <div class="row" style="margin-top:12px"><a href="#/p/${esc(p.id)}/train"><button class="primary big">学習へ</button></a></div>`;
   const save = async (members, msg) => {
-    try { S.project = await api(`/api/projects/${p.id}`, { method: "PATCH", body: { members } }); toast(msg); renderMembers(); } catch (e) { fail(e); }
+    try {
+      const saved = await api(`/api/projects/${p.id}`, { method: "PATCH", body: { members } });
+      toast(msg);
+      if (!S.project || S.project.id !== p.id) return;   // another project was opened while saving
+      S.project = saved;
+      if (!navStale(nav)) renderMembers();
+    } catch (e) { fail(e); }
   };
   $$("[data-mrm]").forEach((b) => b.onclick = () => save((S.project.members || []).filter((x) => x !== b.dataset.mrm), "キャラを外しました（次の学習から反映）"));
   if ($("#mm-addgo")) $("#mm-addgo").onclick = () => save([...(S.project.members || []), $("#mm-add").value], "キャラを追加しました（次の学習から反映）");
@@ -646,6 +678,7 @@ async function openProject(pid, tab) {
     if (navStale(nav)) return;   // another project or page was opened meanwhile
     S.project = proj;
     S.images = []; S.sel.clear(); S.focus = null; S.detail = null; S.resultsRun = null; S.resultsEv = null; S.picked = null;
+    S.search = "";   // the search box of the previous project (the filter chips stay: they show what is on)
     _imgReq++; _imgBusy = false; _imgAgain = false;   // a list still on its way belongs to the previous project
   }
   const p = S.project;
@@ -672,7 +705,9 @@ async function openProject(pid, tab) {
     <div id="tab"></div>`;
   const saveMeta = async (body, okmsg) => {
     try {
-      S.project = await api(`/api/projects/${pid}`, { method: "PATCH", body }); if (okmsg) toast(okmsg);
+      const saved = await api(`/api/projects/${pid}`, { method: "PATCH", body }); if (okmsg) toast(okmsg);
+      if (!S.project || S.project.id !== pid) return;   // another project was opened while saving: it stays the current one
+      S.project = saved;
       // a tab clicked while saving redrew the header from the old values
       const put = (id, v) => { const x = $(id); if (x && x !== document.activeElement && S.project.id === pid) x.value = v; };
       put("#ph-name", S.project.name); put("#ph-trig", S.project.trigger || "");
@@ -693,6 +728,7 @@ async function openProject(pid, tab) {
       `<option value="${m.id}" ${m.id === S.project.model_id ? "selected" : ""}>${esc(m.name)}（${esc(m.variant_info.label || m.family)}）</option>`).join("");
     sel.onchange = async () => {
       await saveMeta({ model_id: sel.value || null }, "LoRA を作るモデルを変えました（次の学習から使われます）");
+      if (!S.project || S.project.id !== pid) return;
       if ((S.project.reset_settings || []).length) toast(`前のモデル向けの設定（${S.project.reset_settings.join("、")}）を初期値に戻しました`);
       if ((S.route[2] || "material") === "train") renderTrain();
     };
@@ -711,7 +747,7 @@ async function drawEnhanceHeader(pid, saveMeta) {
   ms.innerHTML = Object.entries(cat.methods).map(([k, l]) => `<option value="${k}" ${k === e.method ? "selected" : ""}>${esc(l)}</option>`).join("");
   es.innerHTML = Object.entries(cat.effects).filter(([k]) => e.method === "words" || k !== "custom")
     .map(([k, x]) => `<option value="${k}" ${k === e.effect ? "selected" : ""}>${esc(x.label)}</option>`).join("");
-  const reopen = () => openProject(pid, S.route[2] || "material");
+  const reopen = () => { if (S.project && S.project.id === pid && S.route[0] === "p") openProject(pid, S.route[2] || "material"); };
   ms.onchange = async () => {
     await saveMeta({ enhance: { method: ms.value } }, "作り方を変えました（学習の詳細設定は初期値に戻りました）");
     reopen();
@@ -740,10 +776,12 @@ function renderEnhanceWords() {
     <div class="muted small" style="margin-top:8px">できた LoRA は、強さをプラスにすると「強めたいもの」の方向に、マイナスにすると「弱めたいもの」の方向に働きます。変えた内容は次の学習から使われます。</div>
     <div class="row" style="margin-top:10px"><a href="#/p/${S.project.id}/train"><button class="primary">学習の画面へ</button></a></div></div>`;
   const save = async () => {
+    const pid = S.project.id;
     try {
-      S.project = await api(`/api/projects/${S.project.id}`, { method: "PATCH", body: { enhance: {
+      const saved = await api(`/api/projects/${pid}`, { method: "PATCH", body: { enhance: {
         positive: $("#ew-pos").value, negative: $("#ew-neg").value, subject: $("#ew-subj").value } } });
       toast("保存しました（次の学習から使われます）");
+      if (S.project && S.project.id === pid) S.project = saved;   // another project may have been opened while saving
     } catch (err) { fail(err); }
   };
   ["#ew-pos", "#ew-neg", "#ew-subj"].forEach((id) => $(id).onchange = save);
@@ -786,7 +824,7 @@ function renderMaterial() {
         <div id="m-report"></div>
         <div id="m-tags"></div>
         <div class="toolbar"><div class="chips" id="m-filters"></div><div class="spacer"></div>
-          <input type="text" id="m-search" placeholder="説明文・タグで絞り込み" style="width:180px"></div>
+          <input type="text" id="m-search" value="${esc(S.search)}" placeholder="説明文・タグで絞り込み" style="width:180px"></div>
         <div class="toolbar" id="m-bulk"></div>
         <div class="grid" id="m-grid"></div>
       </div>
@@ -805,11 +843,11 @@ function renderMaterial() {
     } catch (err) { fail(err); }
   };
   if ($("#m-gen-open")) $("#m-gen-open").onclick = () => { S.genOpen = !S.genOpen; renderGen(); };
-  if (S.genFor !== S.project.id) { S.genFor = S.project.id; S.gen = null; S.genOpen = S.project.source === "generate"; }
+  if (S.genFor !== S.project.id) { S.genFor = S.project.id; S.gen = null; S.genBatch = null; S.genOpen = S.project.source === "generate"; }
   renderGen();
   $("#m-undo").onclick = () => undoRedo("undo");
   $("#m-redo").onclick = () => undoRedo("redo");
-  $("#m-search").oninput = debounce((e) => { S.search = e.target.value.trim().toLowerCase(); drawGrid(); }, 150);
+  $("#m-search").oninput = debounce((e) => { S.search = e.target.value.trim().toLowerCase(); trimSelection(); drawGrid(); drawBulk(); }, 150);
   $("#m-grid").addEventListener("click", onGridClick);
   $("#m-grid").addEventListener("contextmenu", onGridMenu);
   S.cards = new Map();
@@ -866,7 +904,8 @@ let _imgReq = 0, _imgBusy = false, _imgAgain = false, _imgLast = 0, _imgTimer = 
 /* Updates pushed while analysis runs (several per image): the whole list is rebuilt on the server for each
    request, so these come at most about once a second, and never while a request is still running. */
 function refreshImagesBg() {
-  if (_imgTimer) return;
+  // only the material tab draws the list (it loads it when opened); on the other tabs the answer would be thrown away
+  if (_imgTimer || !$("#m-grid")) return;
   _imgTimer = setTimeout(() => { _imgTimer = null; refreshImages(); }, Math.max(120, 1000 - (Date.now() - _imgLast)));
 }
 let _imgFailed = false;   // one toast per failure streak (analysis asks about once a second)
@@ -934,7 +973,7 @@ function drawReport() {
     if (!["attention", "all", "used", "unused"].includes(k) && !n) return "";
     return `<span class="chip ${S.filter === k ? "on" : ""}" data-f="${k}">${label} ${n}</span>`;
   }).join(""));
-  $$("#m-filters .chip").forEach((ch) => ch.onclick = () => { S.filter = ch.dataset.f; drawReport(); drawGrid(); });
+  $$("#m-filters .chip").forEach((ch) => ch.onclick = () => { S.filter = ch.dataset.f; trimSelection(); drawReport(); drawGrid(); drawBulk(); });
   const sug = (rep.coverage || {}).concept_suggest || [];
   const nMissing = S.images.filter((i) => (i.checks || []).some((x) => x.key === "missing")).length;
   setHTML($("#m-report"), (nMissing ? `<div class="notes"><div class="note warn">元画像が見つからない画像が ${nMissing} 枚あります。移動したときは、今の場所を指定すると戻せます。
@@ -1062,6 +1101,14 @@ function visibleImages() {
   if (S.search) list = list.filter((i) => (i.caption + " " + i.tags.join(" ") + " " + i.name).toLowerCase().includes(S.search));
   if (f === "attention") list.sort((a, b) => (VORDER[a.verdict] - VORDER[b.verdict]) || (a.id - b.id));
   return list;
+}
+
+/* After the filter or the search changed: images no longer shown leave the selection, so a bulk operation or the
+   Delete key never acts on an image that is not on the screen. */
+function trimSelection() {
+  if (!S.sel.size) return;
+  const shown = new Set(visibleImages().map((i) => i.id));
+  for (const id of [...S.sel]) if (!shown.has(id)) S.sel.delete(id);
 }
 
 function cardSig(im) {
@@ -1255,6 +1302,7 @@ async function undoRedo(which) {
 document.addEventListener("keydown", (e) => {
   if (S.route[0] !== "p" || (S.route[2] || "material") !== "material") return;
   if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) return;
+  if (!$("#lightbox").hidden) return;   // the enlarged view has its own keys: none of them acts on the material under it
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undoRedo(e.shiftKey ? "redo" : "undo"); }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") { e.preventDefault(); undoRedo("redo"); }
   if (e.key === "Delete" && S.sel.size) { e.preventDefault(); closeMenu(); removeImages([...S.sel]); }
@@ -1268,7 +1316,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ---- detail panel
-const detailSig = (im) => [im.verdict, im.decision, im.crop, im.ai_status, im.caption_status, im.caption_edited ? "" : im.caption, JSON.stringify(im.checks.map((c) => c.key)), JSON.stringify(im.mask || null), im.mask_off].join("|");
+const detailSig = (im) => [im.verdict, im.decision, im.crop, im.ai_status, im.caption_status, im.caption_edited ? "" : im.caption, JSON.stringify(im.checks.map((c) => c.key)), JSON.stringify(im.mask || null), im.mask_off, S.refs.includes(im.id), S.refs.length === 1 && !((S.project || {}).reference_ids || []).length].join("|");
 let _detReq = 0;
 /* The caption typed in the detail panel is saved 600 ms after the last key; anything that redraws the panel
    or makes another edit saves it first, so the redrawn panel never shows (and then re-saves) the old text. */
@@ -1309,6 +1357,9 @@ function drawDetail(d) {
   const pid = S.project.id;
   const box = $("#m-detail");
   const isRef = S.refs.includes(d.id);
+  // no reference picked by hand yet: the tool's own candidate is used, and an empty list means "choose for me" again,
+  // so the only candidate cannot be taken off (picking another image by hand makes the list the user's)
+  const loneAutoRef = isRef && S.refs.length === 1 && !(S.project.reference_ids || []).length;
   const dom = d.domain ? `${d.domain.label === "photo" ? "写真" : "イラスト"}（推定・確信度${d.domain.confidence}）` : "";
   box.innerHTML = `
     <div class="row" style="justify-content:space-between"><b>#${d.id}</b><span class="badge b-${d.verdict}" style="position:static">${esc(d.verdict_label)}</span></div>
@@ -1326,7 +1377,8 @@ function drawDetail(d) {
       <button data-v="use" class="${d.decision === "use" ? "on" : ""}">採用</button>
       <button data-v="exclude" class="${d.decision === "exclude" ? "on" : ""}">除外</button>
     </div>
-    ${S.project.kind === "character" ? `<button id="d-ref" style="margin-left:6px">${isRef ? "基準画像から外す" : "基準画像にする"}</button>` : ""}
+    ${S.project.kind !== "character" ? "" : loneAutoRef ? `<span class="muted small" style="margin-left:6px" title="基準画像を手で選んでいない間は、ツールが候補を選びます。ほかの画像を「基準画像にする」と、この画像を基準から外せるようになります。">自動で選んだ基準画像</span>`
+      : `<button id="d-ref" style="margin-left:6px">${isRef ? "基準画像から外す" : "基準画像にする"}</button>`}
     <h3>判定の理由</h3><div class="checks" id="d-checks"></div>
     <h3>説明文 <span class="savestate" id="d-save">${d.caption_edited ? "手動編集済み（自動解析で上書きされません）" : d.caption_status === "pending" || d.caption_status === "running" ? "自動生成中…"
       : d.caption_status === "failed" ? "自動生成に失敗" : d.caption_status === "skipped" ? "自動生成なし（解析できませんでした）" : "自動生成"}</span></h3>
@@ -1352,10 +1404,18 @@ function drawDetail(d) {
       S.history = r.history; drawUndo(); refreshImages(); } catch (e) { fail(e); refreshImages(); }
   });
   if ($("#d-ref")) $("#d-ref").onclick = async () => {
-    const cur = new Set((S.project.reference_ids || []));
+    // from the references in use (S.refs: the hand-picked ones, else the tool's candidates), not only the hand-picked
+    // list: taking a candidate off works, and picking another image does not silently drop the candidates
+    const cur = new Set(S.refs);
     isRef ? cur.delete(d.id) : cur.add(d.id);
-    try { S.project = await api(`/api/projects/${pid}`, { method: "PATCH", body: { reference_ids: [...cur] } });
-      toast(isRef ? "基準画像から外しました（同一性を再判定します）" : "基準画像にしました（同一性を再判定します）"); refreshImages(); } catch (e) { fail(e); }
+    $("#d-ref").disabled = true;
+    try {
+      const saved = await api(`/api/projects/${pid}`, { method: "PATCH", body: { reference_ids: [...cur] } });
+      toast(isRef ? "基準画像から外しました（同一性を再判定します）" : "基準画像にしました（同一性を再判定します）");
+      if (!S.project || S.project.id !== pid) return;
+      S.project = saved;
+      refreshImages();   // brings the new references; the panel is redrawn when this image's state changed (detailSig)
+    } catch (e) { fail(e); if ($("#d-ref")) $("#d-ref").disabled = false; }
   };
   const ta = $("#d-cap"), st = $("#d-save");
   if (S.project.caption_style !== "natural") attachTagComplete(ta);   // tag captions: tags as the tagger writes them
@@ -1476,10 +1536,15 @@ function setupCrop(d) {
 /* The image list is refreshed about once a second while analysis runs; the plan behind the start bar checks every
    used image's file, so it is asked for again only when something it depends on changed. */
 let _startSig = null;
+/* [a training of this project runs now, how many of its trainings wait in the queue] (from the last /api/status;
+   other GPU work of the project - material generation, comparison images - has no run number). */
+function trainingState(pid) {
+  const st = S.status || {}, job = st.job;
+  return [!!(job && job.project === pid && job.kind === "train"), (st.queued || []).filter((q) => q.project === pid && q.run != null).length];
+}
 function refreshStartBarIfChanged() {
   if (!S.project) return;
-  const job = S.status && S.status.job;
-  const sig = JSON.stringify([S.project.id, S.project.model_id, job ? job.project : null,
+  const sig = JSON.stringify([S.project.id, S.project.model_id, trainingState(S.project.id),
     S.images.map((i) => [i.id, i.use, i.decision, i.verdict, i.caption_status, i.ai_status, i.fast_status, i.mask_off, i.mask, i.crop])]);
   const el = $("#m-start");
   if (sig === _startSig && el && el._html) return;
@@ -1494,12 +1559,13 @@ const refreshStartBar = debounce(async () => {
   try { plan = await api(`/api/projects/${S.project.id}/train/plan`); } catch (e) { el.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
   S.plan = plan;
   const pf = plan.preflight;
-  const running = S.status && S.status.job && S.status.job.project === S.project.id;
+  const [running, reserved] = trainingState(S.project.id);
   setHTML(el, `
     <div><b>採用 ${plan.used} 枚</b>${plan.values ? ` <span class="muted small">・ ${plan.values.max_train_steps} ステップ（途中保存を比較できます）</span>` : ""}
       ${pf.errors.map((x) => `<div class="err small">${esc(x)}</div>`).join("")}
       ${pf.warnings.map((x) => `<div class="warntext small">${esc(x)}</div>`).join("")}
-      ${running ? `<div class="muted small">学習中です。ここでの編集は次回の学習に反映されます（実行中の学習は変わりません）。</div>` : ""}</div>
+      ${running ? `<div class="muted small">学習中です。ここでの編集は次回の学習に反映されます（実行中の学習は変わりません）。</div>` : ""}
+      ${reserved ? `<div class="muted small">予約済みの学習が ${reserved} 件あります。素材と設定は予約した時点の内容で固定してあるので、ここでの編集は予約済みの学習には反映されません。</div>` : ""}</div>
     <div class="spacer"></div>
     <a href="#/p/${S.project.id}/train" class="small">設定を確認</a>
     <button class="primary big" id="m-go" ${pf.errors.length || _starting ? "disabled" : ""}>${_starting ? "開始しています…" : "学習を開始"}</button>`);
@@ -1512,13 +1578,18 @@ async function startTraining() {
   const b = $("#m-go") || $("#t-go");
   if (b) { b.disabled = true; b.textContent = "開始しています…"; }
   _starting = true;
+  const pid = S.project.id;
+  let started = false;
   try {
-    const r = await api(`/api/projects/${S.project.id}/train/start`, { body: {} });
+    const r = await api(`/api/projects/${pid}/train/start`, { body: {} });
     toast(r.ahead > 0 ? `学習 #${r.run_id} を予約しました。前に ${r.ahead} 件あり、順番が来たら始まります（素材と設定は今の内容で固定しました）。`
       : `学習 #${r.run_id} を開始しました`);
-    location.hash = `#/p/${S.project.id}/train`;
+    started = true;
   } catch (e) { fail(e); if (b) { b.disabled = false; b.textContent = "学習を開始"; } }
   finally { _starting = false; }
+  if (!started || !S.project || S.project.id !== pid || S.route[0] !== "p") return;   // another page was opened meanwhile
+  // already on the training tab: the same address does not redraw it, and the button would stay disabled
+  if (S.route[2] === "train") renderTrain(); else location.hash = `#/p/${pid}/train`;
 }
 
 // ------------------------------------------------------------------ drag & drop (anywhere)
@@ -1607,9 +1678,14 @@ async function renderGen() {
   if (btn) btn.classList.toggle("primary", !!S.genOpen);
   if (!S.genOpen) { el.innerHTML = ""; return; }
   if (!S.gen) el.innerHTML = `<div class="panel gen muted">読み込み中…</div>`;
+  const pid = S.project.id;
+  let gen, lib;
   try {
-    [S.gen, S.lib] = await Promise.all([api(`/api/projects/${S.project.id}/gen`), api("/api/library")]);
-  } catch (e) { el.innerHTML = `<div class="panel gen err">${esc(e.message)}</div>`; return; }
+    [gen, lib] = await Promise.all([api(`/api/projects/${pid}/gen`), api("/api/library")]);
+  } catch (e) { if ($("#m-gen") === el) el.innerHTML = `<div class="panel gen err">${esc(e.message)}</div>`; return; }
+  // another project or tab was opened meanwhile: this answer is the previous project's recipe, not drawn (nor saved from)
+  if (!S.project || S.project.id !== pid || $("#m-gen") !== el) return;
+  S.gen = gen; S.lib = lib;
   drawGenForm();
   drawGenBatches();
 }
@@ -2019,8 +2095,11 @@ function readRecipe() {
   const sampling = {};
   $$("[data-gs]").forEach((i) => { if (i.dataset.gs !== "seed" && i.value !== "") sampling[i.dataset.gs] = i.type === "number" ? num(i.value) : i.value; });
   const seed = $("[data-gs=seed]");
+  // a file being set up (pickFileModel) has no id yet: the model saved before stays until it has one - saving
+  // "no model" meanwhile would make the server lose which model the LoRA's own model was following
+  const gsel = $("#g-model"), settingUp = gsel && gsel.value.startsWith("file:");
   return {
-    gen_model_id: selModelId($("#g-model")), positive: $("#g-pos").value, negative: $("#g-neg").value,
+    gen_model_id: settingUp ? ((S.gen.recipe || {}).gen_model_id ?? null) : selModelId(gsel), positive: $("#g-pos").value, negative: $("#g-neg").value,
     count: genCount(), sampling, seed: seed && seed.value !== "" ? num(seed.value) : null,
     loras: readLoraRows($("#g-loras")),
     exclude_angles: $$("[data-xa]:checked").map((x) => x.dataset.xa), exclude_framings: $$("[data-xf]:checked").map((x) => x.dataset.xf),
@@ -2114,12 +2193,22 @@ async function saveRecipe() {
   } catch (e) { st.className = "savestate err"; st.textContent = "保存できませんでした：" + e.message; return false; }
 }
 
+/* A model file chosen but not set up yet (its text encoder / VAE still to be picked): nothing starts with it, and
+   not with the model saved before either. */
+function genModelPending() {
+  if (!($("#g-model")?.value || "").startsWith("file:")) return false;
+  toast("生成モデルの準備が終わっていません。組み合わせるファイルを選んで「この組み合わせで使う」を押してください", "err");
+  return true;
+}
+
 async function startGen() {
-  const b = $("#g-start");
+  const b = $("#g-start"), n = genCount();
+  if (genModelPending()) return;
+  if (!(n >= 1 && n <= GEN_MAX)) return toast(`枚数は 1〜${GEN_MAX} 枚で指定してください`, "err");
   b.disabled = true;
   try {
     if (!(await saveRecipe())) throw new Error("生成の設定を保存できなかったため、開始しませんでした");
-    const r = await api(`/api/projects/${S.project.id}/gen/start`, { body: { count: genCount() } });
+    const r = await api(`/api/projects/${S.project.id}/gen/start`, { body: { count: n } });
     toast(`生成 #${r.batch_id} を開始しました`);
     S.genBatch = r.batch_id;
     await reloadGen();
@@ -2136,6 +2225,7 @@ function genCount() {
 /* One button for the whole way: registers a LoRA creation task (generate -> add -> analyse -> train). */
 async function startAuto() {
   const b = $("#g-auto"), n = genCount();
+  if (genModelPending()) return;
   if (!(n >= 1 && n <= GEN_MAX)) return toast(`枚数は 1〜${GEN_MAX} 枚で指定してください`, "err");
   b.disabled = true;
   try {
@@ -2148,7 +2238,12 @@ async function startAuto() {
 }
 
 async function reloadGen() {
-  try { S.gen = { ...S.gen, ...(await api(`/api/projects/${S.project.id}/gen`)), recipe: S.gen.recipe }; } catch (e) { return fail(e); }
+  const pid = S.project && S.project.id;
+  if (!pid || !S.gen) return;
+  let d;
+  try { d = await api(`/api/projects/${pid}/gen`); } catch (e) { return fail(e); }
+  if (!S.project || S.project.id !== pid || !S.gen || S.genFor !== pid) return;   // another project meanwhile
+  S.gen = { ...S.gen, ...d, recipe: S.gen.recipe };
   drawGenBatches();
 }
 const reloadGenSoon = debounce(reloadGen, 400);
@@ -2406,8 +2501,11 @@ async function drawTaskForm() {
     ${hasRecipe && !canGen ? `<div class="muted small">素材の生成の設定に足りないところがあるため、今は「今の素材で学習」だけ登録できます（${esc(gen.check.join(" / "))}）。</div>` : ""}`;
   $("#tk-go").onclick = async () => {
     const b = $("#tk-go");
+    const withGen = !!($("#tk-gen") && $("#tk-gen").checked);
+    const n = withGen ? parseInt($("#tk-n").value, 10) || 0 : 0;
+    // an empty count must not quietly register a task that trains without generating
+    if (withGen && !(n >= 1 && n <= GEN_MAX)) return toast(`生成する枚数は 1〜${GEN_MAX} 枚で指定してください`, "err");
     b.disabled = true;
-    const n = $("#tk-gen") && $("#tk-gen").checked ? parseInt($("#tk-n").value, 10) || 0 : 0;
     try {
       const r = await api(`/api/projects/${pid}/tasks`, { body: { gen_count: n, name: $("#tk-name").value } });
       toast(r.ahead > 0 ? `タスクを登録しました。前に ${r.ahead} 件あり、順番が来たら始まります。` : "タスクを登録しました。すぐに始まります。");
@@ -2433,9 +2531,13 @@ async function renderJobs() {
   drawJobs();
 }
 
-let _jobsBusy = false, _jobsAgain = false;
-async function drawJobs() {
+let _jobsBusy = false, _jobsAgain = false, _jobsForce = false;
+/* force: after a button of this page acted - every section is redrawn.  Otherwise (progress events, about once a
+   second) a section is left as it is while a click in it is half done (pressed, not released) or one of its buttons
+   waits for its second click, and sections whose contents did not change keep their elements (setHTML). */
+async function drawJobs(force = false) {
   if (S.route[0] !== "jobs" || !$("#jobs-body")) return;
+  if (force) _jobsForce = true;
   if (_jobsBusy) { _jobsAgain = true; return; }
   _jobsBusy = true;
   let q, d;
@@ -2446,9 +2548,19 @@ async function drawJobs() {
   if (_jobsAgain) { _jobsAgain = false; return drawJobs(); }
   const el = $("#jobs-body");
   if (!el || !q) return;
+  force = _jobsForce; _jobsForce = false;
   const openDetails = !!$("#jb-ended[open]"), openDl = !!$("#jb-dlended[open]");
-  el.innerHTML = (d.old ? `<div class="jpaused">LoRAtelier を起動し直すと、このページのすべての機能（止める・一時停止・LoRA 作成タスク）が使えるようになります。</div>` : "")
-    + jobsCurrentHtml(q) + jobsI2tHtml(q) + jobsDownloadsHtml(q, openDl) + jobsQueueHtml(q) + jobsTasksHtml(d, openDetails);
+  const parts = [["old", d.old ? `<div class="jpaused">LoRAtelier を起動し直すと、このページのすべての機能（止める・一時停止・LoRA 作成タスク）が使えるようになります。</div>` : ""],
+    ["cur", jobsCurrentHtml(q)], ["i2t", jobsI2tHtml(q)], ["dl", jobsDownloadsHtml(q, openDl)], ["queue", jobsQueueHtml(q)], ["tasks", jobsTasksHtml(d, openDetails)]];
+  if (!$("[data-sec]", el)) el.innerHTML = parts.map(([k]) => `<div data-sec="${k}"></div>`).join("");
+  let held = false;
+  for (const [k, html] of parts) {
+    const box = $(`[data-sec="${k}"]`, el);
+    if (!force && box._html !== html && ((_pressed && box.contains(_pressed)) || $(".armed", box))) { held = true; continue; }
+    if (force) box._html = null;   // also when nothing changed: the button that acted was disabled meanwhile
+    setHTML(box, html);
+  }
+  if (held) refreshJobsSoon();   // drawn when the click is over
   bindJobs(el, q);
   // the byte counts of a download are not sent as events: read again while one runs
   clearTimeout(_jobsDlTimer);
@@ -2480,12 +2592,12 @@ function jobsDownloadsHtml(q, openEnded) {
         <span class="jtitle">${esc(x.name)} <span class="muted">${esc(x.what)}</span></span>${x.error ? `<div class="small err jmsg">${esc(x.error)}</div>` : ""}</div>`).join("")}</details>` : ""}
   </section>`;
 }
-/* Progress events can come several times a second: redraw at most about once a second, and not while a
-   stop button waits for its second click (a redraw would reset it). */
+/* Progress events can come several times a second: redraw at most about once a second (drawJobs leaves a section
+   alone while a button in it waits for its second click or is being pressed: a redraw would reset it). */
 let _jobsTimer = null;
 function refreshJobsSoon() {
   if (_jobsTimer || S.route[0] !== "jobs") return;
-  _jobsTimer = setTimeout(() => { _jobsTimer = null; if ($("#jobs-body .armed")) return refreshJobsSoon(); drawJobs(); }, 800);
+  _jobsTimer = setTimeout(() => { _jobsTimer = null; drawJobs(); }, 800);
 }
 
 const jobKind = (k) => `<span class="jkind jk-${k}">${JOB_KIND[k] || "処理"}</span>`;
@@ -2589,12 +2701,12 @@ function bindJobs(el, q) {
   const act = async (b, path, body) => {
     b.disabled = true;
     try { const r = await api(path, { body: body || {} }); if (r && r.message) toast(r.message); } catch (e) { fail(e); }
-    drawJobs();
+    drawJobs(true);
   };
   $$("[data-cur]", el).forEach((b) => {
     b.onmouseenter = () => { if ($("#jctl-note")) $("#jctl-note").textContent = b.title; };
     b.onclick = () => {
-      const go = () => act(b, `/api/queue/current/${b.dataset.cur}`, { uid: q.current.uid });
+      const go = () => act(b, `/api/queue/current/${b.dataset.cur}`, { uid: (q.current || {}).uid });
       b.classList.contains("danger") ? confirmClick(b, "もう一度押すと実行", go) : go();
     };
   });
@@ -2664,12 +2776,16 @@ function saveOverrides(change) {
   }).finally(() => { if (--ovPending === 0 && S.project && S.project.id === pid) loadPlan(); });
 }
 
+let _planSeq = 0;
 async function loadPlan() {
-  const el = $("#t-plan");
+  const el = $("#t-plan"), my = ++_planSeq, pid = S.project.id;
+  if (!el) return;   // asked for after the training tab was left (a setting saved on the way out)
   let plan;
-  try { plan = S.plan = await api(`/api/projects/${S.project.id}/train/plan`); }
-  catch (e) { if ($("#t-plan") === el) el.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
-  if (!el || $("#t-plan") !== el) return;   // the tab was left meanwhile
+  try { plan = await api(`/api/projects/${pid}/train/plan`); }
+  catch (e) { if ($("#t-plan") === el && my === _planSeq) el.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+  // the tab was left meanwhile, or a newer request is on its way (its answer is the one to show)
+  if (!el || $("#t-plan") !== el || my !== _planSeq || !S.project || S.project.id !== pid) return;
+  S.plan = plan;
   // the field being typed in (another than the one just saved) and the open sections survive the redraw
   const fs = formState(el), typing = fs.focus && fs.focus[0];
   const keep = { v: typing && typing in fs.v ? { [typing]: fs.v[typing] } : {}, open: fs.open, focus: fs.focus };
@@ -2684,7 +2800,7 @@ async function loadPlan() {
   const RELKEY = { max_train_steps: "steps_scale", save_every_n_steps: "save_count" };
   el.innerHTML = `
     <div class="row" style="justify-content:space-between"><h2>学習の準備</h2>
-      <button class="primary big" id="t-go" ${pf.errors.length ? "disabled" : ""}>学習を開始</button></div>
+      <button class="primary big" id="t-go" ${pf.errors.length || _starting ? "disabled" : ""}>${_starting ? "開始しています…" : "学習を開始"}</button></div>
     <div class="row small muted">${S.project.kind === "enhance" && (S.project.enhance || {}).method === "words" ? "言葉から作る（画像は使いません）" : `採用 ${plan.used} 枚`} ・ モデル ${esc(plan.model.name)} ・ ${esc(plan.model.variant_info.label || "")}
       ${pf.info.gpu ? ` ・ GPU ${esc(pf.info.gpu.name)} (${Math.round(pf.info.gpu.vram_total_mb / 1024)}GB)` : ""}
       ${pf.info.disk_need_gb ? ` ・ 必要容量 約${pf.info.disk_need_gb}GB / 空き ${pf.info.disk_free_gb}GB` : ""}</div>
@@ -2808,6 +2924,7 @@ async function loadRuns() {
   let runs;
   try { runs = await api(`/api/projects/${pid}/runs`); } catch (e) { return fail(e); }
   if (!S.project || S.project.id !== pid || $("#t-runs") !== el) return;   // another project or tab meanwhile
+  if (_pressed && el.contains(_pressed)) { refreshRunsSoon(); return; }   // a click under way in the list: redrawn after it
   S.runs = runs;
   if (!S.runs.length) { el.innerHTML = `<div class="muted">まだ学習していません。</div>`; return; }
   // the 技術ログ boxes the user has open stay open with their text (the log is reloaded only by its button)
@@ -2907,18 +3024,30 @@ function onRunEvent(m) {
 let _pressed = null;   // the element under a mouse button held down
 window.addEventListener("mousedown", (e) => { _pressed = e.target; }, true);
 window.addEventListener("mouseup", () => { setTimeout(() => { _pressed = null; }); }, true);
+window.addEventListener("blur", () => { _pressed = null; });   // released outside the window: no mouseup comes
 
 // ------------------------------------------------------------------ results tab
 /* Each comparison image made for the comparison shown redraws only the comparison table; a new comparison,
    or one that ends, redraws the whole tab. */
 function onEvalEvent(m) {
-  const R = S.resShown;
-  if (m.status === "running" && R && $("#r-cmp") && R.el === $("#r-cmp") && m.run === R.run.id && R.evIds.includes(m.eval)) {
-    if (m.eval === R.evId) refreshCmpSoon();
-    return;
+  const R = S.resShown, shown = R && $("#r-cmp") && R.el === $("#r-cmp");
+  // one more image of a comparison (m.done): only what shows that comparison is redrawn
+  if (m.status === "running" && m.done != null) {
+    if ($("#t-runs")) return;   // training tab: the run's row follows the "run" events, the history is not reloaded
+    if (shown && (m.run !== R.run.id || R.evIds.includes(m.eval))) {
+      if (m.run === R.run.id && m.eval === R.evId) refreshCmpSoon();
+      if (S.cmp && S.cmp.open && S.cmp.ids.includes(m.run)) refreshRunCmpSoon();   // 回どうしを比べる shows this run's images
+      return;
+    }
   }
   refreshRunsSoon();
 }
+const refreshRunCmpSoon = debounce(() => {
+  const out = $("#rc-out");
+  if (!out || !S.cmp || !S.cmp.open || !S.project || S.cmp.pid !== S.project.id) return;
+  if (_pressed && out.contains(_pressed)) return refreshRunCmpSoon();   // a click under way: after it
+  loadRunCompare();
+}, 1500);
 const refreshCmpSoon = debounce(async () => {
   const R = S.resShown;
   if (!R || !S.project || S.project.id !== R.pid || !R.el.isConnected) return;
@@ -3479,7 +3608,7 @@ function storageHtml(sto) {
       <div><b>${esc(STORAGE_LABELS[k][0])}</b> <span class="muted small">${esc(STORAGE_LABELS[k][1])}</span></div>
       <div class="small">保存先: ${esc(s.dir)} <span class="muted">${s.base ? "" : "（既定）"}${gb(s.free)}</span></div>
       ${s.others.map((o) => `<div class="small muted">・前の置き場所（中身はそのまま使えます）: ${esc(o.dir)}${o.exists ? "" : ` <span class="warntext">見つかりません（ドライブが外れているかもしれません）</span>`}</div>`).join("")}
-      <div class="row" style="margin-top:6px"><input type="text" data-stobase="${k}" style="flex:1;min-width:260px" value="${esc(s.base || "")}" placeholder="元フォルダー（例: D:\LoRAtelier）">
+      <div class="row" style="margin-top:6px"><input type="text" data-stobase="${k}" style="flex:1;min-width:260px" value="${esc(s.base || "")}" placeholder="元フォルダー（例: D:\\LoRAtelier）">
         <button data-stoset="${k}">変更</button>${s.base ? `<button data-storeset="${k}">既定に戻す</button>` : ""}</div>
       ${s.others.length ? `<details data-stomove="${k}" style="margin-top:6px"><summary class="small">置き場所のあいだで移す</summary><div class="small muted">読み込み中…</div></details>` : ""}</div>`).join("")}
     <div id="s-movestate"></div></div>`;
@@ -3570,13 +3699,63 @@ const IG_SAMPLERS = ["euler_ancestral", "euler", "dpmpp_2m", "dpmpp_2m_sde", "dp
   "gradient_estimation", "sa_solver", "seeds_2", "seeds_3", "uni_pc_bh2"];
 const IG_SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple", "beta", "kl_optimal", "ddim_uniform", "linear_quadratic", "ays", "ays+", "ays_30", "gits"];
 
-async function renderSettings() {
+/* The settings page is drawn again as a whole when a download ends (the model lists change).  What the user has
+   typed into its fields and not sent yet, the open sections and the place on the page are put back afterwards
+   (settingsDraft / applySettingsDraft).  Only fields that are sent with a button: a field that saves on "change"
+   (those of i2t) would look saved without being so. */
+const detailsKey = (x) => x.dataset.stomove != null ? `stomove:${x.dataset.stomove}` : "s:" + (($("summary", x) || {}).textContent || "").replace(/[0-9]+/g, "").trim();
+function settingsDraft() {
+  const sel = (x) => x.id ? "#" + CSS.escape(x.id)
+    : x.dataset.choice != null ? `[data-choice="${CSS.escape(x.dataset.choice)}"][data-key="${CSS.escape(x.dataset.key || "")}"]`
+    : ["stobase", "file", "tok"].filter((k) => x.dataset[k] != null).map((k) => `[data-${k}="${CSS.escape(x.dataset[k])}"]`)[0] || null;
+  const d = { fields: [], open: [], y: window.scrollY, focus: null, det: null, tok: null, res: false };
+  $$("input, textarea, select", main).forEach((x) => {
+    const s = sel(x);
+    if (!s || x.closest("#s-i2t") || ["checkbox", "radio", "file"].includes(x.type)) return;
+    if (x.tagName === "SELECT" && x.id !== "s-variant" && x.dataset.choice == null) return;   // the other lists save at once
+    const dflt = x.tagName === "SELECT" ? ([...x.options].find((o) => o.defaultSelected) || x.options[0] || {}).value : x.defaultValue;
+    if (x.value !== dflt) d.fields.push([s, x.value]);
+    if (x === document.activeElement) { let a = null, b = null; try { a = x.selectionStart; b = x.selectionEnd; } catch { /* not a text field */ } d.focus = [s, a, b]; }
+  });
+  d.open = $$("details[open]", main).filter((x) => !x.closest("#s-i2t")).map(detailsKey);
+  const det = $("#s-det"), tok = $("#im-token"), res = $("#im-res");
+  if (det && det.textContent.trim() !== "—") d.det = det.innerHTML;
+  if (tok && !tok.hidden) d.tok = tok.innerHTML;
+  d.res = !!(res && res.innerHTML.trim());
+  return d;
+}
+/* Puts back what is on the page by now and forgets it; called again when the parts drawn later have come. */
+function applySettingsDraft(d) {
+  if (!d || S.route[0] !== "settings") return;
+  const tok = $("#im-token"), det = $("#s-det");
+  if (d.tok && tok && tok.hidden) { tok.hidden = false; tok.innerHTML = d.tok; if ($("#im-retry")) $("#im-retry").onclick = () => resolveLink(); d.tok = null; }
+  if (d.det && det) { det.innerHTML = d.det; d.det = null; }
+  for (let pass = 0; pass < 2; pass++) {   // twice: the kind (#s-variant) draws the file fields that are restored after it
+    d.fields = d.fields.filter(([s, v]) => {
+      const x = $(s, main);
+      if (!x) return true;
+      if (x.tagName === "SELECT" && ![...x.options].some((o) => o.value === v)) return false;
+      x.value = v;
+      if (x.id === "s-variant" && x.onchange) x.onchange();
+      return false;
+    });
+  }
+  d.open = d.open.filter((k) => { const x = $$("details", main).find((y) => !y.open && detailsKey(y) === k); if (x) x.open = true; return !x; });
+  if (d.res && IMPORT && $("#im-link") && $("#im-link").value.trim() === IMPORT.link) { drawResolved(); d.res = false; }
+  const f = d.focus && $(d.focus[0], main);
+  if (f) { f.focus({ preventScroll: true }); try { if (d.focus[1] != null) f.setSelectionRange(d.focus[1], d.focus[2]); } catch { /* not a text field */ } d.focus = null; }
+}
+
+/* keep: a redraw the user did not ask for (a download ended) - see settingsDraft */
+async function renderSettings(keep = false) {
   const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>設定</span>`;
   let d, st, lib, sto;
   try { lib = await api("/api/library"); [d, st, sto] = await Promise.all([api("/api/models"), api("/api/status"), api("/api/storage")]); } catch (e) { return navStale(nav) ? undefined : fail(e); }
   if (navStale(nav)) return;
+  const kept = keep === true ? settingsDraft() : null;
+  if (kept) main.style.minHeight = `${main.offsetHeight}px`;   // the page keeps its length while its parts load: the view does not jump
   // families whose variant cannot always be read from the file (SDXL: Illustrious / Pony ..., Z-Image: Turbo / Base)
   const famVariants = (fam) => Object.entries(d.variants).filter(([, v]) => v.family === fam && v.available !== false);
   const vopts = Object.entries(d.variants).filter(([, v]) => v.available !== false).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("");
@@ -3602,7 +3781,7 @@ async function renderSettings() {
       <div class="muted small">ここに置いたモデルは自動で一覧に出て、画像の生成にも学習にも使えます（コピーはしません）。checkpoint は <b>checkpoints</b>、LoRA は <b>loras</b> に置いてください。</div>
       ${lib.default_dirs.map((x) => `<div class="small">・${esc(x)}</div>`).join("")}
       ${lib.roots.map((x) => `<div class="row small">・${esc(x)} <span class="muted">（追加した場所）</span><button data-rmroot="${esc(x)}">外す</button></div>`).join("")}
-      <div class="row" style="margin-top:8px"><input type="text" id="s-root" style="flex:1;min-width:260px" placeholder="ComfyUI のフォルダーや、ほかのソフトのモデルフォルダー（例: D:\ComfyUI、D:\forge\models\Lora）">
+      <div class="row" style="margin-top:8px"><input type="text" id="s-root" style="flex:1;min-width:260px" placeholder="ComfyUI のフォルダーや、ほかのソフトのモデルフォルダー（例: D:\\ComfyUI、D:\\forge\\models\\Lora）">
         <button id="s-addroot">場所を追加</button></div>
       <div class="muted small">ComfyUI のフォルダーを指定すると、その models フォルダーと、extra_model_paths.yaml に書かれた別の置き場所もまとめて読みます。ファイルはコピーせず、ComfyUI と同じファイルを生成にも学習にも使います。指定したフォルダー以外は読みません。</div>
       <details style="margin-top:8px"><summary class="small">見つかったファイル（checkpoint ${lib.checkpoints.length}・LoRA ${lib.loras.length}）</summary>
@@ -3647,10 +3826,7 @@ async function renderSettings() {
       <div style="margin-top:6px"><a href="#/dict"><button class="small">辞書を開く</button></a></div></div>
     <div id="s-i2t"></div>
     <div class="panel" style="margin-top:14px"><h2>ログ</h2><div id="s-logs" class="small muted">読み込み中…</div></div>`;
-  drawAppLogs();
-  drawCatalog();
-  drawShare();
-  drawI2tSettings();
+  const parts = [drawAppLogs(), drawCatalog(), drawShare(), drawI2tSettings()];   // drawn when their answers come
   bindImport();
   const extra = () => {
     const fam = d.variants[$("#s-variant").value].family;
@@ -3733,6 +3909,12 @@ async function renderSettings() {
     try { await api("/api/ui", { method: "PUT", body: { blur_images: e.target.checked } }); }
     catch (err) { e.target.checked = !e.target.checked; document.documentElement.classList.toggle("blurimg", e.target.checked); fail(err); }
   };
+  if (kept) {
+    applySettingsDraft(kept);
+    window.scrollTo(0, kept.y);
+    parts.forEach((p) => p.then(() => { if (!navStale(nav)) applySettingsDraft(kept); }, () => {}));
+    Promise.allSettled(parts).then(() => { main.style.minHeight = ""; });
+  }
 }
 
 /* 設定 → 再起動: the server starts a new one in a new window and ends; this page waits for the new one (another boot
@@ -3886,8 +4068,8 @@ async function drawShare() {
   const gb = (b) => (b / 1e9).toFixed(1);
   const typed = $("#s-comfy", el), typing = typed && document.activeElement === typed;   // redrawn every 2 s while scanning
   el.innerHTML = `<h2>ComfyUI とファイルを共用</h2>
-    <div class="muted small">ComfyUI のフォルダーを指定すると、作った LoRA を書き出したときに ComfyUI の loras\${"LoRAStudio"} フォルダーにも置きます（手持ちの LoRA とは別のフォルダーです）。また、このツールの models フォルダーと ComfyUI に同じファイルがあるときは、1 つのファイルにまとめられます。どちらもハードリンクなので容量は増えず、ツールも ComfyUI も今までと同じ場所から読めます。</div>
-    <div class="row" style="margin-top:8px"><input type="text" id="s-comfy" style="flex:1;min-width:260px" value="${esc(st.comfy_dir || "")}" placeholder="ComfyUI のフォルダー（例: E:\AI\ComfyUI）">
+    <div class="muted small">ComfyUI のフォルダーを指定すると、作った LoRA を書き出したときに ComfyUI の loras\\LoRAStudio フォルダーにも置きます（手持ちの LoRA とは別のフォルダーです）。また、このツールの models フォルダーと ComfyUI に同じファイルがあるときは、1 つのファイルにまとめられます。どちらもハードリンクなので容量は増えず、ツールも ComfyUI も今までと同じ場所から読めます。</div>
+    <div class="row" style="margin-top:8px"><input type="text" id="s-comfy" style="flex:1;min-width:260px" value="${esc(st.comfy_dir || "")}" placeholder="ComfyUI のフォルダー（例: D:\\ComfyUI）">
       <button id="s-comfy-save">保存</button></div>
     ${st.export_dir ? `<div class="small" style="margin-top:4px">作った LoRA の置き場所（ComfyUI 側）: ${esc(st.export_dir)}</div>` : ""}
     ${st.comfy_dir ? `<div class="row" style="margin-top:8px"><button id="s-dup" ${sc.state === "running" ? "disabled" : ""}>同じファイルを調べる</button>
@@ -3976,7 +4158,7 @@ async function drawCatalog() {
   // when the model still does not count as added, e.g. a component it needs is not ready)
   const fresh = cat.items.filter((x) => x.dl && x.dl.state === "done" && !x.installed_model && !_catReloaded.has(x.id));
   if (cat.items.some((x) => x.dl && x.dl.state === "running")) pollLater("catalog", 3000, () => { if (S.route[0] === "settings") drawCatalog(); });
-  else if (fresh.length) { fresh.forEach((x) => _catReloaded.add(x.id)); pollLater("catalog", 1000, () => { if (S.route[0] === "settings") renderSettings(); }); }
+  else if (fresh.length) { fresh.forEach((x) => _catReloaded.add(x.id)); pollLater("catalog", 1000, () => { if (S.route[0] === "settings") renderSettings(true); }); }
 }
 const _catReloaded = new Set();
 
@@ -4130,7 +4312,7 @@ async function renderLoraSettings() {
           <button class="small" id="lc-vall">呼び出し語が空の LoRA をまとめて調べる</button></div>`}
         ${items.map(card).join("")}` : "";
     }).join("")
-      : `<div class="muted small">${S.lib.loras.length ? "一致する LoRA がありません。" : "LoRA が見つかりません。models\loras に置くか、設定画面の「リンク・ファイルから追加」で追加してください。"}</div>`;
+      : `<div class="muted small">${S.lib.loras.length ? "一致する LoRA がありません。" : "LoRA が見つかりません。models\\loras に置くか、設定画面の「リンク・ファイルから追加」で追加してください。"}</div>`;
     $$("[data-lc]").forEach(bindLoraConfRow);
     const va = $("#lc-vall");
     if (va) va.onclick = async () => {
@@ -4782,7 +4964,9 @@ async function igJaShow() {
       done.push([box, el, map, joinChips(shown)]);
       all.push(...flat.filter((c) => !JA_RE.test(c)));
     }
-    IGJ.missing = all.length ? await i2tCall("missing_ja", all, []) : [];
+    // true: every word without Japanese, also the ones the translation model left untranslated before - this list
+    // is where they are registered by hand, and it starts no translation by itself
+    IGJ.missing = all.length ? await i2tCall("missing_ja", all, [], true) : [];
     for (const [box, el, map, text] of done) { IGJ.shown[box] = map; el.value = text; }   // both boxes at once, only when all worked
     $("#ig-jamsg").textContent = "日本語で表示中（保存と生成には英語を使います）";
   } catch (e) {
@@ -5618,7 +5802,7 @@ new MutationObserver((muts) => {
 // a caption typed just before the tab is closed or reloaded is still saved (the autosave waits 600 ms)
 window.addEventListener("pagehide", () => {
   S.unloading = true;
-  try { flushSaves(); } finally { S.unloading = false; }
+  try { commitFocused(); flushSaves(); } finally { S.unloading = false; }
   const c = S.capPending;
   if (!c) return;
   S.capPending = null;

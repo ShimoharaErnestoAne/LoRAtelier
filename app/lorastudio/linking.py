@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from . import config
-from .models import comfy_model_dirs
+from .models import comfy_model_dirs, sample_digest
 
 COMFY_SUBDIRS = ("checkpoints", "diffusion_models", "unet", "loras", "text_encoders", "clip", "vae")
 EXPORT_SUBDIR = "LoRAStudio"
@@ -115,8 +115,9 @@ def _files(dirs) -> list[Path]:
 
 
 def find_duplicates(progress=None) -> list[dict]:
-    """Files under LoRAtelier's models/ that ComfyUI also has.  Candidates are matched by exact size and
-    confirmed by SHA-256 (the whole file is read once per file; cached while the app runs)."""
+    """Files under LoRAtelier's models/ that ComfyUI also has.  Candidates are matched by exact size, sieved by
+    three 1MB pieces (SDXL fp16 checkpoints all have the same size: most pairs end here) and confirmed by SHA-256
+    (the whole file is read once per file; cached while the app runs)."""
     cd = comfy_dir()
     if not cd:
         return []
@@ -135,6 +136,8 @@ def find_duplicates(progress=None) -> list[dict]:
             try:
                 if os.path.samefile(f, c):
                     item["status"] = "linked"          # already one file
+                elif sample_digest(f) != sample_digest(c):
+                    continue                           # three 1MB pieces differ: not read in full (below)
                 elif _sha256(f) != _sha256(c):
                     continue                           # same size, different contents (all SDXL fp16 files are the same size)
                 elif not same_drive(f, c):

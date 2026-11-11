@@ -56,7 +56,7 @@ except ImportError:
 
 APP_NAME = "i2t"  # 画面に出す名前
 APP_ID = "i2t"  # ファイル名・CLI・HTTP の User-Agent 用 (User-Agent は ASCII しか送れない)
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 FROZEN = bool(getattr(sys, "frozen", False))  # PyInstaller で exe 化されているか
 # exe のときは exe の隣、スクリプトのときはスクリプトの隣に config.json と models/ を置く
 APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
@@ -158,6 +158,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mosaic_strength": "strong",  # normal | strong | max (MOSAIC_LEVELS)
     "split_extras": False,  # カメラ・照明・画風のタグを本文から外し、追加プロンプト側だけに出す
     "split_background": False,  # 背景のタグを本文から外し、本文を被写体だけにする (背景は追加プロンプト側)
+    # 仕上げの書き直し (文章の出力先。タガー + VLM のとき): 集めた内容を VLM にもう一度渡して、出力先の書き方で
+    # 1 つの文章に書き直させる (画像は見せない)。内容が落ちたら使わない。VLM の呼び出しが 1 回増える
+    "polish_prose": True,
     "preview_mosaic": False,  # プレビュー画像をモザイク表示する (表示だけ。出力には影響しない)
     # 結果をチップ (, 区切りの塊) で表示し、選んで Del で消す・日本語訳で見る。Ollama があるときだけ有効
     "result_chips": True,
@@ -172,7 +175,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 人物ごとに分ける: 2 人以上なら人物を検出して 1 人ずつ切り出してタグ付けし、人数タグは検出した人数で付け直す
     "split_persons": True,
     "gender": "none",  # 性別をそろえる: none | female (全員女性) | male (全員男性)
-    "remove_monochrome": False,  # 白黒の情報を消す: 元画像が白黒 (漫画・セピアなど) でも、白黒のタグを外してカラーで出す
+    # 画風を変える (MOSS-Image だけ): none | photo (実写) | anime | manga | watercolor | thick (厚塗り) | oil | pencil。
+    # 元の画像とは違う画風の画像として書く (先頭でその画風だと言い切り、元の画風の語を外し、描き方・質感の文を足す)
+    "restyle": "none",
+    # 年齢の見た目を書く: 人物ごとに画像から読んだ年齢層を、文とタグに書く (書かないと、生成する側のモデルの癖で年齢が決まる)
+    "age_look": True,
     # 同じ顔を避ける: 2 人以上なら「同じ人物・そっくりな人物が並ぶ」タグをネガティブに。双子や描き分けの少ない画風もあるので既定オフ
     "avoid_same_face": False,
     "avoid_duplicates": False,  # 分身を防ぐ (同じ人物の複製・コラージュ・複数アングル・残像・体の重複をネガティブに)
@@ -198,6 +205,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 MODES = {"single": "1 枚", "multi": "最大 8 枚 (メイン + ポーズ / 服装 / 背景 / 小物 / 体格 / 作風 / 表情)"}
 GENDER_MODES = {"none": "そろえない", "female": "全員女性", "male": "全員男性"}
+RESTYLE_MODES = {"none": "変えない", "photo": "実写", "anime": "アニメ風", "manga": "漫画風 (白黒)", "watercolor": "水彩",
+                 "thick": "厚塗り", "oil": "油絵", "pencil": "鉛筆画"}
 # 複数枚モードの参照枠。person は必須、ほかは任意で、空の枠の要素は 1 枚目 (person) から取る
 REF_SLOTS = {
     "person": "① メイン", "pose": "② ポーズ", "outfit": "③ 服装・小物", "background": "④ 背景", "props": "⑤ 小物",
@@ -298,6 +307,12 @@ def load_config() -> dict[str, Any]:
         cfg.pop(gone, None)  # スケベアップ / 検閲を消すは無くなった (古い config.json のキーは捨てる)
     if cfg.get("gender") not in GENDER_MODES:
         cfg["gender"] = DEFAULT_CONFIG["gender"]
+    if data.get("photoreal") is True and "restyle" not in data:
+        cfg["restyle"] = "photo"  # 「実写化」のチェックだったころの設定
+    cfg.pop("photoreal", None)
+    cfg.pop("age", None)  # 年齢の指定は無くなった
+    if cfg.get("restyle") not in RESTYLE_MODES:
+        cfg["restyle"] = DEFAULT_CONFIG["restyle"]
     # 手で編集した config.json の型違い (null や文字列の true など) は既定値に戻す
     for key, default in DEFAULT_CONFIG.items():
         value = cfg.get(key)
@@ -595,6 +610,13 @@ def download_tagger(name: str, progress: DownloadProgress | None = None, cancel:
 
 
 class WD14Tagger:
+    # __init__ を通らずに作ったタガー (テストの差し替え用) でも predict が動くよう、後から足した属性の既定値を置く
+    camie = False
+    pixai = False
+    rating_session = None
+    outputs = None  # None = モデルの出力すべて (WD タガーは 1 つ)
+    logits = False
+
     def __init__(self, name: str, progress: ProgressFn | None = None, cpu_only: bool = False):
         if name not in TAGGER_MODELS:
             raise ValueError(f"未知のタガーモデルです: {name}")
@@ -826,12 +848,313 @@ def force_person_gender(persons: list[dict[str, Any]], gender: str) -> list[dict
     return out
 
 
+# --------------------------------------------------------------------------
+# 年齢の見た目 (画像から読んだとおりに書く)
+# --------------------------------------------------------------------------
+# 出力に年齢が無いと、生成する側のモデルの癖で年齢が決まる (文章で書くモデルは 20 代の大人に、アニメ系のタグのモデルは
+# 若く寄る)。人物ごとに VLM が年齢層を選び、タガーの年齢のタグ (child / mature female / old man など) と合わせて、
+# 文とタグに書く。年齢を選ばせる欄は VLM_SCHEMA の age (1 人のとき) と persons の age (2 人以上)
+AGE_BANDS = ("baby", "toddler", "child", "preteen", "teen", "young adult", "thirties", "forties", "fifties", "sixties", "elderly")
+AGE_ENUM = [*AGE_BANDS, "unknown"]
+AGE_BAND_JA = {
+    "baby": "赤ちゃん", "toddler": "幼児 (1〜3 歳)", "child": "子ども (4〜9 歳)", "preteen": "10〜12 歳", "teen": "13〜17 歳",
+    "young adult": "18〜29 歳", "thirties": "30 代", "forties": "40 代", "fifties": "50 代", "sixties": "60 代",
+    "elderly": "70 歳以上", "middle-aged": "中年 (タガーの mature のタグから)",
+}
+AGE_MINOR = ("baby", "toddler", "child", "preteen", "teen")
+AGE_OLD = ("sixties", "elderly")
+# タガーの年齢のタグ → 年齢層。mature は幅が広いので「中年」とし、VLM が大人の年齢層を選んでいればそちらを使う
+AGE_TAG_BANDS = {
+    "baby": "baby", "toddler": "toddler", "child": "child", "female_child": "child", "male_child": "child",
+    "loli": "child", "shota": "child", "old": "elderly", "old_woman": "elderly", "old_man": "elderly",
+    "mature_female": "middle-aged", "mature_male": "middle-aged", "milf": "middle-aged",
+}
+AGE_VLM_GROUPS = ("baby (under 1), toddler (1-3), child (4-9), preteen (10-12), teen (13-17), young adult (18-29), thirties, "
+                  "forties, fifties, sixties, elderly (70 or older)")
+AGE_VLM_JUDGE = ("Judge from the face, the skin, the body proportions and the height against the surroundings; for a drawn "
+                 "character, from the age the drawing portrays. Do not fall back on young adult: choose the group that "
+                 "really fits, for children and for older people as well.")
+# 年齢の見た目を書くとき、VLM の文 (自然文・被写体・人物ごとの説明) にも年齢に合った言い方をさせる
+AGE_VLM = (
+    "Apparent age: in natural_prompt, subject and every description, whenever you refer to a person with a common noun, "
+    "use wording that fits the age group you choose for them in the age fields (for example 'a little girl', "
+    "'a preteen boy', 'a teenage girl', 'a woman in her forties', 'an elderly man') instead of a generic "
+    "'young woman' or 'girl'. This is about the common noun only: where you would write a character's name, keep "
+    "writing the name."
+)
+_AGE_PREFIX = {"baby": "baby", "toddler": "toddler", "child": "little", "preteen": "preteen", "teen": "teenage",
+               "elderly": "elderly", "middle-aged": "middle-aged"}
+_AGE_DECADE = {"young adult": "twenties", "thirties": "thirties", "forties": "forties", "fifties": "fifties",
+               "sixties": "sixties"}
+
+
+def clean_age(value: Any) -> str:
+    """VLM が返した年齢層。決めた語以外 (unknown も) は空にする。"""
+    text = str(value or "").strip().lower().replace("_", " ")
+    return text if text in AGE_BANDS else ""
+
+
+def age_from_tags(tag_list: list[str]) -> str:
+    """タガーの年齢のタグから年齢層を決める (無ければ空)。幼いほうから見る。"""
+    keys = {_tag_key(t) for t in tag_list}
+    for band in ("baby", "toddler", "child", "elderly", "middle-aged"):
+        if any(AGE_TAG_BANDS.get(k) == band for k in keys):
+            return band
+    return ""
+
+
+def merge_age(vlm_band: str, tag_band: str) -> str:
+    """VLM が選んだ年齢層とタガーのタグを合わせる。子どもかどうか・高齢かどうかが食い違えばタガーのタグ
+    (その語で学習しているぶん確か)、食い違わなければ細かく読める VLM のほう。"""
+    if not vlm_band or not tag_band:
+        return vlm_band or tag_band
+    if (vlm_band in AGE_MINOR) != (tag_band in AGE_MINOR):
+        return tag_band
+    if tag_band == "elderly" and vlm_band not in AGE_OLD:
+        return tag_band
+    return vlm_band
+
+
+def age_noun_en(person: dict[str, Any], article: bool = True) -> str:
+    """人物を年齢に合った言い方で呼ぶ名詞句 (a little girl of elementary-school age / a teenage boy /
+    a woman in her forties / an elderly man)。年齢が分からなければ a woman / a man / a person。"""
+    subject, band = person.get("subject", ""), person.get("age", "")
+    minor = band in AGE_MINOR
+    noun = ({"girl": "girl", "boy": "boy"} if minor else {"girl": "woman", "boy": "man"}).get(
+        subject, "child" if minor else "person")
+    if subject not in ("girl", "boy") and band in ("baby", "toddler"):
+        phrase = band
+    elif subject not in ("girl", "boy") and band == "teen":
+        phrase = "teenager"
+    else:
+        phrase = " ".join(x for x in (_AGE_PREFIX.get(band, ""), noun) if x)
+    if band == "child":
+        phrase += " of elementary-school age"
+    elif band in _AGE_DECADE:
+        phrase += f" in {({'girl': 'her', 'boy': 'his'}).get(subject, 'their')} {_AGE_DECADE[band]}"
+    return _with_article(phrase, capital=False) if article else phrase
+
+
+def group_noun_en(persons: list[dict[str, Any]]) -> str:
+    """全員をまとめて呼ぶ語 (women / men / girls / boys)。性別か、子どもと大人が混ざれば people。"""
+    genders = {p.get("subject") for p in persons}
+    minors = {p.get("age") in AGE_MINOR for p in persons}
+    if len(genders) != 1 or len(minors) != 1:
+        return "people"
+    minor = True in minors
+    return ({"girl": "girls", "boy": "boys"} if minor else {"girl": "women", "boy": "men"}).get(
+        next(iter(genders)), "children" if minor else "people")
+
+
+def without_age_tags(person: dict[str, Any]) -> list[str]:
+    """文に書く人物の特徴。年齢を名詞のほうに書いたときは、年齢のタグ (child / mature female など) を重ねて書かない。"""
+    return [t for t in person["tags"] if not (person.get("age") and _tag_key(t) in AGE_TAG_BANDS)]
+
+
+def age_tags_for(subject: str, band: str) -> list[str]:
+    """タグの出力先に足す年齢のタグ (Danbooru の語。10 代と 20 代に当たるタグは無いので足さない)。"""
+    known = subject in ("girl", "boy")
+    if band in ("baby", "toddler"):
+        return [band]
+    if band in ("child", "preteen"):
+        return ["child"] + ([{"girl": "female child", "boy": "male child"}[subject]] if known else [])
+    if band in ("thirties", "forties", "fifties", "middle-aged"):
+        return [{"girl": "mature female", "boy": "mature male"}[subject]] if known else []
+    if band in AGE_OLD:
+        return [{"girl": "old woman", "boy": "old man"}.get(subject, "old")]
+    return []
+
+
+def with_age_tags(person: dict[str, Any]) -> dict[str, Any]:
+    """人物の区画の先頭 (1girl などのすぐ後ろ) に年齢のタグを足す。すでにあるタグは足さない。"""
+    have = {_tag_key(t) for t in list(person.get("tags") or []) + list(person.get("common") or [])}
+    add = [t for t in age_tags_for(person.get("subject", ""), person.get("age", "")) if _tag_key(t) not in have]
+    if not add:
+        return person
+    parts = [x for x in str(person.get("prompt") or "").split(", ") if x]
+    head = parts[:1] if parts and _tag_key(parts[0]) in PERSON_COUNT_TAGS else []
+    return person | {"tags": add + list(person.get("tags") or []),
+                     "prompt": ", ".join(dedup(head + add + parts[len(head):]))}
+
+
+def age_negatives(people: list[tuple[str, str]]) -> list[str]:
+    """年齢がずれないようにネガティブへ入れるタグ。people は人物ごとの (性別, 年齢層)。全員が大人なら幼くなるのを、
+    全員が子どもなら大人になるのを抑える。読めなかった人がいるとき・子どもと大人が混ざるときは入れない
+    (片方を打ち消してしまう)。"""
+    if not people or not all(band for _, band in people):
+        return []
+    subjects = {s for s, _ in people}
+    if all(band not in AGE_MINOR for _, band in people):
+        return ["child", "aged down"] + (["loli"] if "girl" in subjects else []) + (["shota"] if "boy" in subjects else [])
+    if all(band in AGE_MINOR for _, band in people):
+        return ["aged up"] + (["mature female"] if "girl" in subjects else []) + (["mature male"] if "boy" in subjects else [])
+    return []
+
+
+def age_negatives_prose(people: list[tuple[str, str]]) -> list[str]:
+    """age_negatives の、文章で書く出力先 (MOSS-Image のネガティブ欄) 向けの語。Danbooru のタグではなく、ふつうの英語で書く。
+    全員が大人なら幼く・若くなるのを、全員が子どもなら大人になるのを抑える。読めなかった人がいるとき・子どもと大人が
+    混ざるときは入れない。"""
+    bands = [band for _, band in people]
+    if not bands or not all(bands):
+        return []
+    if all(b not in AGE_MINOR for b in bands):
+        older = all(b not in ("young adult", "thirties") for b in bands)  # 40 代から上だけ: 20 代に寄るのも抑える
+        return ["child", "childlike face", "teenager"] + (["young adult", "youthful face"] if older else [])
+    if all(b in AGE_MINOR for b in bands):
+        return ["adult", "mature face", "middle-aged"] + (["teenager"] if all(b != "teen" for b in bands) else [])
+    return []
+
+
+def single_subject(tags: TagResult) -> str:
+    """1 人の画像の性別 (人数タグから)。1girl だけなら girl、1boy だけなら boy、ほかは other。"""
+    names = {n for n, _ in tags.general}
+    girl, boy = "1girl" in names, "1boy" in names
+    return "girl" if girl and not boy else "boy" if boy and not girl else "other"
+
+
+def assign_ages(
+    persons: list[dict[str, Any]], vlm_age: str, numbered: list[dict[str, Any]], tags: TagResult, nsfw: bool,
+    single: bool,
+) -> tuple[list[dict[str, Any]], str, str]:
+    """人物ごとの年齢層を決める。2 人以上なら persons の各人に "age" を入れ、1 人 (single) ならその年齢層を返す。
+    VLM の読み (2 人以上は persons の age か、番号付きの枠の番号で結び付けた age) とタガーのタグを merge_age で合わせる。
+    性的な内容の画像 (nsfw) では、18 歳未満に見える人物の年齢は書かない。戻り値: (人物, 1 人のときの年齢層, 分析メモの行)。"""
+    out = [dict(p) for p in persons]
+    if len(out) >= 2:
+        by_number = {e.get("number"): e.get("age", "") for e in numbered}
+        for i, person in enumerate(out, 1):
+            vlm_band = person.get("age") or by_number.get(i, "")
+            person["age"] = merge_age(vlm_band, age_from_tags(list(person.get("tags") or []) + list(person.get("common") or [])))
+        bands = [p["age"] for p in out]
+    elif single:
+        bands = [merge_age(vlm_age, age_from_tags([n for n, _ in tags.general]))]
+    else:
+        return out, "", ""
+    held = nsfw and any(b in AGE_MINOR for b in bands)
+    if held:
+        bands = ["" if b in AGE_MINOR else b for b in bands]
+        for person, band in zip(out, bands, strict=False):
+            person["age"] = band
+    if len(out) >= 2:
+        read = "、".join(f"人物 {i} = {AGE_BAND_JA.get(b, '読めませんでした')}" for i, b in enumerate(bands, 1))
+    else:
+        read = AGE_BAND_JA.get(bands[0], "")
+    note = ""
+    if any(bands):
+        note = f"\n年齢の見た目 (画像から読んで本文に書きました。VLM とタガーの読み取りなので、外れることがあります): {read}"
+    if held:
+        note += "\n年齢の見た目: 性的な内容と判定した画像では、18 歳未満に見える人物の年齢は書けません"
+    return out, ("" if len(out) >= 2 else bands[0]), note
+
+
+_AGE_SAID = {
+    "baby": r"\b(?:baby|babies|infant|newborn)\b",
+    "toddler": r"\btoddlers?\b",
+    "child": r"\b(?:little|small)\s+(?:girl|boy|child|kid)\b|\byoung\s+child\b|\belementary[- ]school\b",
+    "preteen": r"\bpre-?teen|\btween\b",
+    "teen": r"\bteen(?:s|age|aged|ager)?\b|\badolescent\b",
+    "young adult": r"\btwenties\b|\b20s\b|\byoung\s+(?:adult|woman|man|lady)\b",
+    "thirties": r"\bthirties\b|\b30s\b", "forties": r"\bforties\b|\b40s\b", "fifties": r"\bfifties\b|\b50s\b",
+    "sixties": r"\bsixties\b|\b60s\b",
+    "elderly": r"\b(?:elderly|senior|seventies|eighties|nineties|70s|80s)\b|\bold\s+(?:woman|man|lady|person)\b",
+    "middle-aged": r"\bmiddle[- ]aged\b|\bmature\b",
+}
+_AGE_ADJ = (r"(?:very\s+)?(?:young|younger|little|small|adult|grown-up|grown|mature|middle-aged|elderly|old|older|aged|"
+            r"teenage|teen|adolescent|youthful|preteen|pre-teen),?\s+")
+# 冠詞と名詞の間は形容詞だけ (a slender young woman)。前置詞や冠詞をまたがない (the back of a woman の the からは取らない)
+_AGE_NP_RE = re.compile(
+    r"\b(?P<art>an?|the|one)\s+"
+    r"(?P<mid>(?:(?!(?:of|with|and|or|in|on|at|by|to|for|from|the|an?|is|as|her|his|their)\b)[a-z][a-z-]*,?\s+){0,3}?)"
+    r"(?P<noun>woman|girl|man|boy|lady|gentleman|female|male|person|child|kid|teenager|toddler|baby)\b"
+    r"(?P<suffix>\s+of\s+elementary-school\s+age|\s+in\s+(?:her|his|their)\s+(?:early\s+|mid[- ]|late\s+)?"
+    r"(?:teens|twenties|thirties|forties|fifties|sixties|seventies|eighties|[1-9]0s))?",
+    re.IGNORECASE)
+_AGE_FEMALE = {"woman", "girl", "lady", "female"}
+_AGE_MALE = {"man", "boy", "gentleman", "male"}
+
+
+def age_mentioned(text: str, band: str) -> bool:
+    """文が、その年齢層だと分かる言い方をもうしているか (引用符の中は画像の文字なので見ない)。"""
+    plain = re.sub(r'"[^"]*"', " ", text)
+    return bool(band in _AGE_SAID and re.search(_AGE_SAID[band], plain, re.IGNORECASE))
+
+
+def apply_age_text(text: str, persons: list[dict[str, Any]], main_age: str, subject: str = "other") -> str:
+    """文章の本文に年齢を書く。1 人なら、人物を呼んでいる最初の名詞句 (a young woman など) を年齢に合った言い方に
+    言い換え、後ろの the woman / the girl も合わせる。名詞句が無ければ一文を足す。2 人以上は、各人の年齢が文から
+    読み取れなければ、左からの並びで一文を足す。年齢がもう書いてあれば何もしない。"""
+    if len(persons) >= 2:
+        known = [p for p in persons if p.get("age")]
+        if not known or all(age_mentioned(text, p["age"]) for p in known):
+            return text
+        nouns = [age_noun_en(p) for p in persons]
+        return text.rstrip() + f" From left to right, the people are {', '.join(nouns[:-1])} and {nouns[-1]}."
+    if not main_age or age_mentioned(text, main_age):
+        return text
+    done = [""]
+
+    def named(m: "re.Match[str]") -> str:
+        if done[0]:
+            return m.group(0)
+        noun = m.group("noun").lower()
+        who = "girl" if noun in _AGE_FEMALE else "boy" if noun in _AGE_MALE else subject
+        done[0] = who
+        mid = re.sub(_AGE_ADJ, "", m.group("mid"), flags=re.IGNORECASE)
+        phrase = mid + age_noun_en({"subject": who, "age": main_age}, article=False)
+        art = m.group("art")
+        if art.lower() in ("a", "an"):
+            new = "an" if phrase[:1].lower() in "aeiou" else "a"
+            art = new.capitalize() if art[:1].isupper() else new
+        return f"{art} {phrase}"
+
+    out = _unquoted_sub(_AGE_NP_RE, named, text)
+    if not done[0]:
+        return out.rstrip() + f" The person shown is {age_noun_en({'subject': subject, 'age': main_age})}."
+    # 後ろで同じ人を呼ぶ the young woman / the girl も合わせる (1 人の画像なので、ほかの人を指すことは無い)
+    minor = main_age in AGE_MINOR
+    again = re.compile(r"\b(the|this|that)\s+(?:" + _AGE_ADJ + r")*(woman|lady|girl|man|gentleman|boy)\b", re.IGNORECASE)
+
+    def same(m: "re.Match[str]") -> str:
+        female = m.group(2).lower() in _AGE_FEMALE
+        return f"{m.group(1)} " + (("girl" if female else "boy") if minor else ("woman" if female else "man"))
+
+    return _tidy_prose(_unquoted_sub(again, same, out))
+
+
 GENDER_VLM = {
     "female": "Every person in the image is a woman. Describe all of them as women or girls and use she/her; "
               "fill persons with subject 'girl'.",
     "male": "Every person in the image is a man. Describe all of them as men or boys and use he/him; "
             "fill persons with subject 'boy'.",
 }
+
+
+def _unquoted_sub(pattern: "re.Pattern[str]", repl: Any, text: str, count: int = 0) -> str:
+    """二重引用符の外だけを置き換える (引用符の中は画像の文字の書き写しなので変えない)。count は全体での回数 (0 = すべて)。"""
+    parts = re.split(r'("[^"]*")', text)
+    left = count
+    for i in range(0, len(parts), 2):
+        if count and left <= 0:
+            break
+        parts[i], n = pattern.subn(repl, parts[i], count=left if count else 0)
+        left -= n
+    return "".join(parts)
+
+
+def _tidy_prose(text: str) -> str:
+    """語を抜いた後の文を整える (空白・句読点・文頭の大文字)。"""
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r",(?:\s*,)+", ",", text)
+    text = re.sub(r"([.!?])\s*,\s*", r"\1 ", text)
+    # 語を抜いた後の冠詞 (an anime girl → an girl → a girl、a stylized elf → a elf → an elf)。u / eu / one で始まる語は
+    # 子音の音が多いので触らない (a uniform)
+    text = re.sub(r"\b([Aa])n (?=[b-df-gj-np-tv-z])", r"\1 ", text)
+    text = re.sub(r"\b([Aa]) (?=(?!one\b|once\b|eu)[aeioAEIO]\w)", r"\1n ", text)
+    text = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), text.strip())
+    return text
 
 
 def format_weight(tag: str, weight: float | None, target: str) -> str:
@@ -1346,7 +1669,12 @@ def order_reference_tags(tags: TagResult, tag_source: dict[str, str], vlm_tags: 
             if loose_tag_key(t) not in have:
                 have.add(loose_tag_key(t))
                 groups[slot].append(t)
-    return head + [t for slot in _MERGE_ORDER for t in groups[slot]]
+    order = _MERGE_ORDER
+    if "style" in tag_source.values():
+        # ⑦ 作風・質感を入れたときは、画風のタグを人数・キャラ名のすぐ後ろに置く (NoobAI などの推奨の並びでも作者・画風は
+        # 一般タグの前)。後ろのままだと、長いプロンプトで CLIP の後ろの区画に押し出されて、① の絵柄に負ける
+        order = ("style",) + tuple(s for s in _MERGE_ORDER if s != "style")
+    return head + [t for slot in order for t in groups[slot]]
 
 
 # VLM が返しがちな、特徴を表さない区分だけの語 (実機の qwen2.5vl がネガティブに face / hair / body / other outfits を入れた)
@@ -2073,19 +2401,19 @@ def describe_persons_en(persons: list[dict[str, Any]], target: str = "") -> str:
     """人物を左から順に 1 人 1 文で書く英文。最初に人数を肯定文で書く (Qwen-Image の left → centre → right の順、
     Anima の「名前だけでなく外見を文で」に合わせる)。否定文は GPT Image 向けのときだけ最後に付ける。"""
     genders = {p["subject"] for p in persons}
-    noun = {"girl": "women", "boy": "men"}.get(next(iter(genders)), "people") if len(genders) == 1 else "people"
+    noun = group_noun_en(persons)
     count = NUMBER_EN.get(len(persons), str(len(persons)))
     sentences = [f"{count.capitalize()} {noun} appear in the scene, described from left to right."]
     common = persons[0].get("common") or []
     if common:
         everyone = "Both" if len(persons) == 2 else f"All {count}"
-        sentences.append(f"{everyone} share these features: {_plain(common)}.")
+        sentences.append(f"{everyone} share these features: {_plain_prose(common)}.")
     for person in persons:
-        who = {"girl": "a woman", "boy": "a man"}.get(person["subject"], "a person")
+        who = age_noun_en(person)
         position = str(person["position"])
         lead = position_phrase_en(position).capitalize() if position in ("left", "right", "center") or position.startswith(("left,", "right,", "center,")) \
             else position[:1].upper() + position[1:]
-        features = _plain(person["tags"])
+        features = _plain_prose(without_age_tags(person))
         sentences.append(f"{lead}, {who}" + (f" with {features}." if features else "."))
     sentences += [text for text, _ in interaction_lines(persons)]
     if target in PROSE_ALLOWS_NEGATION:
@@ -2095,7 +2423,7 @@ def describe_persons_en(persons: list[dict[str, Any]], target: str = "") -> str:
 
 def person_lead_en(person: dict[str, Any]) -> str:
     """人物を位置で呼ぶ英語 ('The woman on the left' / 'The man second from the left')。"""
-    who = {"girl": "woman", "boy": "man"}.get(person.get("subject", ""), "person")
+    who = age_noun_en(person, article=False)
     position = str(person.get("position") or "")
     if position in ("left", "right", "center") or position.startswith(("left,", "right,", "center,")):
         return f"The {who} {position_phrase_en(position)}"
@@ -2110,7 +2438,7 @@ def flux_structured_prompt(
     subjects = []
     relations = interaction_lines(persons)
     for index, person in enumerate(persons):
-        who = {"girl": "a woman", "boy": "a man"}.get(person["subject"], "a person")
+        who = age_noun_en(person)
         everything = dedup(list(person.get("common") or []) + person["tags"])
         pose = [t for t in everything if person_tag_priority(t) == 3]
         look = [t for t in everything if person_tag_priority(t) != 3]
@@ -2149,13 +2477,96 @@ MJ_NO_SKIP = {
 MJ_NO_MAX = 10
 
 
-def count_phrase_en(tag: str) -> str:
-    """人数タグを英語の数の表現にする (2girls → two girls、1boy → a boy)。Midjourney は数を具体的に書くよう勧めている。"""
+# --------------------------------------------------------------------------
+# Danbooru の語 → ふつうの英語 (文章の出力先)
+# --------------------------------------------------------------------------
+# 文章を読む生成モデル (MOSS-Image / Krea 2 / Qwen-Image / Z-Image / FLUX など) は、Danbooru だけで通じる語
+# (cowboy shot、ahoge、zettai ryouiki など) を知らないか、弱くしか効かない。タグから文を組み立てるときは、この表で言い換える。
+# 表に無いタグはそのまま書く (long hair、school uniform のように、ふつうの英語として通じるものが大半)。空文字は書かない語
+DANBOORU_PLAIN = {
+    # 画角・アングル
+    "cowboy shot": "framed from the thighs up", "upper body": "upper body shot", "lower body": "lower body shot",
+    "full body": "full body shot", "portrait": "close-up portrait", "wide shot": "wide shot showing the surroundings",
+    "from above": "seen from above", "from below": "seen from below", "from side": "seen from the side",
+    "from behind": "seen from behind", "dutch angle": "tilted camera angle", "pov": "first-person point of view",
+    "foreshortening": "strong perspective foreshortening", "fisheye": "fisheye lens distortion",
+    # 視線・表情
+    "looking at viewer": "looking at the camera", "looking away": "looking away from the camera",
+    "looking back": "looking back over the shoulder", "looking afar": "gazing into the distance",
+    ":d": "wide open-mouthed smile", ":o": "mouth open in surprise", ":3": "cat-like smile", ":p": "tongue sticking out",
+    ";d": "winking with an open-mouthed smile", "^ ^": "eyes closed in a smile", "> <": "eyes squeezed shut",
+    "blush": "blushing cheeks", "light blush": "slightly blushing cheeks", "one eye closed": "winking",
+    "closed eyes": "eyes closed", "tsurime": "upturned eyes", "tareme": "downturned eyes", "jitome": "half-lidded flat stare",
+    "fang": "a small fang", "skin fang": "a small fang", "tongue out": "tongue sticking out",
+    "expressionless": "blank expression", "smug": "smug expression", "pout": "pouting", "nervous": "nervous expression",
+    # 髪
+    "ahoge": "a single upright strand of hair", "sidelocks": "locks of hair framing the face",
+    "hair between eyes": "bangs falling between the eyes", "blunt bangs": "straight-cut bangs",
+    "hair over one eye": "hair covering one eye", "twintails": "twin tails", "low twintails": "low twin tails",
+    "hime cut": "straight hime-style haircut", "bob cut": "bob haircut", "hair bun": "hair in a bun",
+    "double bun": "two hair buns", "drill hair": "ringlet curls", "twin drills": "twin ringlet curls",
+    "multicolored hair": "multi-coloured hair", "gradient hair": "gradient-coloured hair",
+    "streaked hair": "hair with coloured streaks", "colored inner hair": "hair with a different colour on the inside",
+    "absurdly long hair": "extremely long hair", "hair intakes": "upswept tufts of hair at the temples",
+    "hair flaps": "flap-like tufts of hair", "antenna hair": "two upright strands of hair",
+    # 体・特徴
+    "heterochromia": "eyes of two different colours", "tan": "tanned skin", "tanlines": "tan lines",
+    "dark-skinned female": "dark skin", "dark-skinned male": "dark skin", "mole under eye": "a mole under the eye",
+    "mole under mouth": "a mole below the mouth", "thick thighs": "thick thighs", "kemonomimi mode": "animal ears",
+    "mature female": "mature woman", "mature male": "mature man",
+    # 服
+    "zettai ryouiki": "a band of bare thigh between the skirt and the thigh-high socks", "thighhighs": "thigh-high socks",
+    "kneehighs": "knee-high socks", "serafuku": "sailor-style school uniform", "gakuran": "Japanese boys' school uniform",
+    "detached sleeves": "separate sleeves", "off shoulder": "off-the-shoulder top", "midriff": "bare midriff",
+    "navel": "exposed navel", "sleeves past wrists": "sleeves covering the wrists",
+    "sleeves past fingers": "sleeves covering the hands", "frills": "frilled trim", "hairclip": "hair clip",
+    "hairband": "headband", "legwear": "leg wear", "zipper pull tab": "zipper pull", "shimenawa": "sacred straw rope",
+    "miko": "shrine maiden outfit", "yukata": "yukata (light summer kimono)", "hakama": "hakama (pleated Japanese trousers)",
+    "geta": "geta (wooden sandals)", "tabi": "tabi (split-toe socks)", "randoseru": "Japanese school backpack",
+    # ポーズ
+    "v": "making a peace sign", "double v": "making peace signs with both hands", "arm up": "one arm raised",
+    "hand up": "one hand raised", "own hands together": "hands clasped together", "hand on own hip": "one hand on the hip",
+    "hands on own hips": "hands on the hips", "wariza": "sitting with the legs folded to the sides",
+    "seiza": "kneeling in seiza", "indian style": "sitting cross-legged", "yokozuwari": "sitting with both legs to one side",
+    "on back": "lying on the back", "on stomach": "lying face down", "on side": "lying on the side",
+    "all fours": "on hands and knees", "head tilt": "head tilted", "paw pose": "hands held up like paws",
+    "knees up": "knees drawn up", "leg up": "one leg raised", "standing on one leg": "standing on one leg",
+    # 背景・光
+    "simple background": "plain background", "depth of field": "shallow depth of field", "backlighting": "backlit",
+    "day": "daytime", "scenery": "wide view of the scenery", "no humans": "no people",
+    # 文には書かない語 (人数は別に数の表現で書く。品質・投稿の種類の語は内容ではない)
+    "solo": "", "solo focus": "", "highres": "", "absurdres": "", "lowres": "", "commentary request": "",
+    "translation request": "", "virtual youtuber": "", "official alternate costume": "",
+}
+
+
+def plain_english(tag: str) -> str:
+    """タグを文章の出力先に書くときの言い方 (重みと括弧のエスケープは外す)。表に無ければそのまま。"""
+    text = unescape_parens(str(tag)).strip()
+    if "::" in text or re.fullmatch(r"\(.+:-?\d+(?:\.\d+)?\)", text):  # 重み付き ((tag:1.2) / 1.2::tag::) は中身だけ
+        text = _strip_weight(text)
+    key = text.lower().replace("_", " ")
+    if key in DANBOORU_PLAIN:
+        return DANBOORU_PLAIN[key]
+    # Danbooru の区別用の括弧: watercolor (medium) → watercolor、1990s (style) → 1990s style
+    return re.sub(r"\s*\(style\)$", " style", re.sub(r"\s*\(medium\)$", "", text))
+
+
+def _plain_prose(tag_list: list[str]) -> str:
+    """タグの並びを文章の出力先に書く (_plain の、Danbooru の語をふつうの英語にする版)。"""
+    return ", ".join(dedup([x for x in (plain_english(t) for t in tag_list) if x]))
+
+
+def count_phrase_en(tag: str, age: str = "") -> str:
+    """人数タグを英語の数の表現にする (2girls → two girls、1boy → a boy)。Midjourney は数を具体的に書くよう勧めている。
+    age (1 人のときの年齢層) があれば、年齢に合った言い方にする (1girl → a woman in her forties)。"""
     name = norm_tag(tag).replace(" ", "_")
     if name not in PERSON_COUNT_TAGS or name.startswith("multiple"):
         return ""
     n = PERSON_COUNT_TAGS[name]
     group = next(g for g in ("girl", "boy", "other") if g in name)
+    if n == 1 and age:
+        return age_noun_en({"subject": group, "age": age})
     noun = {"girl": "girl", "boy": "boy", "other": "person"}[group] if n == 1 else {"girl": "girls", "boy": "boys", "other": "people"}[group]
     word = COUNT_WORDS_EN.get(n, "several") if not name.startswith("6+") else "six or more"
     return f"{word} {noun}"
@@ -2163,6 +2574,7 @@ def count_phrase_en(tag: str) -> str:
 
 def compose_midjourney(
     extras: dict[str, dict[str, Any]], medium: str, tags: TagResult, persons: list[dict[str, Any]] | None = None,
+    age: str = "",
 ) -> str:
     """Midjourney 向けの短い描写文 (公式: 短く簡潔に、要素は被写体・画材・環境・光・色・雰囲気・構図、数は具体的に)。
     VLM が無いとき・人物ごとに分けたときに使う。タグは信頼度の高い順に各項目の先頭だけを使う (全体は別タブにある)。"""
@@ -2175,24 +2587,24 @@ def compose_midjourney(
     medium_phrase = MEDIUM_PHRASE.get(medium, "illustration")
     if persons and len(persons) >= 2:
         genders = {p["subject"] for p in persons}
-        noun = {"girl": "women", "boy": "men"}.get(next(iter(genders)), "people") if len(genders) == 1 else "people"
+        noun = group_noun_en(persons)
         who = []
         for person in persons:
-            one = {"girl": "a woman", "boy": "a man"}.get(person["subject"], "a person")
-            feats = _plain(person["tags"][:3])
+            one = age_noun_en(person)
+            feats = _plain_prose(without_age_tags(person)[:3])
             who.append(f"{person['position']}, {one}" + (f" with {feats}" if feats else ""))
-        common = _plain((persons[0].get("common") or [])[:4])
+        common = _plain_prose((persons[0].get("common") or [])[:4])
         subject = f"{COUNT_WORDS_EN.get(len(persons), str(len(persons)))} {noun}" + (f" sharing {common}" if common else "")
         subject += " (" + "; ".join(who) + ")"
         subject += "".join(", " + _lower_first(text.rstrip(".")) for text, _ in interaction_lines(persons))
     else:
-        counts = [count_phrase_en(t) for t in extras["subject"]["tags"]]
+        counts = [count_phrase_en(t, age) for t in extras["subject"]["tags"]]
         count = next((c for c in counts if c), "")
-        looks = _plain(top("subject", 5))
+        looks = _plain_prose([t for t in top("subject", 5) if not (age and _tag_key(t) in AGE_TAG_BANDS)])
         subject = ", ".join(x for x in (count, looks) if x) or "the scene"
     parts = [f"{_with_article(medium_phrase)} of {subject}"]
     if not (persons and len(persons) >= 2):
-        outfit, pose = _plain(top("outfit", 4)), _plain(top("pose", 2))
+        outfit, pose = _plain_prose(top("outfit", 4)), _plain_prose(top("pose", 2))
         if outfit:
             parts.append(f"wearing {outfit}")
         if pose:
@@ -2204,11 +2616,11 @@ def compose_midjourney(
         where = next((p for p in places if p in ("outdoors", "indoors")), "")
         things = [p for p in places if p != where][:3]
         if where or things:
-            parts.append(" ".join(x for x in (where, f"with {_plain(things)} in the background" if things else "") if x))
+            parts.append(" ".join(x for x in (where, f"with {_plain_prose(things)} in the background" if things else "") if x))
     first = ", ".join(parts) + "."
     # 画風の語は冒頭の画材 (a photorealistic photograph など) と重なるものを除く
     style = [t for t in top("style", 3) if not set(t.split()) <= set(medium_phrase.replace("-", " ").split())]
-    second = [x for x in (_plain(top("lighting", 2)), _plain(top("camera", 2)), _plain(style[:2])) if x]
+    second = [x for x in (_plain_prose(top("lighting", 2)), _plain_prose(top("camera", 2)), _plain_prose(style[:2])) if x]
     return first + (" " + ", ".join(second) + "." if second else "")
 
 
@@ -2259,30 +2671,33 @@ def midjourney_params(
 
 def compose_prose_fallback(
     extras: dict[str, dict[str, Any]], medium: str, size: tuple[int, int], target: str, tags: TagResult,
-    persons: list[dict[str, Any]] | None = None, use_text: bool = False,
+    persons: list[dict[str, Any]] | None = None, use_text: bool = False, style_first: bool = False, age: str = "",
 ) -> str:
     """VLM 無しで自然文系の出力先向けに、振り分けたタグから構造化した英文を組み立てる。
-    人物ごとに分けてあれば、被写体は「左の人: ...; 右の人: ...」と人ごとに書く。"""
+    人物ごとに分けてあれば、被写体は「左の人: ...; 右の人: ...」と人ごとに書く。
+    style_first (⑦ 作風・質感を入れたとき) なら、画風を文の最後ではなく、絵か写真かのすぐ後ろ (先頭) に書く。"""
     if target == "midjourney":
-        return compose_midjourney(extras, medium, tags, persons)
+        return compose_midjourney(extras, medium, tags, persons, age)
     # 自然文なので、SD 用の人数タグ (1girl / 2girls / solo) は英語の数の表現 (a girl / two girls) にする
     subject_words = []
     for tag in extras["subject"]["tags"]:
         name = norm_tag(tag).replace(" ", "_")
         if name == "solo" or name.startswith("multiple_"):
             continue
-        subject_words.append(count_phrase_en(tag) if name in PERSON_COUNT_TAGS else tag)
-    subject = _plain([w for w in subject_words if w])
+        if age and name in AGE_TAG_BANDS:
+            continue  # 年齢は人物の呼び方のほうに書く (a little girl ... / a woman in her forties)
+        subject_words.append(count_phrase_en(tag, age) if name in PERSON_COUNT_TAGS else tag)
+    subject = _plain_prose([w for w in subject_words if w])
     many = bool(persons and len(persons) >= 2)
     if many:
         subject = describe_persons_en(persons, target)
-    pose = _plain(extras.get("pose", {}).get("tags", []))
-    outfit = _plain(extras.get("outfit", {}).get("tags", []))
-    objects = _plain(extras["objects"]["tags"])
-    background = _plain(extras["background"]["tags"])
-    camera = _plain(extras["camera"]["tags"])
-    lighting = _plain(extras["lighting"]["tags"])
-    style = _plain(extras["style"]["tags"])
+    pose = _plain_prose(extras.get("pose", {}).get("tags", []))
+    outfit = _plain_prose(extras.get("outfit", {}).get("tags", []))
+    objects = _plain_prose(extras["objects"]["tags"])
+    background = _plain_prose(extras["background"]["tags"])
+    camera = _plain_prose(extras["camera"]["tags"])
+    lighting = _plain_prose(extras["lighting"]["tags"])
+    style = _plain_prose(extras["style"]["tags"])
     if use_text and not many:
         # 最大 4 枚モード: VLM が役割別に書いた文 (① の服・ポーズが混ざったものは呼び出し側で消してある) があれば使う
         def text_or(key: str, fallback: str) -> str:
@@ -2300,7 +2715,7 @@ def compose_prose_fallback(
     if target in ("zimageturbo", "zimage", "mossimage"):
         # MOSS-Image も同じ形 (公式の長いキャプションの観点: 構図・被写体・動作・場所・色・照明・画風。縦横比は数値で指定)
         return compose_zimage(extras, medium_phrase, subject, outfit, pose, objects, background,
-                              use_text or many, many)
+                              use_text or many, many, style_first)
 
     if many and target != "grok":
         # 人物ごとの文を主役に置く。並びは各社ガイドの順: GPT Image は 背景 → 人物 → 細部 → 制約、
@@ -2314,12 +2729,13 @@ def compose_prose_fallback(
 
         setting = sentence("background", "The setting", background)
         style_text = extras["style"]["text"]
+        style_sentence = ((style_text if style_text.endswith(".") else style_text + ".") if style_text
+                          else f"Rendered as {_with_article(medium_phrase, capital=False)}" + (f", {style}." if style else "."))
         rest = [
             f"Objects and props: {objects}." if objects else "",
             sentence("camera", "Composition and camera", camera),
             sentence("lighting", "Lighting and color", lighting),
-            (style_text if style_text.endswith(".") else style_text + ".") if style_text
-            else f"Rendered as {_with_article(medium_phrase, capital=False)}" + (f", {style}." if style else "."),
+            "" if style_first else style_sentence,
             f"Aspect ratio {aspect}.",
         ]
         if target == "chatgpt":
@@ -2327,12 +2743,16 @@ def compose_prose_fallback(
             tail = [] if has_text else ["No text, watermark or logo."]
         else:
             head, tail = [subject, setting], []
+        if style_first:
+            head = head[:1] + [style_sentence] + head[1:] if target == "chatgpt" else [style_sentence] + head
         if target == "krea2" and krea_framing(tags):  # 画角を文の頭に (Krea 2 だけ)
             head = [f"{_with_article(medium_phrase)}."] + head
         return " ".join(x for x in head + rest + tail if x)
 
     if target == "nanobanana":
         parts = [f"{_with_article(medium_phrase)} of {subject or 'the scene'}" + (f", set in {background}" if background else "") + "."]
+        if style and style_first:
+            parts.append(f"Rendered in this style: {style}.")
         if outfit:
             parts.append(f"Outfit: {outfit}.")
         if pose:
@@ -2343,14 +2763,15 @@ def compose_prose_fallback(
             parts.append(f"The scene is illuminated by {lighting}.")
         if camera:
             parts.append(f"Composition and camera: {camera}.")
-        if style:
+        if style and not style_first:
             parts.append(f"Rendered in this style: {style}.")
         parts.append(f"The image should be in a {aspect} format.")
         return " ".join(parts)
 
     if target == "grok":
         pieces = [medium_phrase]
-        for p in (subject, outfit, pose, objects, background, lighting, camera, style):
+        for p in ((style, subject, outfit, pose, objects, background, lighting, camera) if style_first
+                  else (subject, outfit, pose, objects, background, lighting, camera, style)):
             if p:
                 pieces.append(p)
         return "; ".join(pieces) + f". Aspect ratio {aspect}."
@@ -2360,6 +2781,8 @@ def compose_prose_fallback(
         parts.append(f"Create an image: {_with_article(medium_phrase, capital=False)}.")
     else:
         parts.append(f"{_with_article(medium_phrase)}.")
+    if style and style_first:
+        parts.append(f"Style: {style}.")
     if subject:
         parts.append(f"Subject: {subject}.")
     if outfit and not (persons and len(persons) >= 2):  # 人物ごとに書いたときは服・ポーズも各人の側に入っている
@@ -2374,7 +2797,7 @@ def compose_prose_fallback(
         parts.append(f"Composition and camera: {camera}.")
     if lighting:
         parts.append(f"Lighting and color: {lighting}.")
-    if style:
+    if style and not style_first:
         parts.append(f"Style: {style}.")
     parts.append(f"Aspect ratio {aspect}.")
     if target == "chatgpt" and not has_text:
@@ -2384,16 +2807,20 @@ def compose_prose_fallback(
 
 def compose_zimage(
     extras: dict[str, dict[str, Any]], medium_phrase: str, subject: str, outfit: str, pose: str, objects: str,
-    background: str, use_text: bool, many: bool,
+    background: str, use_text: bool, many: bool, style_first: bool = False,
 ) -> str:
     """Z-Image 向けの VLM 無しの英文。ベース版モデルカードの例文と同じく、被写体・服・ポーズ・背景を文章で書き、
     最後に媒体・画風・照明・カメラを句で並べる。縦横比は数値で指定するのでメモに書き、本文には入れない。
-    use_text なら VLM が役割別に書いた文を使う (subject / outfit / pose は呼び出し側で置き換え済み)。"""
+    use_text なら VLM が役割別に書いた文を使う (subject / outfit / pose は呼び出し側で置き換え済み)。
+    style_first (⑦ 作風・質感を入れたとき) なら、媒体と画風を最後ではなく先頭に書く (最後だと ① の絵柄に負ける)。"""
     def text(key: str) -> str:
         value = (extras.get(key, {}).get("text") or "").strip().rstrip(".") if use_text else ""
         return value + "." if value else ""
 
     sentences = []
+    if style_first:
+        lead = _plain_prose(dedup([medium_phrase] + ([] if text("style") else extras.get("style", {}).get("tags", []))))
+        sentences += [lead[:1].upper() + lead[1:] + ".", text("style")]
     outfit_text, pose_text = text("outfit"), text("pose")
     if many:
         # 人物ごとの文 (describe_persons_en)。服・ポーズは人ごとの文に入っている
@@ -2420,14 +2847,15 @@ def compose_zimage(
     if setting:
         sentences.append(setting)
     # 照明・カメラ・画風は VLM の文があれば文で、無ければ末尾の句に入れる (どちらも落とさない)
-    phrases = [medium_phrase]
-    for key in ("style", "lighting", "camera"):
+    phrases = [] if style_first else [medium_phrase]
+    for key in ("lighting", "camera") if style_first else ("style", "lighting", "camera"):
         if text(key):
             sentences.append(text(key))
         else:
             phrases += extras.get(key, {}).get("tags", [])
-    tail = _plain(dedup(phrases))
-    sentences.append(tail[:1].upper() + tail[1:] + ".")
+    tail = _plain_prose(dedup(phrases))
+    if tail:
+        sentences.append(tail[:1].upper() + tail[1:] + ".")
     return " ".join(x for x in sentences if x)
 
 
@@ -4008,6 +4436,8 @@ Rules
 - "outfit_tags": when there is one person, up to 16 lowercase Danbooru-style tags for the clothing, footwear, headwear and accessories worn, with colours (e.g. white dress, puffy short sleeves, black thighhighs). When there are two or more people, return an empty array and put the outfits into persons.
 - In each persons entry, "number" is the number of the box drawn around that person when numbered boxes are shown (otherwise the order from left, starting at 1), "pose_tags" (up to 12) is that person's exact pose and "outfit_tags" (up to 16) is what that person wears.
 - "interactions": an empty array unless the instructions below list actions between people.
+- "age": when the image shows exactly one person or human-like character, the apparent age group that person is shown as: baby (under 1), toddler (1-3), child (4-9), preteen (10-12), teen (13-17), young adult (18-29), thirties, forties, fifties, sixties, elderly (70 or older). "unknown" when there is no person, when there are several people, or when it cannot be judged. Judge from the face, the skin, the body proportions and the height against the surroundings; for a drawn character, from the age the drawing portrays. Do not fall back on young adult: choose the group that really fits, for children and for older people as well.
+- In each persons entry, "age" is that person's apparent age group, chosen in the same way ("unknown" when it cannot be judged).
 """
 
 # VLM には日本語の欄 (analysis / notes) を書かせない。1 回の呼び出しで日本語と英語を書き分けさせると、先に書いた日本語に
@@ -4031,10 +4461,12 @@ VLM_SCHEMA: dict[str, Any] = {
                     "pose_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
                     "outfit_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
                     "description": {"type": "string"},
+                    "age": {"type": "string", "enum": AGE_ENUM},
                 },
-                "required": ["number", "subject", "position", "tags", "pose_tags", "outfit_tags", "description"],
+                "required": ["number", "subject", "position", "tags", "pose_tags", "outfit_tags", "description", "age"],
             },
         },
+        "age": {"type": "string", "enum": AGE_ENUM},
         "camera": {"type": "string"},
         "lighting": {"type": "string"},
         "style": {"type": "string"},
@@ -4060,7 +4492,7 @@ VLM_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "natural_prompt", "extra_tags", "negative_additions", "persons",
+        "natural_prompt", "extra_tags", "negative_additions", "persons", "age",
         "camera", "lighting", "style", "motion", "subject", "background", "objects", "style_tags",
         "pose_tags", "outfit_tags", "interactions",
     ],
@@ -4726,6 +5158,264 @@ def style_removes(tag: str) -> bool:
     return classify_extra_tag(n) == "style" or bool(ERA_TAG_RE.match(n)) or medium_word(n) or texture_tag(n)
 
 
+# --------------------------------------------------------------------------
+# 仕上げの書き直し (文章の出力先。VLM を使うとき)
+# --------------------------------------------------------------------------
+# 文章の出力先の本文は、条件によって作り方が違う: 1 枚だけなら VLM が画像を見て書いた文、複数枚モード・2 人以上なら
+# 枠ごとの内容を決まった順に並べた文 (VLM の文が無い枠はタグの並びのまま)。並べた文は「Subject: ... Outfit: ...」の
+# ような見出しとタグの列で、文章を読む生成モデルには弱い。集めた内容を VLM にもう一度渡して (画像は見せない)、
+# 出力先の書き方で 1 つの文章に書き直させる。VLM が画像を見て書いた文 (1 枚だけ) は書き直さない (呼び出しが増えて遅くなる)。
+# 書き直しが内容を落としたり、外したはずの要素を書いたりしたら使わず、元の文のままにする
+POLISH_SYSTEM = (
+    "You are given a draft prompt for an image generation model. The draft was assembled from separate notes about one "
+    "image (subject, outfit, pose, objects, setting, lighting, camera, medium and style), so parts of it are labels and "
+    "comma-separated tag lists. Rewrite it as the final prompt in fluent English.\n"
+    "Rules:\n"
+    "- Keep every fact of the draft: the people and how many there are, their age, hair, eyes, face, body, clothing with "
+    "its colours and details, pose, objects, setting, lighting, camera framing, medium and style. Do not drop anything.\n"
+    "- Keep every name of a character, a series or an artist exactly as the draft writes it. Names are not tag jargon: "
+    "do not translate them, do not replace them with a description, and do not drop them.\n"
+    "- Do not invent anything that is not in the draft.\n"
+    "- Replace labels such as 'Subject:' or 'Outfit:' and tag lists with natural sentences.\n"
+    "- Replace Danbooru tag jargon with plain descriptive English (1girl -> a woman or a girl as the draft says, cowboy "
+    "shot -> framed from the thighs up, ahoge -> a single upright strand of hair, and so on).\n"
+    "- Keep text inside double quotes exactly as it is.\n"
+    "- Do not add a medium or an art style that the draft does not state, and no quality words such as masterpiece.\n"
+    "- Output only the prompt: no explanations, no headings, no markdown."
+)
+POLISH_STYLE_FIRST = "Begin with the medium and the art style or look, then describe the content."
+def _mentions_loose(text: str, phrase: str) -> bool:
+    """phrase の語が全部 text に出てくるか。並びは問わない (long hair は long pink hair に出ている) し、複数形の s も同じとみなす。
+    文の中の語の並びはタグと違うので、「書かれているか」はこちらで確かめる (厳しく見ると、書いてあるのに足させてしまう)。"""
+    words = set(re.findall(r"[a-z0-9]+", unescape_parens(text).lower()))
+    words |= {w[:-1] for w in words if w.endswith("s")}
+    need = re.findall(r"[a-z0-9]+", unescape_parens(phrase).lower())
+    return bool(need) and all(w in words or w.rstrip("s") in words for w in need)
+
+
+def polish_guidance(target: str) -> str:
+    """出力先ごとの書き方 (メインの VLM への指示から、JSON の欄名を外したもの)。"""
+    text = TARGET_VLM_GUIDANCE.get(target, "")
+    return re.sub(r"^natural_prompt:\s*", "", text).strip()
+
+
+def polish_problem(draft: str, text: str, keep: list[str], forbidden: list[str], names: list[str] | None = None) -> str:
+    """書き直した文を使えない理由 (使えるなら空文字)。keep は本文に入れるタグ、forbidden は外したはずのタグ、
+    names はキャラ名・作品名・作者名 (元の文にあった名前が 1 つでも落ちていたら使わない。名前は言い換えが利かない)。"""
+    words = len(re.findall(r"[A-Za-z]+", text))
+    draft_words = len(re.findall(r"[A-Za-z]+", draft))
+    if words < max(8, draft_words * 0.5):
+        return "短すぎます (内容が落ちています)"
+    if words > max(120, draft_words * 3):
+        return "長すぎます (元に無い内容が足されています)"
+    if re.search(r"(?m)^\s*(?:#|\*\*|- )|\b(?:Here is|Here's|Note:|Explanation:)", text):
+        return "説明や見出しが入っています"
+    lost_quotes = [q for q in re.findall(r'"[^"]+"', draft) if q not in text]
+    if lost_quotes:
+        return "画像の文字 (" + ", ".join(lost_quotes)[:80] + ") が変わっています"
+    lost_names = [t for t in mentions_any(draft, list(names or []))
+                  if not _mentions_loose(text, t) and not _mentions_loose(text, plain_english(t))]
+    if lost_names:
+        return "キャラ名・作品名 (" + ", ".join(dedup(lost_names))[:120] + ") が落ちています"
+    leaked = mentions_any(text, [t for t in forbidden if not mentions_any(draft, [t])])
+    if leaked:
+        return "外した要素 (" + ", ".join(dedup(leaked))[:120] + ") を書いています"
+    had = mentions_any(draft, keep)
+    lost = [t for t in had if not _mentions_loose(text, t) and not _mentions_loose(text, plain_english(t))]
+    if len(lost) > max(3, len(had) * 0.4):
+        return "内容が落ちています (" + ", ".join(dedup(lost))[:120] + ")"
+    return ""
+
+
+# --------------------------------------------------------------------------
+# 画風を変える (MOSS-Image)
+# --------------------------------------------------------------------------
+# 元の画像とは違う画風で作る: 実写 / アニメ風 / 漫画風 / 水彩 / 厚塗り / 油絵 / 鉛筆画。
+# ⑦ 作風・質感に見本を入れても元の絵柄が勝つことがある。原因は 2 つ: 人物の説明が元の画像から書かれること (元の画風の
+# 言い方のまま) と、画風が文の後ろに回ること。種類を選ぶと、先頭でその画風だと言い切り、元の画風の語を外すか言い換え、
+# その画風にしかない描き方・質感の文を最後に足す。⑦ が無くても使える。⑦ の画像が選んだ種類と同じ系統 (写真 / 絵画 / 絵) なら、
+# ⑦ から読んだ文 (写真なら撮り方、絵なら塗り方) を先頭の直後に置く。MOSS-Image での効き目は実機で確かめていない
+PHOTOREAL_VLM = (
+    "The result must be a real photograph of real people taken with a camera, whatever the reference image is (anime, "
+    "illustration, painting or 3D). In natural_prompt, subject and every other text field, describe the person as a real "
+    "human being as they would look in a photograph: natural human facial proportions and eye size, real skin, real hair "
+    "(an unnatural hair colour is dyed hair), real fabrics and materials. Translate drawn features into their real-life "
+    "counterpart instead of copying them (for example huge sparkling eyes become clear blue eyes). Never say that the "
+    "source is a drawing, and never use the words anime, manga, cartoon, illustration, drawing, painting, cel shading, "
+    "line art, 2D, 3D, render, CGI, digital art, stylized, realistic or photorealistic. When the image shows a named "
+    "character, keep the character's name and describe a real person who is that character in real life. Begin "
+    "natural_prompt with 'A photograph of'."
+)
+RESTYLE_VLM = (
+    "The result will be made as {what}, whatever the reference image is (a photograph, an anime illustration, a painting "
+    "or 3D). In natural_prompt, subject and every other text field, describe the content only - the people, their "
+    "clothing, pose, objects, the setting and the light - and never the medium or rendering of the reference image: do "
+    "not use the words photograph, photo, realistic, photorealistic, anime, manga, cartoon, illustration, painting, "
+    "watercolor, oil, sketch, cel shading, line art, 2D, 3D, render or CGI. Begin natural_prompt with '{start} of'."
+)
+PHOTOREAL_PEOPLE = (
+    "Real human skin with visible pores, fine vellus hair and slight natural unevenness, natural human facial proportions "
+    "and eye size, individually visible strands of hair, real fabric with weave and wrinkles, natural light with true "
+    "optical depth of field."
+)
+PHOTOREAL_SCENE = "Real materials and surfaces with their natural wear, natural light with true optical depth of field."
+# 種類ごとの書き方。medium = 絵か写真かの判定に入れる値 (⑦ がこれと同じなら ⑦ の文を使う)、noun = 画材の語の言い換え先、
+# lead = 先頭の文、tail = 最後に足す描き方・質感の文、negative = MOSS-Image のネガティブ欄 (公式の既定は空。CFG 1 の高速 LoRA
+# では効かない)、names = キャラ名を本文に入れるか (どの種類も入れる。実写でも、誰の実写かは名前で決まる)
+RESTYLES: dict[str, dict[str, Any]] = {
+    "photo": {
+        "medium": "photo", "noun": "photograph", "names": True,
+        "lead": "A real photograph of a real person, taken with a camera.",
+        "lead_many": "A real photograph of real people, taken with a camera.",
+        "lead_scene": "A real photograph, taken with a camera.",
+        "tail": PHOTOREAL_PEOPLE, "tail_scene": PHOTOREAL_SCENE,
+        "negative": ["anime", "illustration", "drawing", "painting", "cartoon", "manga", "3d render", "cgi", "digital art",
+                     "doll", "plastic skin"],
+    },
+    "anime": {
+        "medium": "anime", "noun": "anime illustration", "names": True,
+        "lead": "An anime illustration with clean line art and cel shading.",
+        "tail": "Clean, even outlines, flat cel-shaded colours with one or two shadow tones and crisp highlights, large "
+                "expressive eyes and simplified facial features.",
+        "negative": ["photograph", "photorealistic", "3d render", "cgi", "painterly", "sketch"],
+    },
+    "manga": {
+        "medium": "anime", "noun": "black-and-white manga illustration", "names": True,
+        "lead": "A black-and-white manga illustration drawn in ink.",
+        "tail": "Black ink line art on white paper, screentone and hatching for the shading, no colour.",
+        "negative": ["colour", "photograph", "3d render", "cgi", "painting", "grey wash"],
+    },
+    "watercolor": {
+        "medium": "painting", "noun": "watercolour painting", "names": True,
+        "lead": "A watercolour painting on textured paper.",
+        "tail": "Transparent washes of colour that bleed into each other, visible paper grain, soft edges and light pencil "
+                "lines under the paint.",
+        "negative": ["photograph", "3d render", "cgi", "cel shading", "flat colour", "digital art"],
+    },
+    "thick": {
+        "medium": "painting", "noun": "digital painting", "names": True,
+        "lead": "A digital painting with thick, opaque painterly brushwork.",
+        "tail": "Visible brush strokes, blended opaque colours, soft edges without line art, painted light and shadow.",
+        "negative": ["photograph", "3d render", "cgi", "line art", "cel shading", "flat colour"],
+    },
+    "oil": {
+        "medium": "painting", "noun": "oil painting", "names": True,
+        "lead": "An oil painting on canvas.",
+        "tail": "Thick layered oil paint with visible brush strokes and canvas texture, rich blended colours and soft "
+                "painted edges.",
+        "negative": ["photograph", "3d render", "cgi", "line art", "cel shading", "anime"],
+    },
+    "pencil": {
+        "medium": "anime", "noun": "pencil drawing", "names": True,
+        "lead": "A pencil drawing on paper.",
+        "tail": "Graphite pencil lines with hatching and soft smudged shading on white paper, no colour.",
+        "negative": ["colour", "photograph", "3d render", "cgi", "painting", "ink"],
+    },
+}
+# タグから外す語: 絵か写真かと描き方を表す語 (camera は持ち物のタグにもあるので見ない)。実写にするときは写真の語は残す
+_RESTYLE_PHOTO_WORDS = {"photo", "photograph", "photographic"}
+_RESTYLE_DROP_WORDS = (set().union(*_MEDIUM_WORDS.values()) - {"camera"}
+                       | {"2d", "cgi", "screencap", "artstyle", "pixel", "photorealistic", "realistic", "realism"})
+_PR_DRAWN = r"(?:anime|manga|cartoon|comic|toon|cel[- ]shaded)"
+# 絵の画材を表す名詞の句 → その種類の語 (anime-style illustration / digital painting / 3D rendering / an anime image など)
+_RESTYLE_NOUN_RE = re.compile(
+    r"\b(?:(?:" + _PR_DRAWN + r"(?:[- ]?style[d]?)?|digital|2d|3d|cgi?|rendered|illustrated|hand[- ]drawn|painterly|"
+    r"styli[sz]ed|(?:photo|hyper|ultra|semi)[- ]?realistic|realistic)[ -]+)*"
+    r"(?:illustration|drawing|artwork|digital painting|digital art|rendering|render|screencap|screenshot|cartoon|sketch)s?\b"
+    r"|\b(?:" + _PR_DRAWN + r"|digital|oil|watercolou?r|2d|3d|cgi?|rendered|illustrated|styli[sz]ed|hand[- ]drawn)[ -]"
+    r"(?:painting|art|image|picture|portrait|scene|graphic)s?\b"
+    r"|\bpainting(?= of\b)", re.IGNORECASE)
+# 写真を表す名詞の句 (実写以外にするとき) → その種類の語
+_RESTYLE_PHOTO_NOUN_RE = re.compile(
+    r"\b(?:(?:real|real-life|candid|professional|raw|(?:photo|hyper|ultra|semi)[- ]?realistic|realistic)[ -]+)*"
+    r"(?:photograph|photo|snapshot)s?\b", re.IGNORECASE)
+# 画風の言い方の句 (in an anime style、in a clean cel-shaded anime style など) → 外す。
+# 「is rendered in a ... style with soft lighting」は「has soft lighting」にし、何も残らない文 (The image.) は消す
+_PR_STYLE_WORDS = (r"(?:" + _PR_DRAWN + r"|painterly|illustrated|watercolou?r|sketch|pixel[- ]art|photo-?realistic|realistic|"
+                   r"photographic|3d|cgi?)(?:[- ](?:" + _PR_DRAWN + r"|art))*[- ]?style")
+_RESTYLE_IS_STYLE_RE = re.compile(
+    r"\b(?:is|are) (?:rendered|drawn|painted|done|illustrated|made) in (?:an?|the) (?:[\w-]+ ){0,3}?" + _PR_STYLE_WORDS
+    + r"\b( with\b)?", re.IGNORECASE)
+_RESTYLE_STYLE_RE = re.compile(  # コンマで挟まれた句 (, rendered in an anime style,) は後ろのコンマも外す
+    r"(,\s*)?\b(?:rendered |drawn |painted |done )?in (?:an?|the) (?:[\w-]+ ){0,3}?" + _PR_STYLE_WORDS + r"\b(?(1),?)",
+    re.IGNORECASE)
+_RESTYLE_EMPTY_RE = re.compile(
+    r"(?:(?<=[.!?] )|^)(?:The|This) (?:image|picture|scene|artwork|photograph|style)(?: (?:is|are|has))?\s*\.\s*", re.IGNORECASE)
+# 残った絵・CG の語 → 外す
+_RESTYLE_WORD_RE = re.compile(
+    r"\b(?:anime|manga|cartoon|toon|chibi)(?:[- ]?(?:style[d]?|like|esque|inspired))?\b|\bcartoonish\b|\bcel[- ]shad(?:ed|ing)\b"
+    r"|\bline[- ]?art\b|\bstyli[sz]ed\b|\bhand[- ]drawn\b|\billustrated\b|\bpainterly\b|\b[23]d\b|\bcgi?\b"
+    r"|\b(?:digitally )?rendered\b", re.IGNORECASE)
+# realistic / photorealistic: 実写にするときは real に (「本物らしく描いた」という語で、CG の説明にも使われる)、ほかの種類では外す
+_RESTYLE_REAL_RE = re.compile(r"\b(?:(?:photo|hyper|ultra|semi)[- ]?)?realistic\b|\bphotoreal\b|\bphotographic\b", re.IGNORECASE)
+
+
+def restyle_vlm(kind: str) -> str:
+    """VLM への指示: 元の画像の画風を書かせず、選んだ種類の画像として書かせる。"""
+    if kind == "photo":
+        return PHOTOREAL_VLM
+    noun = RESTYLES[kind]["noun"]
+    return RESTYLE_VLM.format(what=_with_article(noun, capital=False), start=_with_article(noun))
+
+
+def restyle_removes(tag: str, kind: str, keep_style: bool = False) -> bool:
+    """「画風を変える」で外すタグか: 絵か写真かと描き方を表す語、年代、画風・技法のタグ。keep_style なら、
+    ⑦ から読んだ画風のタグ (絵か写真かを表す語を含まないもの) は残す。"""
+    n = _tag_name(tag)
+    drop = _RESTYLE_DROP_WORDS - (_RESTYLE_PHOTO_WORDS if kind == "photo" else set())
+    if set(re.findall(r"[a-z0-9-]+", n.replace("_", " "))) & drop or ERA_TAG_RE.match(n):
+        return True
+    return classify_extra_tag(n) == "style" and not keep_style
+
+
+def restyle_text(text: str, kind: str, people: int, shot: str = "") -> tuple[str, list[str]]:
+    """本文を、選んだ種類の画像として書き直す。戻り値: (本文, 外した・言い換えた語の一覧)。
+    先頭にその種類だと言い切る文、その直後に ⑦ から読んだ文 (shot。本文の中にあれば前へ移す)、最後に描き方・質感の文を置く。
+    元の画風の語 (anime-style illustration、photograph など) は、その種類の語にするか外す。people は人数 (0 = 人物なし)。"""
+    spec = RESTYLES[kind]
+    shot = shot.strip()
+    if shot:
+        sentence = shot.rstrip(".") + "."
+        text = text.replace(sentence, "", 1) if sentence in text else text.replace(shot, "", 1)
+        shot = sentence
+    lead = spec.get("lead_scene", spec["lead"]) if people < 1 else spec.get("lead_many", spec["lead"]) if people >= 2 else spec["lead"]
+    tail = spec.get("tail_scene", spec["tail"]) if people < 1 else spec["tail"]
+    noun = spec["noun"]
+    changed: list[str] = []
+
+    mark = "@@LOOK@@"  # 言い換え先の語 (anime illustration など) が、後の「絵の語を外す」で削られないよう、最後に入れる
+
+    def to_noun(m: "re.Match[str]") -> str:
+        if m.group(0).lower() != noun:
+            changed.append(f"{m.group(0).lower()} → {noun}")
+        return mark
+
+    def drop(m: "re.Match[str]") -> str:
+        changed.append(m.group(0).strip(" ,").lower() + " (外した)")
+        return ""
+
+    def is_style(m: "re.Match[str]") -> str:
+        changed.append(m.group(0).lower() + (" → has" if m.group(1) else " (外した)"))
+        return "has" if m.group(1) else ""
+
+    def real(m: "re.Match[str]") -> str:
+        if kind != "photo":
+            return drop(m)
+        changed.append(m.group(0).lower() + " → real")
+        return "Real" if m.group(0)[:1].isupper() else "real"
+
+    body = " ".join(x for x in (shot, text.strip()) if x)
+    body = _unquoted_sub(_RESTYLE_IS_STYLE_RE, is_style, body)
+    body = _unquoted_sub(_RESTYLE_STYLE_RE, drop, body)
+    body = _unquoted_sub(_RESTYLE_NOUN_RE, to_noun, body)
+    if kind != "photo":
+        body = _unquoted_sub(_RESTYLE_PHOTO_NOUN_RE, to_noun, body)
+    body = _unquoted_sub(_RESTYLE_WORD_RE, drop, body)
+    body = _unquoted_sub(_RESTYLE_REAL_RE, real, body)
+    body = _RESTYLE_EMPTY_RE.sub("", _tidy_prose(body.replace(mark, noun))).strip()
+    return " ".join(x for x in (lead, body, tail) if x), dedup(changed)
+
+
 def _tag_name(tag: str) -> str:
     return _strip_weight(norm_tag(tag)).replace(" ", "_")
 
@@ -4757,13 +5447,14 @@ def turnaround_removes(tag: str) -> bool:
 
 
 STRENGTH_GROUPS = [("person", "人物"), ("pose", "ポーズ"), ("outfit", "服装"), ("body", "体格"), ("props", "小物"),
-                   ("background", "背景")]
+                   ("background", "背景"), ("style", "画風")]
 STRENGTH_WEIGHT = {"strong": 1.2, "weak": 0.8}
 
 
 def strength_group(name: str, style_ref: bool = False) -> str:
-    """強さの調整の枠: reference_category を 6 つにまとめる (持ち物は小物、服で決まる見え方は服装)。
-    画風は ⑦ 作風・質感が無ければ以前どおり人物の枠。⑦ があれば ⑦ の枠 (強さの欄は無い = 普通のまま)。"""
+    """強さの調整の枠: reference_category を 7 つにまとめる (持ち物は小物、服で決まる見え方は服装)。
+    画風は、⑦ 作風・質感があるか「画風」の強さを選んだとき (呼び出し側が style_ref を True にする) は画風の枠。
+    どちらでもなければ以前どおり人物の枠。"""
     category = reference_category(name, style_ref)
     if category == "style" and not style_ref:
         return "person"
@@ -4844,6 +5535,7 @@ def apply_strength(shared: list[str], strength: dict[str, str] | None, target: s
         return shared, []
     if kind == "prose":
         return shared, ["強さの調整: この出力先 (自然文) には重みを付けられません"]
+    style_ref = style_ref or "style" in chosen  # 「画風」の強さを選んだら、⑦ が無くても画風のタグは画風の枠
 
     def key(t: str) -> str:
         return _strip_weight(norm_tag(t)).replace(" ", "_")
@@ -5102,6 +5794,8 @@ def vlm_reference_system(slots: list[str], separate: tuple[str, ...] = ()) -> st
         "- Never identify a real person by name. Well-known fictional characters may be named.",
         *([separate_rule(separate, "props" in idx)] if separate else []),
         "- Write every field in English only.",
+        '- "age": the apparent age group of the character of image 1: ' + AGE_VLM_GROUPS + '. "unknown" when it cannot be '
+        "judged. " + AGE_VLM_JUDGE,
         '- "extra_tags": up to 12 lowercase Danbooru-style tags for composition, camera, lighting and atmosphere that are missing from the tag lists.',
         f'- "pose_tags": up to 12 lowercase Danbooru-style tags for the pose in {src("pose")} only (e.g. standing, sitting, arms up, hand on hip, crossed legs).',
         f'- "pose": one or two English sentences describing only the pose in {src("pose")}: body orientation, torso, arms, hands, legs, head tilt, gaze.',
@@ -5259,6 +5953,7 @@ def parse_persons(raw: Any) -> list[dict[str, Any]]:
             "position_ja": position_ja(position),
             "tags": tags,
             "description": description,
+            "age": clean_age(item.get("age")),
             "prompt": ", ".join(dedup([SUBJECT_TOKEN[subject]] + tags)),
         })
     return persons
@@ -5538,6 +6233,29 @@ class OllamaVLM:
         data = self._chat(payload)
         text = str((data.get("message") or {}).get("content") or "")
         return re.sub(r"(?s)^\s*<think>.*?</think>", "", text).strip()
+
+    def rewrite(self, draft: str, guidance: str, style_first: bool = False) -> str:
+        """仕上げの書き直し: 組み立てた本文を、出力先の書き方で 1 つの文章に書き直させる (画像は渡さない)。"""
+        thinking = "thinking" in self.capabilities()
+        system = POLISH_SYSTEM + ("\n- " + POLISH_STYLE_FIRST if style_first else "")
+        if guidance:
+            system += "\nHow the final prompt should be written: " + guidance
+        user = "Draft:\n" + draft
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "stream": False,
+            "options": {"temperature": 0.2, "num_predict": VLM_NUM_PREDICT_THINKING if thinking else VLM_NUM_PREDICT,
+                        "num_ctx": VLM_NUM_CTX},  # num_ctx はメインと揃える (変えるとモデルを読み直す)
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }
+        if thinking:
+            payload["think"] = False
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+        data = self._chat(payload)
+        text = re.sub(r"(?s)^\s*<think>.*?</think>", "", str((data.get("message") or {}).get("content") or "")).strip()
+        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text).strip()
+        return re.sub(r"^(?:Final prompt|Prompt)\s*:\s*", "", text, flags=re.IGNORECASE).strip().strip("'").strip()
 
     def analyze_detail(self, image: Image.Image, tags: list[str], with_build: bool,
                        keep_alive: int | str | None = None, medium_hint: str = "",
@@ -6036,6 +6754,7 @@ class Engine:
         started = time.time()  # モデル読み込みを除いた 1 枚あたりの処理時間
         self.fraction(0.02, None)
         inputs = self._tag_inputs(tagger, path, refs, general_th, character_th, warnings)
+        timing: list[tuple[str, float]] = [("タガーと検出", time.time() - started)]  # どこに時間がかかったか (分析メモの最後に出す)
         self.fraction(0.35, None)
         controls = controls or {}
         control_flags = {"pose": False, "camera": False}
@@ -6056,6 +6775,14 @@ class Engine:
         turnaround = bool(cfg.get("turnaround", False))  # 三面図にする
         no_identity = bool(cfg.get("no_identity", False))  # 人物の特徴を入れない (LoRA 用)
         no_style = bool(cfg.get("no_style", False))  # 作風の特徴を入れない (画風 LoRA 用)
+        # 年齢の見た目を書く。人物の特徴を入れないときは書かない (年齢もその人の特徴)
+        age_on = bool(cfg.get("age_look", True)) and not no_identity
+        run_target = cfg.get("target") if cfg.get("target") in TARGETS else DEFAULT_TARGET
+        # 画風を変える: MOSS-Image だけ
+        restyle = cfg.get("restyle") if cfg.get("restyle") in RESTYLES and run_target == "mossimage" else "none"
+        if restyle != "none" and no_style:
+            no_style = False
+            warnings.append("「画風を変える」を選んでいるので、「作風の特徴を入れない」は使いませんでした (画風を書く必要があります)")
         nsfw_before = nsfw_suspected(inputs.tags)  # 表示用 (ステータス欄 / JSON)。条件には使わない
         mono_removed: list[str] = []
         if cfg.get("remove_monochrome", False):
@@ -6096,6 +6823,10 @@ class Engine:
             )
         tags, ref_tags, tag_source, size = inputs.tags, inputs.ref_tags, inputs.tag_source, inputs.size
         medium = detect_medium(tags, STYLE_REF_PHOTO_THRESHOLD if "style" in ref_tags else PHOTO_THRESHOLD)
+        # ⑦ 作風・質感が、選んだ種類と同じ系統 (写真 / 絵画 / 絵) か。同じなら ⑦ から読んだ画風の文とタグを使う
+        style_matches = restyle != "none" and "style" in ref_tags and medium == RESTYLES[restyle]["medium"]
+        if restyle != "none":
+            medium = RESTYLES[restyle]["medium"]  # 元の画像に関係なく、選んだ種類として書く (文の画材、VLM への手がかり)
         nsfw = nsfw_before or nsfw_suspected(tags)
         target = cfg.get("target") if cfg.get("target") in TARGETS else DEFAULT_TARGET
         kind = TARGETS[target]["kind"]
@@ -6197,12 +6928,19 @@ class Engine:
                     TURNAROUND_VLM if turnaround else "",
                     NO_IDENTITY_VLM if no_identity else "",
                     NO_STYLE_VLM if no_style else "",
+                    restyle_vlm(restyle) if restyle != "none" else "",
+                    AGE_VLM if age_on else "",
                 ) if x),
                 look=look_prose(look) if look else "",
                 describe_image=inputs.vlm_image,
                 persons_guided=inputs.main_person is not None or bool(inputs.persons),
+                # 枠ごとの内容を並べる条件 (複数枚モード・ボーン / カメラの指定・2 人以上) では、この後に仕上げの書き直しがある
+                polish_next=(kind == "prose" and target != "midjourney" and bool(cfg.get("polish_prose", True))
+                             and (bool(ref_tags) or overridden or len(inputs.persons) >= 2)),
             )
             warnings += vlm.warnings
+            timing.append(("VLM" + (f" ({1 + len([s for s in ref_tags if s in VLM_SEPARATE_SLOTS])} 回)"
+                                    if any(s in VLM_SEPARATE_SLOTS for s in ref_tags) else ""), time.time() - vlm_started))
             if vlm.ok:
                 self.last_vlm = (model, round(time.time() - vlm_started - self.describe_seconds, 1))
             self.fraction(0.95, None)
@@ -6246,8 +6984,10 @@ class Engine:
         detail_summary = ""
         face_extra = empty_face_extra()
         if cfg.get("person_details", False):
+            details_started = time.time()
             persons, detail_tags_main, detail_summary, detail_notes, detail_warn, face_extra = self._person_details(
                 inputs, persons, use_vlm, with_build="body" not in ref_tags, medium=medium)
+            timing.append(("人物の特徴を詳しく", time.time() - details_started))
             warnings += detail_warn
             if detail_notes:
                 analysis += "\n" + detail_notes
@@ -6459,25 +7199,65 @@ class Engine:
                 and inputs.tag_source.get(norm_tag(t).replace(" ", "_")) in ("pose", "control") else t
                 for t in shared_general
             ]
+        # 年齢の見た目: 人物ごとに VLM が選んだ年齢層とタガーの年齢のタグから決めて、文とタグに書く。
+        # 人物の特徴を入れないときは書かない (年齢もその人の特徴)。人物ごとに分けていない 2 人以上の画像は、誰の年齢か
+        # 結び付けられないので書かない
+        main_age = ""
+        age_moss_negative: list[str] = []
+        if age_on:
+            age_single = len(persons) < 2 and (hint_count <= 1 or inputs.main_person is not None)
+            persons, main_age, age_note = assign_ages(
+                persons, vlm.age if vlm.ok else "", vlm.numbered if vlm.ok else [], tags, nsfw, age_single)
+            analysis += age_note
+            people_ages = ([(p.get("subject", ""), p.get("age", "")) for p in persons] if len(persons) >= 2
+                           else [(single_subject(tags), main_age)] if age_single else [])
+            if kind != "prose":  # タグの出力先と Anima (タグの部分): 年齢のタグを足し、ずれる方向をネガティブで抑える
+                if len(persons) >= 2:
+                    persons = [with_age_tags(p) for p in persons]
+                else:
+                    have_age = {_tag_key(t) for t in shared_general}
+                    add_age = [t for t in age_tags_for(single_subject(tags), main_age) if _tag_key(t) not in have_age]
+                    at = max((i for i, t in enumerate(shared_general)
+                              if _tag_key(t) in PERSON_COUNT_TAGS or _tag_key(t) == "solo"), default=-1) + 1
+                    shared_general = shared_general[:at] + add_age + shared_general[at:]
+                negative = dedup(negative + age_negatives(people_ages))
+            elif target == "mossimage":
+                # MOSS-Image はネガティブ欄が使える (公式の既定は空)。年齢は本文の言い方に加えて、ずれる方向をここでも抑える
+                age_moss_negative = age_negatives_prose(people_ages)
+                if age_moss_negative:
+                    analysis += ("\n年齢の見た目: MOSS-Image のネガティブ欄に、年齢がずれる方向を抑える語を入れました ("
+                                 + ", ".join(age_moss_negative) + "。CFG 1 の高速 LoRA では効きません)")
         compose_extras = extras
         compose_tags = tags
-        if turnaround or no_identity or no_style:
+        option_removed: list[str] = []  # 画風を変えるで外したタグ (分析メモは本文を整えるところで書く)
+        removed_all: list[str] = []  # 三面図・人物の特徴・作風の特徴などで外したタグ (仕上げの書き直しが戻さないかも確かめる)
+        # キャラ名を本文に入れない種類か (今はどの種類も入れる。RESTYLES の names)
+        no_names = restyle != "none" and not RESTYLES[restyle]["names"]
+        if turnaround or no_identity or no_style or restyle != "none":
             # 撮影プリセットと同じく、本文・人物ごと・VLM の追加タグから外す。追加プロンプトのタブは画像のまま残す
             char_keys = {_tag_name(sd_tag(n)) for n, _ in tags.characters}
             style_name_keys = {_tag_name(sd_escape(n.lower())) for n in vlm.style_names}  # ⑦ の作品名・作者名
             char_keys |= {_tag_name(t) for t in shared_chars} - style_name_keys
 
-            def drops(t: str) -> bool:  # キャラ名は追加プロンプトの被写体の欄にも入っている
+            def drops_base(t: str) -> bool:  # キャラ名は追加プロンプトの被写体の欄にも入っている
                 return ((turnaround and turnaround_removes(t)) or (no_identity and (identity_tag(t) or _tag_name(t) in char_keys))
                         or (no_style and (style_removes(t) or _tag_name(t) in style_name_keys
                                           or t.lower().startswith("in the style of"))))
+
+            def drops(t: str) -> bool:
+                # 画風を変える: 元の画風のタグ、⑦ の作品名・作者名、(実写にするとき) キャラ名。VLM の自然文は捨てずに、
+                # 後で文の中の語を言い換える (restyle_text)
+                return (drops_base(t)
+                        or (restyle != "none" and (restyle_removes(t, restyle, style_matches) or _tag_name(t) in style_name_keys
+                                                   or t.lower().startswith("in the style of")
+                                                   or (no_names and _tag_name(t) in char_keys))))
 
             removed_all = [t for t in shared_general + extra_tags + [x for p in persons for x in p.get("tags", [])] if drops(t)]
             removed_all = [t for t in shared_chars if drops(t)] + removed_all
             shared_chars = [t for t in shared_chars if not drops(t)]  # ⑦ の作品名・作者名はキャラ名ではないので人物の特徴では外さない
             # 自然文の組み立て (VLM 無し) はタグからも直接読むので、外したタグとキャラ名を除いたものを渡す
             compose_tags = TagResult(tags.rating, tags.rating_conf, [(n, q) for n, q in tags.general if not drops(n)],
-                                     [] if no_identity else list(tags.characters), dict(tags.general_probs))
+                                     [] if no_identity or no_names else list(tags.characters), dict(tags.general_probs))
             shared_general = [t for t in shared_general if not drops(t)]
             extra_tags = [t for t in extra_tags if not drops(t)]
             persons = [p | {"tags": [x for x in p.get("tags", []) if not drops(x)],
@@ -6485,7 +7265,9 @@ class Engine:
                        for p in persons]
             compose_extras = {k: dict(v) for k, v in extras.items()}
             blank = ((["pose", "camera", "background", "objects", "lighting"] if turnaround else [])
-                     + (["subject", "face"] if no_identity else []) + (["style"] if no_style else []))
+                     + (["subject", "face"] if no_identity else [])
+                     # 画風を変える: 元の画像の画風の文は使わない (⑦ が同じ系統なら、⑦ から読んだ文は残す)
+                     + (["style"] if no_style or (restyle != "none" and not style_matches) else []))
             for key in compose_extras:
                 if key == "motion":
                     continue
@@ -6493,7 +7275,8 @@ class Engine:
                 if key in blank:  # VLM の文はその要素を書くので使わず、残ったタグで書く
                     compose_extras[key]["text"] = ""
                 compose_extras[key]["prompt"] = compose_extras[key]["text"] or ", ".join(compose_extras[key]["tags"])
-            leaked = mentions_any(natural_prompt, [_strip_weight(t) for t in removed_all]) if natural_prompt else []
+            leaked = (mentions_any(natural_prompt, [_strip_weight(t) for t in removed_all if drops_base(t)])
+                      if natural_prompt else [])
             if natural_prompt and no_style and medium_word(natural_prompt):
                 leaked.append("絵か写真か (" + ", ".join(sorted(set(re.findall(r"[a-z0-9-]+", natural_prompt.lower())) & MEDIUM_WORD_SET)) + ")")
             if leaked:
@@ -6503,7 +7286,10 @@ class Engine:
                                         "人物の特徴を入れない (髪・目・顔立ち・肌の色・キャラ名を外しました)" if no_identity else "",
                                         "作風の特徴を入れない (画風・技法・絵か写真か・年代・作品名 / 作者名を外し、品質タグ・ネガティブも"
                                         "絵か写真かに合わせた語を外しました)" if no_style else "") if x)
-            analysis += "\n" + what +(f": {', '.join(dedup(removed_all))}" if removed_all else "") + "。追加プロンプトのタブは画像のままです"
+            removed_base = [t for t in removed_all if drops_base(t)]
+            if what:
+                analysis += "\n" + what + (f": {', '.join(dedup(removed_base))}" if removed_base else "") + "。追加プロンプトのタブは画像のままです"
+            option_removed = dedup([t for t in removed_all if not drops_base(t)])
         if turnaround and kind != "prose":
             have = {_tag_name(t) for t in shared_general}
             shared_general = [t for t in TURNAROUND_TAGS if _tag_name(t) not in have] + shared_general
@@ -6551,10 +7337,29 @@ class Engine:
             natural_prompt=natural_prompt, persons=persons,
             quality_on=bool(cfg.get("quality_tags", True)), use_break=bool(cfg.get("use_break", True)),
             vlm_attempted=use_vlm, references=bool(ref_tags) or overridden, no_style=no_style,
+            style_first="style" in ref_tags and not no_style, age=main_age,
         )
         warnings += compose_warnings
-        if target == "mossimage" and not no_identity:
-            # カタログに載っているキャラは「名前 from 作品名」(カタログの書き方)
+        # 仕上げの書き直しは、枠ごとの内容を並べた文のときだけ (compose_positive が VLM の自然文を使わない条件と同じ)。
+        # VLM が画像を見て書いた文 (1 枚だけ) はそのまま使う: VLM をもう一度呼ぶと、その分だけ遅くなる
+        assembled = not natural_prompt or bool(ref_tags) or overridden or (len(persons) >= 2 and bool(persons[0].get("box")))
+        polish_started = time.time()
+        if kind == "prose" and target != "midjourney" and vlm.ok and assembled and cfg.get("polish_prose", True):
+            positive, polish_note, polish_warn = self._polish(
+                positive, target, shared_general + extra_tags, forbidden=displaced_all + removed_all,
+                style_first=("style" in ref_tags and not no_style) or restyle != "none",
+                names=shared_chars)  # キャラ名と ⑦ の作品名・作者名: 書き直しで落ちていたら使わない
+            analysis += polish_note
+            warnings += polish_warn
+            timing.append(("仕上げの書き直し", time.time() - polish_started))
+        if age_on and kind in ("prose", "anima") and (main_age or len(persons) >= 2):
+            # 年齢を文に書く (VLM の文が a young woman などと書いていたら、読んだ年齢に合わせて言い換える)。
+            # Anima はタグの後ろの文の部分だけ
+            age_head, age_sep, age_tail = positive.partition(". ") if kind == "anima" else ("", "", positive)
+            if age_tail:
+                positive = age_head + age_sep + apply_age_text(age_tail, persons, main_age, single_subject(tags))
+        if target == "mossimage" and not no_identity and not no_names:
+            # カタログに載っているキャラは「名前 from 作品名」(カタログの書き方)。実写にするときはキャラ名を書かない
             positive, catalog_note = moss_names_with_series(positive, list(tags.characters))
             analysis += catalog_note
         if turnaround and kind == "prose":  # 三面図の一文 (撮影プリセットなどより前)
@@ -6617,11 +7422,36 @@ class Engine:
         if no_style:  # 絵か写真かに合わせたネガティブの定番 (アニメ絵の realistic / 3d、写真の anime / illustration など) を外す
             negative = [n for n in negative if not medium_word(n)]
 
+        if restyle != "none":
+            # 画風を変える: 先頭でその画風だと書き、⑦ から読んだ文をその直後に、描き方・質感の文を最後に置く
+            shot = compose_extras["style"]["text"] if style_matches else ""
+            positive, restyle_words = restyle_text(positive, restyle, max(len(persons), hint_count), shot)
+            # 実写にするとき: キャラ名のタグは外してあるが、VLM が自然文に名前を書いていれば残る (文は言い換えない)
+            names_left = mentions_any(positive, [unescape_parens(sd_tag(n)) for n, _ in tags.characters]) if no_names else []
+            if names_left:
+                warnings.append("画風を変える: VLM の文にキャラ名 (" + ", ".join(names_left) + ") が残っています "
+                                "(名前は元の絵柄を呼び出すことがあります。気になるときは本文から消してください)")
+            analysis += (f"\n画風を変える (MOSS-Image): {RESTYLE_MODES[restyle]}。先頭でその画風だと書き、描き方・質感の文を足しました"
+                         + ("。⑦ 作風・質感から読んだ文は先頭の直後に置きました" if shot else "")
+                         + (f"。外した・言い換えた語: {', '.join(restyle_words)}" if restyle_words else "")
+                         + (f"。外したタグ: {', '.join(option_removed)}" if option_removed else "")
+                         + ("。キャラ名は絵柄を呼び出すので本文に入れていません"
+                            if no_names and tags.characters and not names_left else "")
+                         + (f"。キャラ名のタグは外しましたが、VLM の文に名前 ({', '.join(names_left)}) が残っています"
+                            if names_left else "")
+                         + "。ネガティブには、ほかの画風を抑える語を入れました (CFG 1 の高速 LoRA では効きません)")
+            if "style" in ref_tags and not style_matches:
+                warnings.append(f"画風を変える: ⑦ 作風・質感の画像が「{RESTYLE_MODES[restyle]}」と同じ系統と判定されなかったので、"
+                                "⑦ の画風は使いませんでした")
         positive, negative_text, persons, mosaic_prompt_applied = finalize_prompts(
             positive, negative, persons, kind, target, True,
             # モザイク指定はオンなら画像に関係なく常に入れる
             mosaic_level=cfg.get("mosaic_strength") if cfg.get("mosaic", False) else None,
         )
+        if restyle != "none":
+            negative_text = ", ".join(RESTYLES[restyle]["negative"])  # MOSS-Image のネガティブ欄 (ふだんは空)
+        if age_moss_negative:  # 画風を変えるの語があれば、その後ろに足す
+            negative_text = ", ".join(dedup([t.strip() for t in negative_text.split(",") if t.strip()] + age_moss_negative))
         if target == "novelai":
             for person, undesired in zip(persons, novelai_undesired(persons), strict=True):
                 person["undesired"] = undesired
@@ -6656,6 +7486,10 @@ class Engine:
         elif len(persons) >= 2:
             analysis += "\n品質チェック: 人数タグ・各人の特徴・区画の長さ・ネガティブとの矛盾に問題はありません"
 
+        total = time.time() - started
+        if total >= 1.0:  # どこが遅いかを見分けられるように (モデルの読み込みは含まない)
+            analysis += ("\nかかった時間: " + "、".join(f"{label} {secs:.1f} 秒" for label, secs in timing if secs >= 0.05)
+                         + f" (合計 {total:.1f} 秒)")
         tag_records = [
             {"tag": sd_tag(n), "raw": n, "conf": round(p, 4), "kind": "character"} for n, p in tags.characters
         ] + [
@@ -7101,11 +7935,34 @@ class Engine:
         face_extra = {"tags": list(main_tags), "text": text, "prompt": text or ", ".join(main_tags)}
         return out, main_tags, main_summary, "\n".join(notes), warnings, face_extra
 
+    def _polish(self, draft: str, target: str, shared: list[str], forbidden: list[str],
+                style_first: bool, names: list[str] | None = None) -> tuple[str, str, list[str]]:
+        """仕上げの書き直し (POLISH_SYSTEM): 枠ごとの内容を並べた文を、出力先の書き方で 1 つの文章にする。
+        戻り値: (本文, 分析メモに足す行, 注意)。失敗・内容が落ちたときは元の文のまま (中止だけは投げる)。"""
+        if not draft.strip():
+            return draft, "", []
+        try:
+            vlm = self.vlm()
+            self._check()
+            self.progress(f"VLM で文を仕上げています ({vlm.model})...")
+            text = vlm.rewrite(draft, polish_guidance(target), style_first)
+        except OperationCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001 - 仕上げは無くても結果は出せる
+            if self._cancel.is_set():
+                raise OperationCancelled() from e
+            return draft, "", [f"仕上げの書き直し: できませんでした ({describe_error(e)})。組み立てた文のままです"]
+        problem = polish_problem(draft, text, [_strip_weight(t) for t in shared], [_strip_weight(t) for t in forbidden],
+                                 [unescape_parens(_strip_weight(t)) for t in names or []])
+        if problem:
+            return draft, "", [f"仕上げの書き直し: 書き直した文は使いませんでした ({problem})。元の文のままです"]
+        return text, "\n仕上げの書き直し: 枠ごとに集めた内容を、1 つの文章に書き直しました (設定の「文を仕上げる」でオフにできます)", []
+
     def _run_vlm(
         self, image: Image.Image, tags: TagResult, medium: str, negative: list[str], target: str,
         size: tuple[int, int], vlm_refs: list[tuple[str, Image.Image, TagResult]], hint_count: int, hint_tags: list[str],
         extra_guidance: str = "", look: str = "", describe_image: Image.Image | None = None,
-        persons_guided: bool = False,
+        persons_guided: bool = False, polish_next: bool = False,
     ) -> VlmOutcome:
         """VLM で分析する。失敗してもタガーの結果で続けられるよう、理由を warnings に入れて空の結果を返す
         (中止だけは OperationCancelled を投げる)。"""
@@ -7148,7 +8005,13 @@ class Engine:
                     result.warnings.append(f"VLM の {REF_SLOTS[slot]} の分析をスキップしました: {describe_error(e)}")
             self._check()
             self.progress(f"VLM で分析中 ({vlm.model})...")
-            out = vlm.analyze(image, tags, medium, negative, guidance, vlm_refs, separate)
+            keep_before = vlm.keep_alive
+            if polish_next and keep_before == 0:
+                vlm.keep_alive = "2m"  # 続けて仕上げの書き直しがあるので、省 VRAM 設定でもそれまではモデルを降ろさない
+            try:
+                out = vlm.analyze(image, tags, medium, negative, guidance, vlm_refs, separate)
+            finally:
+                vlm.keep_alive = keep_before
             if "style" in separate:
                 # ⑦ があるときの画風は ⑦ の呼び出しだけから取る。思考モデルはスキーマを守らずに ① の画風を書いてくる
                 # ことがあり、⑦ の呼び出しが失敗するとそれが残った (実機: Krea 2 の Style: が ① の 2D anime aesthetic)
@@ -7173,6 +8036,7 @@ class Engine:
             result.analysis = (result.analysis + "\n\n" if result.analysis else "") + f"[{self._describer_label()} の説明]\n{described}"
         result.notes = llm_text(out.get("notes"))
         result.natural_prompt = llm_text(out.get("natural_prompt"))
+        result.age = clean_age(out.get("age"))
         result.extra_tags = clean_llm_tags(out.get("extra_tags"))
         # 参照画像から VLM が拾ったポーズ・服装のタグも本文に入れる。末尾ではなく服装・ポーズのタグの並びに置くので別に持つ
         if "pose" in slots:
@@ -7205,6 +8069,7 @@ class Engine:
                         "number": num,
                         "pose_tags": clean_llm_tags(entry.get("pose_tags"), limit=12),
                         "outfit_tags": clean_llm_tags(entry.get("outfit_tags"), limit=16),
+                        "age": clean_age(entry.get("age")),
                     })
             raw_inter = out.get("interactions") if isinstance(out.get("interactions"), list) else []
             for entry in raw_inter[:VLM_ARRAY_LIMITS["interactions"]]:
@@ -7233,6 +8098,7 @@ class VlmOutcome:
     analysis: str = ""
     notes: str = ""
     natural_prompt: str = ""
+    age: str = ""  # 1 人のときの年齢層 (AGE_BANDS。読めなければ空)
     extra_tags: list[str] = field(default_factory=list)
     negative: list[str] = field(default_factory=list)
     persons: list[dict[str, Any]] = field(default_factory=list)
@@ -7461,7 +8327,7 @@ def compose_positive(
     kind: str, target: str, *, tags: TagResult, medium: str, size: tuple[int, int], extras: dict[str, dict[str, Any]],
     shared_chars: list[str], shared_general: list[str], extra_tags: list[str], natural_prompt: str,
     persons: list[dict[str, Any]], quality_on: bool, use_break: bool, vlm_attempted: bool, references: bool = False,
-    no_style: bool = False,
+    no_style: bool = False, style_first: bool = False, age: str = "",
 ) -> tuple[str, list[str]]:
     """出力先の書式でポジティブプロンプトを組み立てる。戻り値: (ポジティブ, 注意)。
     references (最大 4 枚モード) では、VLM のまとめ文は ① の服・ポーズを持ち込むので使わず、枠ごとの内容から書く。"""
@@ -7475,11 +8341,12 @@ def compose_positive(
     if kind == "prose" and detected:
         # VLM の自然文は人物をまとめて書き、各人の特徴を落とす (実機の qwen2.5vl で「Each woman is wearing ...」になった)。
         # 人物は 1 人ずつ確かめたタグから書き、場所・照明・構図・画風には VLM の文があれば使う
-        return compose_prose_fallback(extras, medium, size, target, tags, persons), warnings
+        return compose_prose_fallback(extras, medium, size, target, tags, persons, style_first=style_first, age=age), warnings
     if kind == "prose" and references:
         # VLM の自然文は ② / ③ の役割を守らず ① の服やポーズで書くことがある (服装・ポーズが ① に負ける原因)。
         # 服装は ③、ポーズは ② から取ったタグ (と VLM の役割別の文) で書く
-        return compose_prose_fallback(extras, medium, size, target, tags, persons, use_text=True), warnings
+        return compose_prose_fallback(extras, medium, size, target, tags, persons, use_text=True,
+                                      style_first=style_first, age=age), warnings
     if kind == "prose" and natural_prompt:
         if target == "krea2":  # 画角を文の頭に (Krea 2 だけ)
             return krea_lead_with_framing(natural_prompt, krea_framing(tags)), warnings
@@ -7513,7 +8380,7 @@ def compose_positive(
         # VLM が無い / 失敗したときは、振り分けたタグから構造化した英文を組み立てる
         if vlm_attempted:
             warnings.append("VLM から自然文が得られなかったため、タグから組み立てた英文を出力しました。")
-        return compose_prose_fallback(extras, medium, size, target, tags, persons), warnings
+        return compose_prose_fallback(extras, medium, size, target, tags, persons, style_first=style_first, age=age), warnings
     if not quality_on:
         quality: list[str] = []
     elif target == "novelai":
@@ -8418,6 +9285,8 @@ def run_cli(args: argparse.Namespace) -> int:
         cfg["tagger_model"] = args.tagger
     if args.vlm:
         cfg["ollama_model"] = args.vlm
+    if args.describer:
+        cfg["describer_model"] = args.describer
     if args.host:
         cfg["ollama_host"] = args.host
     # --style は ⑦ 作風・質感の画像。旧オプション (--style tags / natural = 出力先) と同じ名前なので、その値で
@@ -8439,6 +9308,10 @@ def run_cli(args: argparse.Namespace) -> int:
         cfg["split_extras"] = True
     if args.split_background:
         cfg["split_background"] = True
+    if args.no_polish:
+        cfg["polish_prose"] = False
+    if args.no_age_look:
+        cfg["age_look"] = False
     if args.general_threshold is not None:
         cfg["general_threshold"] = args.general_threshold
     if args.character_threshold is not None:
@@ -8453,6 +9326,8 @@ def run_cli(args: argparse.Namespace) -> int:
         cfg["split_persons"] = False
     if args.gender:
         cfg["gender"] = args.gender
+    if args.restyle:
+        cfg["restyle"] = args.restyle
     if args.no_anatomy_guard:
         cfg["anatomy_guard"] = False
     if args.color:
@@ -9394,6 +10269,8 @@ HELP_SECTIONS: list[tuple[str, str]] = [
   SNS から保存した写真やスクリーンショットには撮影情報が残っていないことが多いです。
   撮影プリセット (構図と強さの「撮影」) を選んでいるときはプリセットを使い、撮影情報は分析メモに出すだけにします
 ・ネガティブ非対応の出力先 (Krea 2 など) では「アニメ絵を避ける」指定を書けないので、写真の指定は本文だけになります
+・MOSS-Image で、⑦ に写真を入れても 3DCG のようになるときは、「出力」欄の「画風変更」で「実写」を選んでください
+  (→「画風を変える (MOSS-Image)」)
 """),
     ("ポーズ・カメラ・強さを変える", """左の「構図と強さ」欄で、画像から読んだポーズや構図を上書きできます (LLM・GPU 不要)。何も指定しなければ画像のままです。
 
@@ -9484,7 +10361,8 @@ SDXL / NovelAI は重み (1.2 / 0.8)、ほかのタグ形式は並び順で表�
 ■ 自然文 (VLM 推奨)
 Flux.1 / SD3、FLUX.2、Krea 2、Qwen-Image、Z-Image Turbo、Z-Image、MOSS-Image、ChatGPT、Grok、Nano Banana、Midjourney
 ・Z-Image Turbo はネガティブが効かないので出しません。Z-Image (ベース) はネガティブを出します
-・MOSS-Image のネガティブ欄は空です (公式の既定も空)。必要なら自分で入れてください
+・MOSS-Image のネガティブ欄は空です (公式の既定も空)。必要なら自分で入れてください。「画風を変える」と「年齢の見た目を書く」は、
+  それぞれの語をこの欄に入れます (CFG 1 の高速 LoRA では、ネガティブ欄は効きません)
 ・MOSS-Image では、キャラ一覧 (hide1 の MOSS-Image Character & Style Catalog。LoRA なしの生成例で、選別されていません) に載っているキャラの名前を「名前 from 作品名」で書きます (例: dawn (pokemon) from pokemon。一覧の書き方で、公式資料には書き方がありません)。一覧は初めて MOSS-Image で分析するときに確かめてから取得します (約 7MB)。載っているかどうかと生成例の画像のアドレスは「分析」タブに出ます
 ・VLM が無いときは、タグから組み立てた英文になります
 ・ネガティブ非対応の出力先では、ネガティブ欄は空です
@@ -9543,12 +10421,104 @@ AI で作った画像に、作ったときのプロンプトが入っている�
 ・読める形式: A1111 / Forge、ComfyUI、NovelAI、Fooocus、InvokeAI
 ・SNS に上げた画像・スクリーンショット・貼り付けた画像など、情報が消えた画像からは読めません
 """),
+    ("先に画像の説明を書かせる (JoyCaption など)", """「⚙ 設定...」の「説明のモデル」にモデルを入れると、いつもの VLM の前に、そのモデルが画像の説明を書きます。
+説明は VLM に参考として渡され、「分析メモ」にも残ります。欄が空なら使いません (初期設定は空)。
+
+・候補に出る JoyCaption Beta One は、画像の説明を書くことに特化したモデルです (約 5.8GB)。Ollama にまだ無ければ、
+  欄の右の「取得」で取得できます
+・VLM の呼び出しが 1 回増えるので、そのぶん時間がかかります
+・説明を書けなかったときは、ステータス欄の「注意」に出して、いつもの分析を続けます
+・コマンドラインでは --describer モデル名
+"""),
+    ("年齢の見た目を書く", """出力に年齢が書かれていないと、生成する側のモデルの癖で年齢が決まります (文章で書くモデルは 20 代の大人に、
+アニメ系のタグのモデルは若く寄りがちです)。元の画像と同じ年齢で出るように、人物ごとに画像から読んだ年齢層を本文に書きます。
+
+■ 読み方
+・「タガー + VLM」のとき、VLM が人物ごとに年齢層を選びます (赤ちゃん / 幼児 / 子ども / 10〜12 歳 / 13〜17 歳 / 18〜29 歳 /
+  30 代 / 40 代 / 50 代 / 60 代 / 70 歳以上)。2 人以上のときも 1 人ずつ読みます
+・タガーが年齢のタグ (child / mature female / old man など) を出していれば、それも使います。子どもかどうか・高齢かどうかが
+  VLM とタガーで食い違うときは、タガーのタグに合わせます
+・「タガーのみ」のときは、タガーの年齢のタグだけから決めます
+・読んだ結果は「分析メモ」の「年齢の見た目」の行に出ます。VLM とタガーの読み取りなので、外れることがあります
+
+■ 書き方
+・文章の出力先: 人物を年齢に合った言い方で書きます (a little girl of elementary-school age / a teenage boy /
+  a woman in her forties / an elderly man など)。VLM の文が別の言い方 (a young woman など) をしていたら、言い換えます
+・タグの出力先: 年齢のタグを足します (child・female child / mature female / old man など。10 代と 20 代に当たる
+  Danbooru のタグは無いので足しません)。全員が大人のときはネガティブに child / aged down などを、全員が子どもの
+  ときは aged up / mature female などを入れます
+・Anima はタグと文の両方に書きます
+・MOSS-Image: 本文の言い方に加えて、ネガティブ欄にも、ずれる方向を抑える語を入れます (全員が大人のときは child /
+  childlike face / teenager、40 代から上だけなら young adult / youthful face も。全員が子どものときは adult /
+  mature face / middle-aged など)。CFG 1 の高速 LoRA (8 ステップ・4 ステップ) では、ネガティブ欄は効きません
+
+■ 年齢が書かれないとき
+・「人物の特徴を入れない」がオンのとき (年齢もその人の特徴として外れます)
+・2 人以上の画像で、人物ごとに分けていないとき (誰の年齢か結び付けられないので、書けません)
+・性的な内容と判定した画像の、18 歳未満に見える人物 (この機能では年齢を書けません。タガーと VLM が出した結果は、
+  そのまま出ます)
+・「⚙ 設定...」の「年齢の見た目を書く」をオフにしたとき
+"""),
+    ("文章の出力先の文 (MOSS-Image / Krea 2 など)", """文章で書く出力先 (MOSS-Image / Krea 2 / Qwen-Image / Z-Image / FLUX など) の本文は、条件によって作り方が違います。
+
+■ 文の作り方
+・1 枚だけ + 「タガー + VLM」: VLM が画像を見て書いた文を使います
+・複数枚モード (② 〜 ⑧ のどれかを使う)・2 人以上・ボーンやカメラを指定したとき: 枠ごとの内容を決まった順に並べます
+・「タガーのみ」: タグを文の形に並べます
+
+■ 文を仕上げる (「タガー + VLM」で、枠ごとの内容を並べた文のとき。初期設定はオン)
+・枠ごとの内容を並べた文は、見出しとタグの列になりがちです。集めた内容を VLM にもう一度渡して、出力先の書き方で
+  1 つの文章に書き直します (画像は見せません)
+・1 枚だけのときは VLM が画像を見て書いた文をそのまま使い、書き直しはしません (VLM をもう一度呼ぶと、そのぶん遅くなるため)
+・書き直した文が内容を落としていたり、キャラ名・作品名を落としていたり、外したはずの要素を書いていたり、画像の文字を変えていたりしたら使わず、元の文のままにします
+  (ステータス欄の「注意」に出ます)
+・VLM の呼び出しが 1 回増えます。「⚙ 設定...」の「文を仕上げる」でオフにできます
+・どこに時間がかかったかは、「分析メモ」の最後の「かかった時間」の行に出ます
+
+■ Danbooru の語
+タグから文を組み立てるときは、Danbooru だけで通じる語をふつうの英語にします
+(cowboy shot → framed from the thighs up、ahoge → a single upright strand of hair、serafuku → sailor-style school uniform など)。
+タグの出力先 (SDXL 系・NovelAI・Anima のタグ列) は、タグのままです。
+
+■ ⑦ 作風・質感を入れたとき
+・文章の出力先: 絵か写真かと画風を、文の最後ではなく先頭に書きます
+・タグの出力先: 画風のタグを、人数・キャラ名のすぐ後ろに置きます (前は服装・ポーズ・人物の後ろでした)
+・「構図と強さ」の「強さ」に「画風」があります。強い / 弱いを選ぶと、重みの書式がある出力先では画風のタグに重みを付けます
+  (⑦ が無くても使えます。文章の出力先には重みを付けられません)
+"""),
+    ("画風を変える (MOSS-Image)", """元の画像とは違う画風で作りたいとき、⑦ 作風・質感に見本を入れても、元の絵柄が勝つことがあります
+(絵を実写にしたら 3DCG のようになる、など)。人物の説明が元の画像から書かれることと、画風が文の後ろに回ることが原因です。
+「画風を変える」で種類を選ぶと、その画風の画像として書き直します。
+1. 出力先を MOSS-Image にする
+2. 左の「出力」欄の「画風変更」で種類を選ぶ (実写 / アニメ風 / 漫画風 (白黒) / 水彩 / 厚塗り / 油絵 / 鉛筆画)
+3. 「▶ 分析する」を押す (⑦ 作風・質感は入れなくても使えます)
+
+■ やること
+・本文の先頭で、その画風だと書きます (実写なら「実在の人物をカメラで撮った写真」、水彩なら「紙に描いた水彩画」など)
+・元の画風の語を外すか、その種類の語に言い換えます (実写にするなら anime-style illustration → photograph、
+  水彩にするなら photograph → watercolour painting など)。実写にするときは realistic / photorealistic を real にします
+  (「本物らしく描いた」という語で、CG の説明にも使われるため)
+・その画風にしかない描き方・質感の文を最後に足します (実写: 肌のきめ・髪の一本一本、アニメ風: 均一な線と 2 段階の影、
+  水彩: にじむ絵の具と紙の目、厚塗り: 筆の跡、鉛筆画: ハッチング、など)
+・⑦ の画像が選んだ種類と同じ系統 (写真 / 絵画 / 絵) なら、⑦ から読んだ文 (写真なら撮り方、絵なら塗り方) を先頭の直後に置きます。
+  系統が違うときは ⑦ の画風は使いません (ステータス欄の「注意」に出ます)
+・キャラクター名は、どの種類でも本文に残ります (実写でも同じです。誰の実写かは名前で決まるため)。
+  実写にしたのに元の絵柄に寄るときは、本文の名前を消して試してください
+・ネガティブ欄に、ほかの画風を抑える語を入れます。CFG 1 の高速 LoRA では効きません
+・「タガー + VLM」では、VLM にも元の画像の画風を書かないよう伝えます (実写にするときは、絵特有の大きな目などを実際の人の
+  特徴に言い換えさせます)
+
+■ 知っておくこと
+・MOSS-Image 以外の出力先では何もしません
+・「作風の特徴を入れない」と一緒には使えません (「画風を変える」を優先します)
+・外した語・言い換えた語は「分析メモ」に出ます
+"""),
     ("設定 (⚙ 設定...)", """よく変える設定は本画面の「出力」欄、それ以外は右上の「⚙ 設定...」にあります。変えた内容はすぐ反映され、config.json に保存されます。
 
 ■ 本画面の「出力」欄
 ・エンジン: 「タガー + VLM」(詳しい・遅い) / 「タガーのみ」(速い・オフライン)
-・出力先、モザイク指定 (強さ)、分身を防ぐ、性別をそろえる、白黒をカラーで出す、人物の特徴を詳しく (VLM)、
-  三面図にする、LoRA 用に入れない (人物の特徴 / 作風の特徴)
+・出力先、モザイク指定 (強さ)、分身を防ぐ、性別をそろえる、画風変更 (MOSS-Image)、白黒をカラーで出す、
+  人物の特徴を詳しく (VLM)、三面図にする、LoRA 用に入れない (人物の特徴 / 作風の特徴)
 
 ■ 「⚙ 設定...」
 ・タガー: モデル、しきい値 (一般 / キャラクター / 画風。下げるとタグが増える)
@@ -9579,6 +10549,7 @@ AI で作った画像に、作ったときのプロンプトが入っている�
 
 ■ 実写化したのに絵になる
 「分析メモ」の「絵か写真かの判定は ⑦ 作風・質感から」の行を見てください。写真らしさの値が 0.25 未満なら、別の写真を ⑦ に使ってください
+MOSS-Image で、写真と判定されているのに 3DCG のようになるときは、「出力」欄の「画風変更」で「実写」を選んでください (→「画風を変える (MOSS-Image)」)
 
 ■ 結果の中身を変えたい
 タグの塊で出ているときは、要らない塊を選んで Del で消します (→「結果を選り分ける」)。書き足したいときは
@@ -9977,6 +10948,13 @@ class App:
         self.gender_var = tk.StringVar(value=GENDER_MODES[current_gender])
         ttk.Combobox(grow, textvariable=self.gender_var, values=list(self.gender_labels), state="readonly", width=10).pack(
             side="left", padx=(6, 12))
+        # 画風を変える (MOSS-Image だけ)。行を増やすと 1152 × 633 に収まらないので、性別の行に置く
+        ttk.Label(grow, text="画風変更").pack(side="left")
+        self.restyle_labels = {v: k for k, v in RESTYLE_MODES.items()}
+        current_restyle = self.cfg.get("restyle") if self.cfg.get("restyle") in RESTYLE_MODES else "none"
+        self.restyle_var = tk.StringVar(value=RESTYLE_MODES[current_restyle])
+        ttk.Combobox(grow, textvariable=self.restyle_var, values=list(self.restyle_labels), state="readonly", width=8).pack(
+            side="left", padx=(4, 8))
         self.color_var = tk.BooleanVar(value=bool(self.cfg.get("remove_monochrome", False)))
         ttk.Checkbutton(grow, text="白黒をカラーで出す", variable=self.color_var).pack(side="left")
         self.details_var = tk.BooleanVar(value=bool(self.cfg.get("person_details", False)))
@@ -10205,6 +11183,22 @@ class App:
             return
         self._start_pull(name, translate=True)
 
+    def pull_describer(self) -> None:
+        """説明のモデル欄のモデルを Ollama に取得する (取得後も VLM 欄は変えない)。"""
+        if self.busy:
+            return
+        name = self.describer_var.get().strip()
+        if not name:
+            return
+        self._collect_settings()
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Ollama ({self.cfg['ollama_host']}) に説明のモデル「{name}」を取得しますか？\n数 GB のダウンロードになることがあります。",
+            parent=self.root,
+        ):
+            return
+        self._start_pull(name, describer=True)
+
     def _check_hf_model(self, text: str) -> None:
         """Hugging Face の URL: 公開 API でファイル一覧を確かめてから (別スレッド)、取得してよいか聞く。"""
         self._collect_settings()
@@ -10239,8 +11233,9 @@ class App:
         self.vlm_var.set(info["name"])
         self._start_pull(info["name"])
 
-    def _start_pull(self, name: str, translate: bool = False) -> None:
-        """確認済みのモデル名を Ollama に取得する (導入サポートからも呼ばれる)。translate: 訳のモデルとして取得する。"""
+    def _start_pull(self, name: str, translate: bool = False, describer: bool = False) -> None:
+        """確認済みのモデル名を Ollama に取得する (導入サポートからも呼ばれる)。translate: 訳のモデルとして、
+        describer: 説明のモデルとして取得する (どちらも VLM 欄は変えない)。"""
         cancel = threading.Event()
         if not self._start_busy(f"{name} を取得中...", cancel.set):
             return
@@ -10249,7 +11244,7 @@ class App:
         def worker() -> None:
             try:
                 OllamaVLM(host, name).pull(name, progress=lambda m: self.queue.put(("status", m)), cancel=cancel)
-                self.queue.put(("pulled_translate" if translate else "pulled", name))
+                self.queue.put(("pulled_describer" if describer else "pulled_translate" if translate else "pulled", name))
             except OperationCancelled:
                 self.queue.put(("cancelled", f"{name} の取得を中止しました (もう一度「追加 (pull)」を押すと続きから取得します)"))
             except Exception as e:  # noqa: BLE001
@@ -10864,9 +11859,12 @@ class App:
         self.cfg["mosaic_strength"] = self.mosaic_level_labels.get(self.mosaic_level_var.get(), DEFAULT_MOSAIC_LEVEL)
         self.cfg["split_extras"] = bool(self.split_var.get())
         self.cfg["split_background"] = bool(self.split_bg_var.get())
+        self.cfg["polish_prose"] = bool(self.polish_var.get())
+        self.cfg["age_look"] = bool(self.age_var.get())
         self.cfg["preview_mosaic"] = bool(self.preview_mosaic_var.get())
         self.cfg["result_chips"] = bool(self.chips_var.get())
         self.cfg["translate_model"] = self.translate_var.get().strip() or DEFAULT_CONFIG["translate_model"]
+        self.cfg["describer_model"] = self.describer_var.get().strip()
         self.cfg["ollama_model"] = self.vlm_var.get().strip() or DEFAULT_CONFIG["ollama_model"]
         host = self.host_var.get().strip() or DEFAULT_CONFIG["ollama_host"]
         if not re.match(r"^https?://", host, re.IGNORECASE):
@@ -10879,6 +11877,7 @@ class App:
         self.cfg["main_person_only"] = bool(self.main_person_var.get())
         self.cfg["split_persons"] = bool(self.split_persons_var.get())
         self.cfg["gender"] = self.gender_labels.get(self.gender_var.get(), "none")
+        self.cfg["restyle"] = self.restyle_labels.get(self.restyle_var.get(), "none")
         self.cfg["anatomy_guard"] = bool(self.anatomy_var.get())
         self.cfg["remove_monochrome"] = bool(self.color_var.get())
         self.cfg["avoid_same_face"] = bool(self.same_face_var.get())
@@ -10977,8 +11976,9 @@ class App:
         ttk.Spinbox(th, from_=0.05, to=0.95, increment=0.05, textvariable=self.style_th_var, width=5, format="%.2f").pack(
             side="left", padx=4)
 
+        # 枠の間は 5 (説明のモデルの行を足したとき、1280 × 720 の画面に収まるよう 8 から詰めた)
         v = ttk.LabelFrame(body, text="VLM (Ollama)", padding=(6, 4))
-        v.pack(fill="x", pady=(8, 0))
+        v.pack(fill="x", pady=(5, 0))
         v.columnconfigure(1, weight=1)
         ttk.Label(v, text="モデル").grid(row=0, column=0, sticky="w", **pad)
         self.vlm_var = tk.StringVar(value=self.cfg["ollama_model"])
@@ -10996,17 +11996,28 @@ class App:
         self.tr_pull_btn = ttk.Button(tb, text="取得", width=6, command=self.pull_translate)
         self.tr_pull_btn.pack(side="left")
         ttk.Label(tb, text="結果の日本語訳用", foreground="#666").pack(side="left", padx=(4, 0))
-        ttk.Label(v, text="Ollama URL").grid(row=2, column=0, sticky="w", **pad)
+        # 先に画像の説明を書かせるモデル (describer_model)。空なら使わない
+        ttk.Label(v, text="説明のモデル").grid(row=2, column=0, sticky="w", **pad)
+        self.describer_var = tk.StringVar(value=str(self.cfg.get("describer_model") or ""))
+        self.describer_box = ttk.Combobox(v, textvariable=self.describer_var,
+                                          values=["", *dedup([self.describer_var.get(), JOYCAPTION_MODEL])], width=36)
+        self.describer_box.grid(row=2, column=1, sticky="we", pady=2)
+        db = ttk.Frame(v)
+        db.grid(row=2, column=2, padx=(4, 0), pady=2, sticky="w")
+        self.desc_pull_btn = ttk.Button(db, text="取得", width=6, command=self.pull_describer)
+        self.desc_pull_btn.pack(side="left")
+        ttk.Label(db, text="先に説明を書かせる (空 = 使わない)", foreground="#666").pack(side="left", padx=(4, 0))
+        ttk.Label(v, text="Ollama URL").grid(row=3, column=0, sticky="w", **pad)
         self.host_var = tk.StringVar(value=self.cfg["ollama_host"])
-        ttk.Entry(v, textvariable=self.host_var, width=36).grid(row=2, column=1, sticky="we", pady=2)
+        ttk.Entry(v, textvariable=self.host_var, width=36).grid(row=3, column=1, sticky="we", pady=2)
         hb = ttk.Frame(v)
-        hb.grid(row=2, column=2, padx=(4, 0), pady=2, sticky="w")
+        hb.grid(row=3, column=2, padx=(4, 0), pady=2, sticky="w")
         ttk.Button(hb, text="再接続", width=6, command=self.reconnect_ollama).pack(side="left")
         self.setup_btn = ttk.Button(hb, text="導入...", width=6, command=self.open_ollama_setup)
         self.setup_btn.pack(side="left", padx=(3, 0))
 
         w = ttk.LabelFrame(body, text="プロンプトの書き方", padding=(6, 4))
-        w.pack(fill="x", pady=(8, 0))
+        w.pack(fill="x", pady=(5, 0))
 
         def check(parent: Any, var: "tk.BooleanVar", text: str) -> None:
             ttk.Checkbutton(parent, text=text, variable=var).pack(anchor="w")
@@ -11019,6 +12030,10 @@ class App:
         check(w, self.split_var, "カメラ・照明・画風のタグを本文から分離する (追加プロンプト側に出す)")
         self.split_bg_var = tk.BooleanVar(value=bool(self.cfg.get("split_background", False)))
         check(w, self.split_bg_var, "背景のタグを本文から分離する (本文は被写体だけ、背景は追加プロンプト側)")
+        self.polish_var = tk.BooleanVar(value=bool(self.cfg.get("polish_prose", True)))
+        check(w, self.polish_var, "文を仕上げる (文章の出力先・VLM: 集めた内容を 1 つの文章に書き直す。VLM の呼び出しが 1 回増える)")
+        self.age_var = tk.BooleanVar(value=bool(self.cfg.get("age_look", True)))
+        check(w, self.age_var, "年齢の見た目を書く (人物ごとに画像から読んだ年齢層を、文とタグに書く。元の画像と年齢がずれるのを防ぐ)")
         self.era_var = tk.BooleanVar(value=bool(self.cfg.get("era_tags", True)))
         check(w, self.era_var, "年代スタイル (1990s / 2010s など) を判定して画風タグに足す (イラスト系のみ、17MB のモデルを初回取得)")
         self.anatomy_var = tk.BooleanVar(value=bool(self.cfg.get("anatomy_guard", True)))
@@ -11027,14 +12042,14 @@ class App:
         check(w, self.same_face_var, "同じ顔を避ける (2 人以上ならネガティブに clone, twins など。ネガティブの無い出力先は本文で書き分け)")
 
         h = ttk.LabelFrame(body, text="人物", padding=(6, 4))
-        h.pack(fill="x", pady=(8, 0))
+        h.pack(fill="x", pady=(5, 0))
         self.main_person_var = tk.BooleanVar(value=bool(self.cfg.get("main_person_only", False)))
         check(h, self.main_person_var, "人物はメインの 1 人だけ (一番大きく写っている人を検出し、ほかの人はプロンプトに入れない。初回 44MB 取得)")
         self.split_persons_var = tk.BooleanVar(value=bool(self.cfg.get("split_persons", True)))
         check(h, self.split_persons_var, "2 人以上なら人物ごとに分ける (1 人ずつ切り出してタグ付けし、人数と特徴の取り違えを防ぐ)")
 
         o = ttk.LabelFrame(body, text="動作・表示", padding=(6, 4))
-        o.pack(fill="x", pady=(8, 0))
+        o.pack(fill="x", pady=(5, 0))
         self.low_vram_var = tk.BooleanVar(value=bool(self.cfg.get("low_vram", True)))
         check(o, self.low_vram_var, "GPU / VRAM の使用を抑える (タガーは CPU で、VLM は使い終わったらすぐ VRAM を空ける。VLM は毎回読み込み分遅くなる)")
         ttk.Checkbutton(o, text="プレビューをモザイク表示 (NSFW 対策。出力には影響しません)", variable=self.preview_mosaic_var,
@@ -11044,13 +12059,15 @@ class App:
                         variable=self.chips_var, command=self._toggle_chips).pack(anchor="w")
 
         foot = ttk.Frame(body)
-        foot.pack(fill="x", pady=(10, 0))
+        foot.pack(fill="x", pady=(6, 0))
         ttk.Label(foot, text="変えた内容はすぐ反映され、config.json に保存されます", foreground="#666").pack(side="left")
         ttk.Button(foot, text="閉じる", command=self.close_settings).pack(side="right")
         # 変えたらすぐ反映・保存 (入力中の数値を書き換えないよう、少し待ってから保存する)
         self._settings_save_job: str | None = None
-        for var in (self.tagger_var, self.general_th_var, self.character_th_var, self.style_th_var, self.vlm_var, self.translate_var, self.host_var,
-                    self.quality_var, self.break_var, self.split_var, self.split_bg_var, self.era_var, self.anatomy_var,
+        for var in (self.tagger_var, self.general_th_var, self.character_th_var, self.style_th_var, self.vlm_var, self.translate_var,
+                    self.describer_var, self.host_var,
+                    self.quality_var, self.break_var, self.split_var, self.split_bg_var, self.polish_var, self.age_var, self.era_var,
+                    self.anatomy_var,
                     self.same_face_var, self.main_person_var, self.split_persons_var, self.low_vram_var):
             var.trace_add("write", lambda *_a: self._schedule_settings_save())
 
@@ -11114,11 +12131,11 @@ class App:
         grid2.pack(fill="x", pady=(1, 1))
         ttk.Label(grid2, text="強さ").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.strength_vars: dict[str, tk.StringVar] = {}
-        for i, (group, label) in enumerate(STRENGTH_GROUPS):
-            ttk.Label(grid2, text=label).grid(row=i // 3, column=1 + (i % 3) * 2, sticky="e", padx=(6, 2), pady=1)
+        for i, (group, label) in enumerate(STRENGTH_GROUPS):  # 4 つずつ 2 行 (行を増やすと 1152 × 633 に収まらない)
+            ttk.Label(grid2, text=label).grid(row=i // 4, column=1 + (i % 4) * 2, sticky="e", padx=(4, 2), pady=1)
             var = tk.StringVar(value="普通")
-            ttk.Combobox(grid2, textvariable=var, values=["弱い", "普通", "強い"], state="readonly", width=5).grid(
-                row=i // 3, column=2 + (i % 3) * 2, sticky="w")
+            ttk.Combobox(grid2, textvariable=var, values=["弱い", "普通", "強い"], state="readonly", width=4).grid(
+                row=i // 4, column=2 + (i % 4) * 2, sticky="w")
             self.strength_vars[group] = var
 
     def controls(self) -> dict[str, Any]:
@@ -11223,6 +12240,7 @@ class App:
         self.run_btn.config(state="disabled")
         self.pull_btn.config(state="disabled")
         self.tr_pull_btn.config(state="disabled")
+        self.desc_pull_btn.config(state="disabled")
         if determinate:
             self.progress.config(mode="determinate", maximum=1.0, value=0.0)
         else:
@@ -11293,6 +12311,9 @@ class App:
                     models, vision = payload  # vision は絞り込み前なら None
                     self._known_models = models
                     self.translate_box["values"] = dedup(models + [self.translate_var.get().strip()] + TRANSLATE_CHOICES)  # 文字専用のモデルも選べる
+                    # 説明のモデルは画像を見るので、画像対応のモデルから (絞り込み前は全部)
+                    self.describer_box["values"] = ["", *dedup([self.describer_var.get().strip(), JOYCAPTION_MODEL]
+                                                               + list(vision if vision else models))]
                     self.vlm_box["values"] = self._vlm_choices(vision if vision else models)
                     current = self.vlm_var.get().strip()
                     hit = current in models or any(m.startswith(current + ":") for m in models)
@@ -11369,6 +12390,13 @@ class App:
                     self.translate_var.set(payload)
                     self._save_cfg()
                     self.status_var.set(f"取得完了 (訳のモデル): {payload}")
+                    self._probe_ollama_async()
+                elif kind == "pulled_describer":
+                    self._finish()
+                    self.cfg["describer_model"] = payload
+                    self.describer_var.set(payload)
+                    self._save_cfg()
+                    self.status_var.set(f"取得完了 (説明のモデル): {payload}")
                     self._probe_ollama_async()
                 elif kind == "hf_checked":
                     self._on_hf_checked(payload)
@@ -11454,6 +12482,7 @@ class App:
         self.run_btn.config(state="normal" if self._ready() else "disabled")
         self.pull_btn.config(state="normal")
         self.tr_pull_btn.config(state="normal")
+        self.desc_pull_btn.config(state="normal")
 
     def _show_result(self, result: PromptResult, mosaic_level: str | None = None) -> None:
         """結果を画面に出す。mosaic_level は解析に使ったモザイクの強さ (履歴から開いたとき。無ければ今回の解析の設定)。"""
@@ -11918,6 +12947,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--engine", choices=list(ENGINES), help="hybrid: タガー + VLM / tagger: タガーのみ")
     p.add_argument("--tagger", choices=list(TAGGER_MODELS), help=f"タガーモデル (既定: {DEFAULT_TAGGER})")
     p.add_argument("--vlm", metavar="MODEL", help="Ollama の画像対応モデル (既定: qwen3-vl:8b-instruct)")
+    p.add_argument("--describer", metavar="MODEL",
+                   help="先に画像の説明を書かせるモデル (JoyCaption Beta One: " + JOYCAPTION_MODEL + ")。書いた説明を VLM に参考として渡す")
     p.add_argument("--host", metavar="URL", help="Ollama のホスト (既定: http://localhost:11434)")
     p.add_argument(
         "--target", choices=list(TARGETS),
@@ -11928,6 +12959,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mosaic", action="store_true", help="プロンプトにモザイク指定 (censored, mosaic censoring) を追加する")
     p.add_argument("--split-extras", action="store_true", help="カメラ・照明・画風のタグを本文から外し、追加プロンプト側だけに出す")
     p.add_argument("--split-background", action="store_true", help="背景のタグを本文から外し、本文を被写体だけにする (背景は追加プロンプト側)")
+    p.add_argument("--no-age-look", action="store_true",
+                   help="年齢の見た目を書かない (人物ごとに画像から読んだ年齢層を、文とタグに書く処理を省く)")
+    p.add_argument("--no-polish", action="store_true",
+                   help="文を仕上げない (文章の出力先・VLM: 集めた内容を VLM に 1 つの文章へ書き直させる処理を省く)")
     p.add_argument("--mosaic-prompt", dest="mosaic", action="store_true", help=argparse.SUPPRESS)  # 旧名
     p.add_argument("--mosaic-strength", choices=list(MOSAIC_LEVELS), help="モザイク指定の強さ (既定 strong)")
     p.add_argument("--general-threshold", type=float, metavar="F", help="一般タグのしきい値 (既定 0.35)")
@@ -11943,6 +12978,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="2 人以上でも人物ごとに分けない (既定では人物を検出して 1 人ずつタグ付けし、人数タグを付け直す)",
     )
     p.add_argument("--gender", choices=["female", "male"], help="人物の性別をそろえる (female: 全員女性 / male: 全員男性)")
+    p.add_argument("--restyle", choices=list(RESTYLES),
+                   help="画風を変える (MOSS-Image だけ): photo (実写) / anime (アニメ風) / manga (漫画風・白黒) / watercolor (水彩) / "
+                        "thick (厚塗り) / oil (油絵) / pencil (鉛筆画)。元の画像とは違う画風の画像として書く")
     p.add_argument("--no-anatomy-guard", action="store_true", help="人物の破綻を防ぐネガティブ (bad anatomy など) を足さない")
     p.add_argument("--color", action="store_true", help="白黒の情報を消す: 元画像が白黒でも白黒のタグを外してカラーで出す")
     p.add_argument("--person-details", action="store_true",
@@ -11979,7 +13017,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--look", metavar="NAME", help="撮影プリセットの名前 (config.json の camera_looks。例: \"ポートレート 85mm\")。"
                    "画像から読んだレンズ・照明の質をプリセットの文に置き換える")
     p.add_argument("--strength", metavar="SPEC", help="枠ごとの強さ。例: outfit=strong,background=weak "
-                   "(枠: person / pose / outfit / body / props / background、強さ: strong / normal / weak)")
+                   "(枠: person / pose / outfit / body / props / background / style、強さ: strong / normal / weak)")
     p.add_argument("--json", action="store_true", help="結果を JSON で出力する")
     p.add_argument("--save", action="store_true", help="各画像の隣に <名前>_prompt.txt を保存する")
     p.add_argument("--out", metavar="FILE", help="全結果をこのファイルにまとめて書き出す")

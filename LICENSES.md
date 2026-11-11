@@ -6,7 +6,7 @@
 
 | 名称 | 用途 | ライセンス | 組み込み方 |
 |---|---|---|---|
-| i2t（作者: ShimoharaErnestoAne。LoRAtelier と同じ） | 「画像からプロンプト」（`engines/i2t/` に版を固定して同梱、解析用環境で実行） | PolyForm Noncommercial 1.0.0 と追加の条件（LoRAtelier と同じ） | 同梱の訳の辞書 `assets/tags_ja.json` は WD Tagger v3 のタグ一覧（Apache-2.0, SmilingWolf）を Index-Translate-2B（Apache-2.0, IndexTeam）で訳し、手直ししたもの。実行時に取得するモデル（WD14 タガー、DeepGHS の人物検出・年代判定、RTMPose-s）はそれぞれの利用条件に従う |
+| i2t（作者: ShimoharaErnestoAne。LoRAtelier と同じ） | 「画像からプロンプト」（`engines/i2t/` に版を固定して同梱、解析用環境で実行） | PolyForm Noncommercial 1.0.0 と追加の条件（LoRAtelier と同じ） | 同梱の訳の辞書 `assets/tags_ja.json` は WD Tagger v3 のタグ一覧（Apache-2.0, SmilingWolf）を Index-Translate-2B（Apache-2.0, IndexTeam）で訳し、手直ししたもの。実行時に取得するモデルとデータは、下の「「画像からプロンプト」が取得するモデル・データ」の表のとおりで、それぞれの利用条件に従う |
 | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) | SDXL / Anima の LoRA 学習 | Apache-2.0 | 別プロセスで実行（`engines.lock.json` の commit に固定） |
 | [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) | Qwen-Image・Z-Image の LoRA 学習（Krea 2 用の部分は積み残し） | Apache-2.0 | 別プロセスで実行（commit 固定） |
 | [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) dev ブランチ | Qwen-Image-2.1 の LoRA 学習 | Apache-2.0 | PR #1145 を取り込んだ commit（9702b25）に固定。Qwen-Image-2.1 学習用ファイルを追加したときだけ取得します |
@@ -34,6 +34,25 @@
 | Qwen/Qwen3-VL-4B-Instruct | 自然文の説明文生成 | Apache-2.0 |
 
 [IQA-PyTorch](https://github.com/chaofengc/IQA-PyTorch) は PolyForm Noncommercial 等の記載があるため採用していません（画質は機械的な指標で判定）。
+
+## 「画像からプロンプト」が取得するモデル・データ
+
+どれも配布物には含めていません。使うときに、確認の上でこの PC に取得します（Ollama のモデルは Ollama に取得します）。
+
+| 名称 | 用途 | ライセンス（配布元のページの表記） |
+|---|---|---|
+| WD Tagger v3 シリーズ（[SmilingWolf](https://huggingface.co/SmilingWolf)。wd-eva02-large-tagger-v3 など 5 種類） | タガー（選んだものだけ取得） | Apache-2.0 |
+| PixAI Tagger v0.9（[deepghs/pixai-tagger-v0.9-onnx](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)。元のモデルは [pixai-labs/pixai-tagger-v0.9](https://huggingface.co/pixai-labs/pixai-tagger-v0.9)、ONNX への変換は DeepGHS） | タガー（選んだときだけ取得） | Apache-2.0 |
+| [deepghs/anime_rating](https://huggingface.co/deepghs/anime_rating)（mobilenetv3_v1_pruned_ls0.1） | レーティングの判定（PixAI Tagger v0.9 はレーティングを出さないので、一緒に取得） | MIT |
+| Camie Tagger v2（[Camais03/camie-tagger-v2](https://huggingface.co/Camais03/camie-tagger-v2)） | タガー（選んだときだけ取得） | GPL-3.0。同梱していません。タガーにこれを選び、確認の上で取得したときだけ、この PC のモデルの場所に置いて使います。語彙の一覧（metadata.json）は、この PC の中で selected_tags.csv の形に直して置きます |
+| [deepghs/anime_style_ages](https://huggingface.co/deepghs/anime_style_ages)（mobilenetv3_v0_dist） | 年代スタイルの判定 | OpenRAIL |
+| [deepghs/anime_person_detection](https://huggingface.co/deepghs/anime_person_detection)（person_detect_v1.3_s）、[deepghs/anime_head_detection](https://huggingface.co/deepghs/anime_head_detection)（head_detect_v2.0_s） | 人物ごとに分けるときの人物・頭部の検出 | MIT |
+| RTMPose-s（[OpenMMLab MMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose)。rtmpose-s_simcc-body7_pt-body7_420e-256x192） | ポーズ編集の骨格の推定 | Apache-2.0 |
+| [MOSS-Image Character & Style Catalog](https://huggingface.co/spaces/hide1/MOSS-Image-Character-Catalog)（hide1。catalog.json、Space の版 43eac1d） | MOSS-Image のキャラ一覧（名前・作品名・画像の id だけを残して保存。画像生成のタグの入力補完でも同じ一覧を使います） | コードとドキュメントは MIT ですが、一覧のデータと生成画像は MIT の範囲外です（カタログの NOTICE.md）。キャラ・作品・画風の権利は各権利者に帰属します |
+| Index-Translate-2B の GGUF（[IndexTeam/Index-Translate-2B-GGUF](https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF)。Ollama に取得） | 辞書に無い語の日本語訳（既定の「訳のモデル」） | Apache-2.0 |
+| PLaMo 3 Translate 2B / 8B の GGUF（Ollama に取得） | 「訳のモデル」で選べる翻訳モデル | PLaMo Community License（下の「ベースモデル」の表にも記載） |
+| JoyCaption Beta One の GGUF（[cinnabrad/llama-joycaption-beta-one-hf-llava-mmproj-gguf](https://huggingface.co/cinnabrad/llama-joycaption-beta-one-hf-llava-mmproj-gguf)。元のモデルは [fancyfeast/llama-joycaption-beta-one-hf-llava](https://huggingface.co/fancyfeast/llama-joycaption-beta-one-hf-llava)。Ollama に取得） | 先に画像の説明を書かせるモデル（選んだときだけ取得） | ライセンスの表示は、取得元のモデルカードにも、元のモデルのモデルカードにもありません。元のモデルの説明には "Always released for free, open weights, no restrictions" とあります。作者のコードのリポジトリ（[fpgaminer/joycaption](https://github.com/fpgaminer/joycaption)）は Apache-2.0 で、土台の言語モデルは Llama 3.1 です |
+| Qwen3-VL / Qwen2.5-VL / Qwen3.5 / Qwen3.6 / Qwen3.8 / Gemma 4 と、それらの検閲なし版（huihui_ai）などの VLM（Ollama に取得） | 画像の分析（「タガー + VLM」） | 各モデルのライセンスに従います（使うモデルの配布元のページで確かめてください） |
 
 ## UI・サーバー
 

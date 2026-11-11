@@ -55,23 +55,37 @@ def save(graph: dict, source: str, summary: str) -> dict:
     return meta
 
 
+_read_cache: dict[str, tuple] = {}   # wid -> ((mtime_ns, size), content): the page asks for the same workflow on every update
+
+
 def _read(wid) -> dict | None:
     if not isinstance(wid, str) or not re.fullmatch(r"[0-9a-f]{12}", wid):
         return None
+    p = DIR / f"{wid}.json"
     try:
-        return json.loads((DIR / f"{wid}.json").read_text(encoding="utf-8"))
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = _read_cache.get(wid)
+        if hit and hit[0] == sig:
+            return hit[1]
+        d = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        _read_cache.pop(wid, None)
         return None
+    if len(_read_cache) >= 32:
+        _read_cache.clear()
+    _read_cache[wid] = (sig, d)
+    return d
 
 
 def load(wid) -> dict | None:
     d = _read(wid)
-    return d["graph"] if d else None
+    return copy.deepcopy(d["graph"]) if d else None   # the caller's own: the kept one is never changed
 
 
 def meta(wid) -> dict | None:
     d = _read(wid)
-    return d["meta"] if d else None
+    return dict(d["meta"]) if d else None
 
 
 # ------------------------------------------------------------------------------------- prompt text
@@ -239,6 +253,19 @@ def same_names(name: str) -> set[str]:
     return next(({_stem(n) for n in grp} for grp in SAME_FILE if s in {_stem(n) for n in grp}), {s})
 
 
+def nested_loras(inputs: dict) -> list[tuple[str, dict]]:
+    """(input, value) of the LoRAs a node keeps as {"on", "lora", "strength"} values of its own (rgthree's Power Lora
+    Loader: lora_1, lora_2, ...), not as a lora_name input."""
+    return [(k, v) for k, v in (inputs or {}).items()
+            if isinstance(v, dict) and isinstance(v.get("lora"), str) and v["lora"].strip() and v["lora"] != "None"]
+
+
+def lora_in_use(v: dict) -> bool:
+    """A nested LoRA that is switched on (rgthree skips the ones turned off or at strength 0)."""
+    two = v.get("strengthTwo")
+    return bool(v.get("on", True)) and (v.get("strength") != 0 or two not in (None, 0))
+
+
 def resolve_files(graph: dict, files: dict[str, list[str]], stage, models: list[dict] = ()) -> tuple[dict, list[str], dict | None]:
     """File names pointed at this PC's files (stage(kind, path) -> the name ComfyUI knows it by).
     A name not here that is another version / name of a file the workflow's model is set up with here (e.g.
@@ -261,6 +288,15 @@ def resolve_files(graph: dict, files: dict[str, list[str]], stage, models: list[
                                                            for s in ("gen", "turbo", "ckpt"))), None)
             else:
                 todo.append((inputs, key, kind, v))
+        for _key, v in nested_loras(inputs):   # the LoRA's own name, or another name of the very same file
+            names = same_names(v["lora"])
+            hit = next((p for p in files.get("loras", []) if _stem(p) == _stem(v["lora"])), None) \
+                or next((p for p in files.get("loras", []) if _stem(p) in names), None)
+            if hit:
+                if _stem(hit) != _stem(v["lora"]):
+                    notes.append(f"workflow の「{Path(v['lora'].replace(chr(92), '/')).name}」は、このパソコンの"
+                                 f"「{Path(hit).name}」と同じファイルなので、それを使いました。")
+                v["lora"] = stage("loras", hit)
     for inputs, key, kind, v in todo:
         name = Path(v.replace(chr(92), "/")).name
         group = next(({_stem(n) for n in grp} for grp in SAME_FILE if _stem(v) in {_stem(n) for n in grp}), None)
@@ -399,6 +435,7 @@ def check(graph: dict, info: dict) -> list[str]:
     if miss := missing_nodes(graph, set(info)):
         errors.append("この workflow には、ここの ComfyUI に入っていないノードがあります: " + "、".join(miss) +
                       "。カスタムノードは、このアプリが入れたもの（ComfyUI-GGUF・ComfyUI-ppm・rgthree-comfy など）しか使えません。")
+    loras = _lora_options(info)
     for nid, node in _nodes(graph):
         spec = info.get(str(node.get("class_type")))
         if not spec:
@@ -409,7 +446,26 @@ def check(graph: dict, info: dict) -> list[str]:
             if isinstance(v, str) and isinstance(opts, list) and opts and v not in opts and key in FILE_INPUTS:
                 errors.append(f"「{Path(v.replace(chr(92), '/')).name}」が見つかりません（{node.get('class_type')} の {key}）。"
                               "モデルのフォルダーに置いてください。")
+        # a nested LoRA (rgthree's Power Lora Loader) the ComfyUI here does not have is skipped by that node without
+        # a word, and the image comes out without it: said here, as for every other loader
+        for _key, v in nested_loras(node.get("inputs") or {}):
+            if loras is not None and lora_in_use(v) and v["lora"] not in loras and _stem(v["lora"]) not in {_stem(x) for x in loras}:
+                errors.append(f"「{Path(v['lora'].replace(chr(92), '/')).name}」が見つかりません（{node.get('class_type')} の LoRA）。"
+                              "モデルのフォルダーに置いてください。")
     return errors
+
+
+def _lora_options(info: dict) -> list[str] | None:
+    """The LoRA files the running ComfyUI lists (LoraLoader's lora_name choices), None when it does not say."""
+    try:
+        spec = info["LoraLoader"]["input"]["required"]["lora_name"]
+    except (KeyError, TypeError):
+        return None
+    opts = spec[0] if isinstance(spec, (list, tuple)) and spec else None
+    if isinstance(opts, list):
+        return [str(x) for x in opts]
+    more = spec[1] if isinstance(spec, (list, tuple)) and len(spec) > 1 and isinstance(spec[1], dict) else {}
+    return [str(x) for x in more["options"]] if isinstance(more.get("options"), list) else None
 
 
 def summary(info: dict) -> str:

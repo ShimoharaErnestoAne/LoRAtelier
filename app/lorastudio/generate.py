@@ -444,7 +444,17 @@ PLACE_NOUNS = {
     "stage", "shrine", "temple", "castle", "ruins", "space", "interior", "hallway", "station", "background",
 }
 _BG_PHRASES = ("background", "scenery", "outdoors", "indoors", "landscape", "cityscape")
-_PLACE_RE = r"\b(in|at|on|inside|outside|under|by) (a|an|the) (\w+ ){0,2}(" + "|".join(sorted(PLACE_NOUNS)) + r")\b"
+# Natural language: "in a cafe", "on the beach", "in a field of flowers".  The place noun must end the phrase (the
+# end of the chunk, or a word that starts the next part): "in a school uniform", "in a sky blue dress" and "in a forest
+# green cloak" describe the character, not a place.
+_PLACE_RE = (r"\b(?:in front of|inside|outside|under|near|in|at|on|by) (?:a|an|the) (?:[\w'-]+ ){0,2}(?:"
+             + "|".join(sorted(PLACE_NOUNS)) + r")\b"
+             r"(?: (?:full of|filled with|of) (?:[\w'-]+ ){0,2}[\w'-]+)?"
+             r"(?=\s*(?:$|[,.;:!?)])|\s+(?:and|with|while|as|where|at|in|on|near|by|during|under|behind|beside|wearing|"
+             r"holding|looking|smiling|standing|sitting|facing|posing)\b)")
+# "against a white background", "with a city skyline backdrop", and the words that are a background by themselves
+_BG_CUT_RE = (r"\b(?:in front of|against|with|over|on|in) (?:a|an|the) (?:[\w'-]+ ){0,3}"
+              r"(?:background|backdrop|scenery|landscape|cityscape)\b|\b(?:outdoors|indoors)\b")
 
 
 def strip_background(positive: str, caption_style: str) -> tuple[str, list[str]]:
@@ -462,15 +472,26 @@ def strip_background(positive: str, caption_style: str) -> tuple[str, list[str]]
             else:
                 kept.append(w)
         return ", ".join(kept), removed
-    # natural language: drop comma / sentence chunks that describe the background or the place
-    parts = [p for p in re.split(r"(?<=[,.;])\s*", positive) if p.strip()]
+    # natural language, per comma / sentence chunk: the phrase that names the place or the background is cut out and
+    # the rest of the chunk stays ("A woman with red hair sits in a cafe." keeps the woman).  A chunk that is about
+    # the background in another way ("The background is a busy street.") goes as a whole.  The split needs a space
+    # after the mark, so "f/1.8" and "1,000" stay in one piece.
+    parts = [p for p in re.split(r"(?<=[,.;])\s+", positive) if p.strip()]
     kept, removed = [], []
     for p in parts:
-        low = p.lower()
-        if any(k in low for k in _BG_PHRASES) or re.search(_PLACE_RE, low):
+        cut: list[str] = []
+
+        def take(m):
+            cut.append(m.group(0))
+            return ""
+        rest = re.sub(_BG_CUT_RE, take, re.sub(_PLACE_RE, take, p, flags=re.I), flags=re.I)
+        if any(k in rest.lower() for k in _BG_PHRASES):
             removed.append(p.strip(" ,.;"))
-        else:
-            kept.append(p)
+            continue
+        removed += cut
+        rest = re.sub(r"\s+([,.;:!?])", r"\1", re.sub(r"\s{2,}", " ", rest)).strip()
+        if re.search(r"\w", rest):
+            kept.append(rest)
     return " ".join(kept).strip(), removed
 
 
@@ -600,7 +621,7 @@ def prompt_style(model: dict | None) -> str:
 # ======================================================================== ComfyUI graph
 def _stage(kind: str, src: str) -> str:
     """Expose a file to ComfyUI without copying (evaluate.Comfy.stage_model: hard link in a subfolder per
-    source folder)."""
+    source file)."""
     return comfy.stage_model(kind, src)
 
 
@@ -986,7 +1007,11 @@ def check_prompt(project) -> dict:
     with project.tx() as db:
         for r, probs in zip(need, res["tags"]):
             spec = json.loads(r["spec"] or "{}")
-            req = promptkeep.requested(spec.get("positive", ""), spec.get("prompt_style", "tags"))
+            # what was generated from: the background and the shot words (pose, expression, framing) the user
+            # wrote are taken out before generating (compose_prompt), so they are not asked of the picture
+            style = spec.get("prompt_style", "tags")
+            asked = strip_shot_words(strip_background(spec.get("positive", ""), style)[0], style)[0]
+            req = promptkeep.requested(asked, style)
             out = promptkeep.check(req, probs, json.loads(r["shot"] or "{}"))
             bad = bool(out["conflicts"] or out["missing"])
             mismatch += bad

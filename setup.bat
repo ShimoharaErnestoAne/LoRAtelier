@@ -14,39 +14,47 @@ pause
 exit /b %RC%
 
 #POWERSHELL#
+# A folder name with [ or ] (D:\[AI]\LoRAtelier): PowerShell reads them as wildcards.  It cannot even start in such
+# a folder (it falls back to its own), and Test-Path / New-Item / Expand-Archive miss the files there.  So: go to
+# this file's folder literally, and name every file by its full path through .NET, which takes [ ] as they are.
+$root = [IO.Path]::GetDirectoryName($env:LS_SETUP)
+Set-Location -LiteralPath $root
 Write-Host 'LoRAtelier 初回セットアップ（数 GB のダウンロードがあります）'
 Write-Host 'ベースモデルはここでは取得しません。起動後の画面からダウンロードするか、models フォルダーに置いてください。'
 # The package has no models folder: create the empty folders for model files.
 foreach ($d in 'checkpoints', 'loras', 'diffusion_models', 'text_encoders', 'vae') {
-  New-Item -ItemType Directory -Force -Path (Join-Path 'models' $d) | Out-Null
+  [IO.Directory]::CreateDirectory([IO.Path]::Combine($root, 'models', $d)) | Out-Null
 }
 
 # Do not use a Python already on the PC (e.g. miniconda): its old DLLs can break torch / onnxruntime.
 # Fetch uv into tools\uv and run the setup on the Python 3.11 that uv provides (nothing installed PC-wide).
 # uv.exe is used only after it runs (a half-extracted uv is removed and fetched again).
 $uvVer = '0.11.14'
-$uv = Join-Path $PWD.Path 'tools\uv\uv.exe'
-function Test-Uv { (Test-Path $uv) -and ((& $uv --version 2>$null) -ne $null) }
+$uvDir = [IO.Path]::Combine($root, 'tools', 'uv')
+$uv = [IO.Path]::Combine($uvDir, 'uv.exe')
+function Test-Uv { [IO.File]::Exists($uv) -and ((& $uv --version 2>$null) -ne $null) }
+function Remove-UvDir { if ([IO.Directory]::Exists($uvDir)) { [IO.Directory]::Delete($uvDir, $true) } }
 if (-not (Test-Uv)) {
-  if (Test-Path 'tools\uv') { Remove-Item -Recurse -Force 'tools\uv' }
   Write-Host 'セットアップ用の Python を、このフォルダーの中に用意します。'
   try {
+    Remove-UvDir
     # old Windows 10 PowerShell connects with TLS 1.0, which GitHub refuses
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $z = Join-Path $env:TEMP ('lorastudio_uv_' + [guid]::NewGuid().ToString('N') + '.zip')
     Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/astral-sh/uv/releases/download/$uvVer/uv-x86_64-pc-windows-msvc.zip" -OutFile $z -ErrorAction Stop
-    Expand-Archive -Force $z 'tools\uv' -ErrorAction Stop
-    Remove-Item $z
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($z, $uvDir)
+    Remove-Item -LiteralPath $z
   } catch {
     Write-Host $_.Exception.Message
   }
 }
 if (-not (Test-Uv)) {
-  if (Test-Path 'tools\uv') { Remove-Item -Recurse -Force 'tools\uv' }
+  try { Remove-UvDir } catch { }
   Write-Host 'uv を取得できませんでした。インターネットへの接続（プロキシを含む）を確認してから、setup.bat をもう一度実行してください。'
   exit 1
 }
-$env:PATH = (Split-Path $uv) + ';' + $env:PATH
-$env:UV_PYTHON_INSTALL_DIR = Join-Path $PWD.Path 'tools\python'
+$env:PATH = $uvDir + ';' + $env:PATH
+$env:UV_PYTHON_INSTALL_DIR = [IO.Path]::Combine($root, 'tools', 'python')
 & $uv run --no-project --python 3.11 --python-preference only-managed setup_env.py
 exit $LASTEXITCODE

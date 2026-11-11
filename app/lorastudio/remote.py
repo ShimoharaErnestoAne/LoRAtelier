@@ -12,9 +12,11 @@ used for the request and not stored.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import struct
@@ -389,6 +391,23 @@ def safe_name(name: str) -> str:
     return name
 
 
+def _site_of(url: str) -> str | None:
+    """"huggingface" / "civitai" for an https link to that site (the host itself or a subdomain of it), else None."""
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    if u.scheme != "https":
+        return None
+    for site, domain in (("huggingface", "huggingface.co"), ("civitai", "civitai.com")):
+        if host == domain or host.endswith("." + domain):
+            return site
+    return None
+
+
+def disk_full(e: BaseException) -> bool:
+    """Is this OSError "no space left on the drive" (not a dropped connection)?"""
+    return isinstance(e, OSError) and (e.errno == errno.ENOSPC or getattr(e, "winerror", None) in (39, 112))
+
+
 _place_lock = threading.Lock()   # choosing a free final name and moving the file there is one step
 
 
@@ -408,9 +427,13 @@ def start_download(url: str, name: str, site: str, token: str | None = None, var
     name = safe_name(name)
     if not name.lower().endswith(SAFE_EXT):
         raise ValueError("safetensors か GGUF のファイルだけを取得します")
-    host = urllib.parse.urlparse(url).netloc.lower()
-    if not (host.endswith("huggingface.co") or host.endswith("civitai.com")):
+    # the site is read from the link itself, never taken from the request: the token for one site must not be
+    # sent to another host ("evilhuggingface.co" also ends with "huggingface.co")
+    site = _site_of(url)
+    if not site:
         raise ValueError("Hugging Face か Civitai のファイルだけを取得できます")
+    # as 「調べる」 does: a token set in the environment is used when none was typed
+    token = token or os.environ.get("HF_TOKEN" if site == "huggingface" else "CIVITAI_TOKEN") or None
     key = hashlib.sha1(url.encode()).hexdigest()[:12]
     with _lock:
         if _state.get(key, {}).get("state") == "running":
@@ -436,9 +459,10 @@ def _download(st: dict, url: str, name: str, headers: dict, hint: str | None):
         if not cls.get("ok"):
             raise ValueError(cls.get("reason") or "このツールで使える種類のファイルではありません")
         free = shutil.disk_usage(tmp.parent).free
-        if st["total_bytes"] and free < st["total_bytes"] + (2 << 30):
-            raise RuntimeError(f"空き容量が不足しています（必要 約{st['total_bytes'] / 1e9:.1f}GB / 空き {free / 1e9:.1f}GB）")
         have = tmp.stat().st_size if tmp.exists() else 0
+        need = max(0, st["total_bytes"] - have)   # an interrupted download is continued: only the rest is needed
+        if st["total_bytes"] and free < need + (2 << 30):
+            raise RuntimeError(f"空き容量が不足しています（あと 約{need / 1e9:.1f}GB 必要 / 空き {free / 1e9:.1f}GB）")
         h = dict(headers)
         if have:
             h["Range"] = f"bytes={have}-"
@@ -462,6 +486,9 @@ def _download(st: dict, url: str, name: str, headers: dict, hint: str | None):
             if not (e.code == 416 and have):   # 416: the .part is already whole (the last try ended after the last byte)
                 raise
         except OSError as e:   # timeout, reset: the .part is kept, and pressing again continues it
+            if disk_full(e):
+                raise RuntimeError("空き容量がなくなったため、ダウンロードを中断しました。空きを増やしてからもう一度「追加する」を押すと、"
+                                   f"続きから取得します（{tmp.stat().st_size / 1e9 if tmp.exists() else 0:.2f}GB まで取得済み）。") from e
             raise RuntimeError("接続が途中で切れました。もう一度「追加する」を押すと続きから取得します"
                                f"（{tmp.stat().st_size / 1e9 if tmp.exists() else 0:.2f}GB まで取得済み）。") from e
         # read() also ends quietly when the connection drops: the .part is kept, and pressing again continues it

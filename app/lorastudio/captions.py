@@ -32,8 +32,17 @@ _FEATURE_PATTERNS = [
     r".*(animal|cat|fox|dog|wolf|rabbit|horse|elf|pointy) ears$", r".* tail$", r"^horns?$", r".* horns?$", r"^wings$",
     r".* wings$", r"^halo$", r"^(dark|pale|tan|tanned|blue|green|grey|red|white) skin$", r"^freckles$", r"^mole.*$",
     r"^fang$", r"^fangs$", r"^skin fang$", r"^(flat|small|medium|large|huge|gigantic) breasts$", r"^facial mark$",
-    r"^scar.*$", r"^tattoo$", r"^beard$", r"^mustache$", r"^facial hair$", r"^muscular.*$", r"^glasses$",
+    r"^scars?$", r"^scar (on|across) .*$", r"^tattoo$", r"^beard$", r"^mustache$", r"^facial hair$", r"^muscular.*$",
+    r"^glasses$",
 ]
+# tags the patterns above would take for a feature, but which are a state, an expression or an action of the moment:
+# left in the caption, or they would be bound to the trigger word
+_NOT_FEATURE = {
+    "closed eyes", "half-closed eyes", "narrowed eyes", "wide eyes", "rolling eyes", "covering eyes", "covering own eyes",
+    "rubbing eyes", "crying with eyes open", "wet hair", "floating hair", "adjusting hair", "playing with own hair",
+    "hand in own hair", "hands in hair", "holding own hair", "holding hair", "tucking hair", "tying hair", "brushing hair",
+    "grabbing another's hair", "hair pull", "spread wings",
+}
 # clothing / accessories -> removed only when the outfit is part of the character
 _CLOTHING_WORDS = {
     "dress", "shirt", "skirt", "jacket", "coat", "uniform", "gloves", "thighhighs", "socks", "kneehighs", "boots",
@@ -44,7 +53,13 @@ _CLOTHING_WORDS = {
     "neckerchief", "sailor collar", "pleated skirt", "miniskirt", "overalls", "jumpsuit", "robe", "cloak", "mask",
     "wristband", "bracelet", "armband", "gauntlets", "sash", "obi", "hakama", "garter straps", "suspenders",
     "raincoat", "parka", "poncho", "tunic", "blouse", "camisole", "pajamas", "tracksuit", "sneakers", "sandals",
+    "t-shirt", "tank top", "crop top", "tube top", "bikini top", "panties", "bra", "underwear", "lingerie", "jeans",
+    "heels", "stockings", "tights", "leggings", "yukata", "suit",
 }
+# Version of the tag rules above (is_feature / is_clothing): part of the key of every caption made from the tags,
+# so those are made again (at once, from the saved tags) when the rules change.  Captions the VLM wrote do not
+# depend on the rules and keep their key.
+TAG_RULES = ":r2"
 _DROP_ALWAYS = {"general", "sensitive", "questionable", "explicit", "rating:general", "rating:sensitive"}
 _STYLE_WORDS = re.compile(r"^(.*(style|art|artstyle|medium|parody)|sketch|lineart|watercolor \(medium\)|"
                           r"traditional media|official art|realistic|anime coloring|retro artstyle|monochrome|greyscale)$")
@@ -57,7 +72,7 @@ def norm_tag(t: str) -> str:
 
 
 def is_feature(tag: str) -> bool:
-    return bool(_feature_re.fullmatch(tag))
+    return tag not in _NOT_FEATURE and bool(_feature_re.fullmatch(tag))
 
 
 def is_clothing(tag: str) -> bool:
@@ -265,7 +280,9 @@ def nl_instruction(kind: str, outfit_mode: str, trigger: str, concept=(), target
 def finalize_nl(text: str, kind: str, trigger: str) -> str:
     text = " ".join((text or "").split())
     if kind in ("character", "concept"):
-        return text if trigger in text else f"{trigger}, {text}"
+        # as a word of its own: a short trigger inside another word ("rin" in "earrings") is not the trigger
+        has = not trigger or re.search(rf"(?<![\w]){re.escape(trigger)}(?![\w])", text)
+        return text if has else f"{trigger}, {text}"
     return f"{trigger} style. {text}"
 
 

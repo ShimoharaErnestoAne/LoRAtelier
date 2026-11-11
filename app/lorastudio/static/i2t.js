@@ -115,7 +115,7 @@ function iBindTop() {
   $("#i-geninfo").onclick = iGenInfoDialog;
   $("#i-to-gen").onclick = iToImageGen;
   $("#i-to-i2i").onclick = iToImageGenI2I;
-  $("#i-lang").onclick = () => iSetLang(!I.ja);
+  $("#i-lang").onclick = () => iSetLang(!I.ja, true);
   $$("#i-tabs a").forEach((a) => a.onclick = () => { I.tab = a.dataset.tab; iDrawTab(); });
   for (const box of ["pos", "neg"]) {
     const el = $(`#i-${box}`);
@@ -329,20 +329,24 @@ function iControls() {
 
 function iDrawOutput() {
   const el = $("#i-output"), c = I.c, f = I.cfg;
-  const chk = (k, label) => `<label class="small"><input type="checkbox" data-ck="${k}" ${f[k] ? "checked" : ""}>${label}</label>`;
+  const chk = (k, label, tip) => `<label class="small"${tip ? ` title="${esc(tip)}"` : ""}><input type="checkbox" data-ck="${k}" ${f[k] ? "checked" : ""}>${label}</label>`;
+  // the look to change to: only for MOSS-Image, where it does something (the setting is kept when another target is chosen)
+  const looks = c.restyle_modes || {}, showLook = f.target === "mossimage" && Object.keys(looks).length > 0;
   el.innerHTML = `<div class="small"><b>出力</b></div>
     <div class="i-grid">
       <span>エンジン</span><select id="i-engine">${Object.entries(c.engines).map(([k, l]) => `<option value="${k}" ${f.engine === k ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
       <span>出力先</span><select id="i-target">${Object.entries(c.targets).map(([k, t]) => `<option value="${k}" ${f.target === k ? "selected" : ""}>${esc(t.label)}</option>`).join("")}</select>
       <span></span><div class="row">${chk("mosaic", "モザイク指定を追加")}<label class="small">強さ <select id="i-mosaic">${Object.entries(c.mosaic_levels).map(([k, v]) => `<option value="${k}" ${f.mosaic_strength === k ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label></div>
       <span></span><div class="row">${chk("avoid_duplicates", "分身を防ぐ")}
-        <label class="small">性別をそろえる <select id="i-gender">${[["none", "そろえない"], ["female", "全員女性"], ["male", "全員男性"]].map(([v, l]) => `<option value="${v}" ${f.gender === v ? "selected" : ""}>${l}</option>`).join("")}</select></label></div>
+        <label class="small">性別をそろえる <select id="i-gender">${[["none", "そろえない"], ["female", "全員女性"], ["male", "全員男性"]].map(([v, l]) => `<option value="${v}" ${f.gender === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+        ${showLook ? `<label class="small" title="元の画像とは違う画風の画像として書きます。先頭でその画風だと書き、元の画風の語を外し、その画風の描き方・質感の文を足します（MOSS-Image だけ。⑦ 作風・質感が無くても使えます）">画風を変える <select id="i-restyle">${Object.entries(looks).map(([v, l]) => `<option value="${v}" ${(f.restyle || "none") === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>` : ""}</div>
       <span></span><div class="row">${chk("remove_monochrome", "白黒をカラーで出す")}${chk("person_details", "人物の特徴を詳しく (顔立ち・髪型・体格。VLM)")}</div>
       <span></span><div class="row">${chk("turnaround", "三面図にする")}</div>
       <span></span><div class="row"><span class="small">LoRA 用に入れない:</span>${chk("no_identity", "人物の特徴")}${chk("no_style", "作風の特徴")}</div>
     </div>`;
   $("#i-engine").onchange = (e) => { iSet("engine", e.target.value); if (e.target.value === "hybrid") iProbeOllama(true); };
-  $("#i-target").onchange = (e) => iSet("target", e.target.value);
+  $("#i-target").onchange = (e) => { iSet("target", e.target.value); iDrawOutput(); };   // the 画風を変える control follows the target
+  if ($("#i-restyle")) $("#i-restyle").onchange = (e) => iSet("restyle", e.target.value);
   $("#i-mosaic").onchange = (e) => iSet("mosaic_strength", e.target.value);
   $("#i-gender").onchange = (e) => iSet("gender", e.target.value);
   $$("[data-ck]", el).forEach((b) => b.onchange = async () => {
@@ -357,25 +361,36 @@ function iDrawOutput() {
 
 // ------------------------------------------------------------------ jobs (analysis and the other long work)
 async function iStartJob(op, body, message) {
+  if (I.starting) return null;   // a second press while the first start is still on its way
+  I.starting = true;
+  const sent = Date.now();
   try {
     const j = await api("/api/i2t/job", { body: { op, ...body } });
+    // a job that fails or ends at once: its "done" event can come before this answer.  It is shown by then
+    // (onI2tEvent), and taking it as running here would leave the page busy for good
+    if (I.ended && I.ended.rid === j.rid && I.ended.at >= sent) return j;
     I.job = j; I.paused = false;
     iStatus(message || j.message);
     iUpdateButtons();
     iProgress(op === "analyze" || op === "tagger_download" ? 0 : null);
     return j;
   } catch (e) { fail(e); iStatus("エラー: " + e.message); return null; }
+  finally { I.starting = false; }
 }
 
 async function iAnalyze() {
-  if (I.job || !I.slots.person) return;
+  if (I.job || I.starting || !I.slots.person) return;
   if (!I.c.tagger_models[I.cfg.tagger_model]?.ready) { iTaggerDialog("run"); return; }
   if (I.cfg.target === "mossimage" && !I.c.moss_catalog_ready && !I.mossAsked) { iMossCatalogDialog(); return; }
-  I.result = null; I.chips = { pos: null, neg: null }; iShowResult(null);
   const refs = multi() ? Object.fromEntries(SLOT_ORDER.slice(1).filter((k) => I.slots[k]).map((k) => [k, I.slots[k].path])) : {};
-  I.analyzedCfg = { ...I.cfg };
-  I.analyzedMain = { ...I.slots.person, refs: Object.keys(refs).length };   // the base image of 「メインの画像から生成」
-  await iStartJob("analyze", { path: I.slots.person.path, refs, controls: iControls(), cfg: I.cfg, mode: I.cfg.mode }, "準備中...");
+  const cfg = { ...I.cfg }, main = { ...I.slots.person, refs: Object.keys(refs).length };
+  const j = await iStartJob("analyze", { path: main.path, refs, controls: iControls(), cfg: I.cfg, mode: I.cfg.mode }, "準備中...");
+  if (!j) return;   // not started (e.g. another job runs): the result on the screen stays
+  I.analyzedCfg = cfg;
+  I.analyzedMain = main;   // the base image of 「メインの画像から生成」
+  if (!I.job || I.job.rid !== j.rid) return;   // it has ended already (see iStartJob): what it showed stays
+  I.result = null; I.chips = { pos: null, neg: null };
+  if ($("#i-root")) iShowResult(null);
 }
 
 function iCancel() { if (I.job && I.job.cancellable !== false) api("/api/i2t/cancel", { body: {} }).catch(fail); }
@@ -410,6 +425,22 @@ setInterval(() => {
 
 function iOnJob(m) { if (m.message) iStatus(m.message); }
 
+/* The events did not arrive for a while (the tab was in the background for long, the connection was made again):
+   a job this page still shows as running may have ended meanwhile.  Without this the page stayed busy - no
+   analysis, no translation - until it was opened again. */
+async function iResync() {
+  if (!I.job || I.starting || (!$("#i-root") && !$("#s-i2t"))) return;
+  const rid = I.job.rid;
+  let st;
+  try { st = await api("/api/i2t/job"); } catch (e) { return; }
+  if (!I.job || I.job.rid !== rid) return;   // its event came meanwhile
+  if (st.job && st.job.rid === rid) { I.paused = !!st.job.paused; iOnJob(st.job); iUpdateButtons(); return; }   // still running
+  if (st.last_done && st.last_done.rid === rid) { onI2tEvent({ type: "i2t", event: "done", ...st.last_done }); return; }
+  I.job = null; I.est = null; I.paused = false;
+  iProgress(0); iUpdateButtons();
+  iStatus("処理が終わっていました（結果を確かめられませんでした。もう一度実行してください）");
+}
+
 function onI2tEvent(m) {
   if (!$("#i-root") && !$("#s-i2t")) return;
   if (I.job && m.rid !== I.job.rid && ["done", "fraction", "stop_state"].includes(m.event)) return;
@@ -426,6 +457,7 @@ function onI2tEvent(m) {
     if (I.job && m.rid === I.job.rid) { I.paused = m.paused; iUpdateButtons(); }
   } else if (m.event === "done") {
     const op = m.op;
+    I.ended = { rid: m.rid, at: Date.now() };
     I.job = null; I.est = null; I.paused = false;
     iUpdateButtons();
     if (!m.ok) {
@@ -437,7 +469,10 @@ function onI2tEvent(m) {
       return;
     }
     iProgress(1);
-    if (op === "analyze") { I.shownRid = m.rid; iShowResult(m.result, m.history); }
+    if (op === "analyze") {
+      // on the settings page there is nothing to draw into: renderI2t shows it (st.last_done) when the page is opened
+      if ($("#i-root")) { I.shownRid = m.rid; iShowResult(m.result, m.history); }
+    }
     else if (op === "tagger_download") {
       iStatus(`ダウンロード完了: ${m.value.name} を使用します`);
       I.c.tagger_models[m.value.name].ready = true; iSet("tagger_model", m.value.name);
@@ -459,7 +494,11 @@ function onI2tEvent(m) {
       if ($("#s-i2t")) drawI2tSettings();
     }
     else if (op === "pull") { iStatus(`${m.value.name} を取得しました`); iAfterPull(m.value.name); }
-    else if (op === "translate") { iStatus(`日本語に訳しました (${Object.keys(m.value.translated).length} 語)`); iRefreshLabels(); }
+    else if (op === "translate") {
+      const left = (m.value.untranslated || []).length;   // the model gave nothing, or only copied the English
+      iStatus(`日本語に訳しました (${Object.keys(m.value.translated).length} 語)` + (left ? `。${left} 語は訳されず、英語のままです（「日本語」を押し直すと、もう一度訳します）` : ""));
+      iRefreshLabels();
+    }
     else if (op === "pose_estimate") { iStatus("骨格を推定しました"); if (I.onPose) I.onPose(m.value); }
     else if (op === "ollama_setup") { iStatus("Ollama の準備ができました"); iAfterSetup(); }
   }
@@ -566,15 +605,27 @@ document.addEventListener("keydown", (e) => {
   if (inBox && e.key.toLowerCase() === "z" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); iUndo(box); }
 });
 
-async function iSetLang(ja) {
+// byUser: the 「日本語」 button was pressed (not the automatic translation after an analysis) - the words the
+// translation model left untranslated before are asked about again
+async function iSetLang(ja, byUser) {
   I.ja = ja;
   if (!ja || !I.chips.pos) { iDrawChips(); return; }
-  await iRefreshLabels();
-  const chars = (I.result.tags || []).filter((t) => t.kind === "character").map((t) => String(t.tag || ""));
-  const missing = await iApi("missing_ja", [...iFlat("pos"), ...iFlat("neg")], chars).catch(() => []);
-  if (!missing.length) return;
-  if (!I.ollama.ok) { iStatus(`辞書に無い ${missing.length} 語は英語のままです (訳すには Ollama と訳のモデルが必要です)`); return; }
-  if (I.job) { iStatus("ほかの処理の最中は訳せません"); return; }
+  // a failure is said here: it used to leave the button doing nothing, with no message
+  try { await iRefreshLabels(); } catch (e) {
+    I.ja = false; iDrawChips();
+    iStatus("日本語にできませんでした: " + e.message); fail(e);
+    return;
+  }
+  let missing;
+  try {
+    const chars = ((I.result || {}).tags || []).filter((t) => t.kind === "character").map((t) => String(t.tag || ""));
+    missing = await iApi("missing_ja", [...iFlat("pos"), ...iFlat("neg")], chars, !!byUser);
+  } catch (e) { iStatus("辞書に無い語を調べられませんでした（辞書にある語だけ日本語にしました）: " + e.message); return; }
+  if (!missing.length || !I.ja) return;
+  // Ollama may have been started after this page was opened: asked again before giving up
+  if (!I.ollama.ok) await iProbeOllama();
+  if (!I.ollama.ok) { iStatus(`辞書に無い ${missing.length} 語は英語のままです (Ollama に接続できません。訳すには Ollama と訳のモデルが必要です)`); return; }
+  if (I.job || I.starting) { iStatus(`辞書に無い ${missing.length} 語は英語のままです (ほかの処理の最中は訳せません。終わってから「日本語」を押し直してください)`); return; }
   iStartJob("translate", { words: missing });
 }
 
@@ -872,6 +923,8 @@ async function drawI2tSettings() {
       ${chk("use_break", "複数人物は BREAK で人物ごとに区切る (SDXL 系。Regional Prompter などで使う)")}
       ${chk("split_extras", "カメラ・照明・画風のタグを本文から分離する (追加プロンプトのタブに出す)")}
       ${chk("split_background", "背景のタグを本文から分離する (本文を被写体だけにする)")}
+      ${chk("polish_prose", "文を仕上げる (文章の出力先・VLM: 集めた内容を 1 つの文章に書き直す。VLM の呼び出しが 1 回増える)")}
+      ${chk("age_look", "年齢の見た目を書く (人物ごとに画像から読んだ年齢層を、文とタグに書く。元の画像と年齢がずれるのを防ぐ)")}
       ${chk("era_tags", "年代スタイル (1990s / 2010s など) を判定して画風タグに足す (初回にモデル 17MB を取得)")}
       ${chk("anatomy_guard", "人物の破綻を防ぐ (bad anatomy などをネガティブに足す)")}
       ${chk("avoid_same_face", "同じ顔を避ける (2 人以上なら clone, twins などをネガティブに足す)")}`)}

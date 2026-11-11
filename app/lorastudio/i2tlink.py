@@ -48,6 +48,7 @@ class I2tClient:
     def __init__(self):
         self.proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._job_lock = threading.Lock()   # "is a job running?" and "this one runs now" as one step
         self._pending: dict[int, Future] = {}
         self._rid = itertools.count(1)
         self.status = "stopped"          # stopped / starting / ready / failed
@@ -55,7 +56,7 @@ class I2tClient:
         self.last_done: dict | None = None
         self._consts = None
         self._restarts: list[float] = []   # unexpected ends (stop() is not counted)
-        self.kept_vlm: dict | None = None  # {host, model}: the VLM an analysis left loaded in Ollama (unload_kept_vlm)
+        self.kept_vlm: list[dict] = []     # [{host, model}]: models the jobs left loaded in Ollama (unload_kept_vlm)
 
     def available(self) -> bool:
         return config.ANALYSIS_PYTHON.exists() and (I2T_DIR / "i2t.py").exists()
@@ -65,11 +66,12 @@ class I2tClient:
             raise RuntimeError("i2t を動かす環境がありません（setup.bat を実行してください）")
         if self.proc is not None:   # the worker ended by itself (stop() clears proc): limit the restarts
             now = time.time()
-            self._restarts = [t for t in self._restarts if now - t < 600] + [now]
-            if len(self._restarts) > 3:
+            self._restarts = [t for t in self._restarts if now - t < 600]
+            if len(self._restarts) >= 3:   # a refused try is not counted: the limit ends 10 minutes after the last restart
                 self.status = "failed"
                 raise RuntimeError("i2t のワーカーが繰り返し停止したため、自動再起動を止めました。"
                                    "data\\i2t_worker.log を確認し、しばらくしてからもう一度試してください。")
+            self._restarts.append(now)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         log = open(config.DATA_DIR / "i2t_worker.log", "ab")
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
@@ -112,10 +114,17 @@ class I2tClient:
                 self.job = None
                 if done["op"] == "analyze":
                     self._release_gpu()
-                    if msg.get("vlm_kept"):
-                        self.kept_vlm = msg["vlm_kept"]
-                        if gpu.owner or gpu.analysis_active:   # the GPU was taken while it ran: free it now
-                            threading.Thread(target=unload_kept_vlm, daemon=True, name="i2t-unload").start()
+                kept = msg.get("vlm_kept") or []
+                if isinstance(kept, dict):
+                    kept = [kept]
+                if kept:
+                    names = {(k["host"], k["model"]) for k in kept}
+                    self.kept_vlm = [k for k in self.kept_vlm if (k["host"], k["model"]) not in names] + kept
+                    # the GPU was taken while it ran: free it now (material analysis beside it is fine with 省 VRAM off)
+                    if gpu.owner:
+                        threading.Thread(target=unload_kept_vlm, daemon=True, name="i2t-unload").start()
+                    elif gpu.analysis_active:
+                        threading.Thread(target=unload_kept_for_analysis, daemon=True, name="i2t-unload").start()
                 bus.publish("i2t", event="done", **{k: v for k, v in done.items() if k != "trace"})
             fut = self._pending.pop(rid, None)
             if fut is not None:
@@ -169,27 +178,38 @@ class I2tClient:
         """Start a long job; returns at once.  Only one runs at a time (like the i2t window)."""
         if op not in LONG_JOBS:
             raise ValueError(op)
-        if self.job:
-            raise RuntimeError("ほかの処理の最中です。終わるか中止してからもう一度押してください。")
-        rid = next(self._rid)
-        self.job = {"rid": rid, "op": op, "message": "準備中...", "fraction": None, "est": None, "cancellable": True,
-                    "started": time.time()}
-        if op == "analyze" and not (kw.get("cfg") or {}).get("low_vram", True):
-            self.job["message"] = "GPU が空くのを待っています（学習・生成の後に始まります）" if gpu.owner else "準備中..."
+        wait_gpu = op == "analyze" and not (kw.get("cfg") or {}).get("low_vram", True)
+        with self._job_lock:   # two requests at the same moment: the second one is refused, not started over the first
+            if self.job:
+                raise RuntimeError("ほかの処理の最中です。終わるか中止してからもう一度押してください。")
+            rid = next(self._rid)
+            job = {"rid": rid, "op": op, "message": "準備中...", "fraction": None, "est": None, "cancellable": True,
+                   "started": time.time(), "waiting_gpu": wait_gpu}
+            if wait_gpu and gpu.owner:
+                job["message"] = "GPU が空くのを待っています（学習・生成の後に始まります）"
+            self.job = job
+        started = dict(job)   # the reader thread may already have ended the job when this returns
+        if wait_gpu:
             threading.Thread(target=self._send_after_gpu, args=(rid, op, kw), daemon=True).start()
         else:
-            self._send_job(rid, op, kw)
-        return dict(self.job)
+            error = self._send_job(rid, op, kw)
+            if error:
+                raise RuntimeError(error)
+        return started
 
     def _send_after_gpu(self, rid, op, kw):
         gpu.begin_analysis()
-        if not self.job or self.job["rid"] != rid:   # cancelled while waiting
-            gpu.end_analysis()
-            return
-        self._gpu_held = True
+        with self._job_lock:
+            job = self.job
+            if not job or job["rid"] != rid:   # cancelled while waiting
+                gpu.end_analysis()
+                return
+            job["waiting_gpu"] = False
+            self._gpu_held = True
         self._send_job(rid, op, kw)
 
-    def _send_job(self, rid, op, kw):
+    def _send_job(self, rid, op, kw) -> str | None:
+        """Sends the job to the worker.  When that fails the job is ended and the reason returned."""
         try:
             self._send({"rid": rid, "op": op, **kw})
         except (OSError, RuntimeError) as e:
@@ -197,6 +217,8 @@ class I2tClient:
             done = {"rid": rid, "op": op, "ok": False, "error": str(e)}
             self.last_done, self.job = done, None
             bus.publish("i2t", event="done", **done)
+            return str(e)
+        return None
 
     def view(self) -> dict | None:
         """The running long job as the job page shows it (None when nothing runs)."""
@@ -213,19 +235,27 @@ class I2tClient:
             # kept here so the i2t page and the job page show the same state, whichever one was pressed
             self.job["paused"] = what == "pause"
             bus.publish("i2t", event="paused", rid=self.job["rid"], paused=self.job["paused"])
-        if what == "cancel" and self.job and self.job["op"] == "analyze" and self.job["message"].startswith("GPU が空く"):
-            done = {"rid": self.job["rid"], "op": "analyze", "ok": False, "cancelled": True, "error": "中止しました"}
-            self.last_done, self.job = done, None
-            bus.publish("i2t", event="done", **done)
-            return
+        if what == "cancel":
+            with self._job_lock:   # not sent to the worker yet (it waits for the GPU): end it here
+                job = self.job
+                waiting = bool(job and job.get("waiting_gpu"))
+                if waiting:
+                    done = {"rid": job["rid"], "op": job["op"], "ok": False, "cancelled": True, "error": "中止しました"}
+                    self.last_done, self.job = done, None
+            if waiting:
+                bus.publish("i2t", event="done", **done)
+                return
         if self.proc is not None and self.proc.poll() is None:
             self._send({"op": what})
 
     def consts(self) -> dict:
         if self._consts is None:
             self._consts = self.call("consts")
-        else:   # which tagger models are present changes after a download
-            self._consts["tagger_models"] = {k: {**v, "ready": self.call("tagger_ready", k)} for k, v in self._consts["tagger_models"].items()}
+        else:   # what a download changes (which tagger models and lists are present): asked in one call
+            now = self.call("consts_now")
+            self._consts["tagger_models"] = {k: {**v, "ready": bool(now["tagger_ready"].get(k))}
+                                             for k, v in self._consts["tagger_models"].items()}
+            self._consts["moss_catalog_ready"] = now["moss_catalog_ready"]
         return self._consts
 
     def restart(self):
@@ -236,8 +266,12 @@ class I2tClient:
     def stop(self):
         with self._lock:
             if self.proc is not None and self.proc.poll() is None:
-                from .training import kill_tree
-                kill_tree(self.proc.pid)
+                # the worker alone, not its process tree: an Ollama started from the setup dialog is its child and
+                # must stay up (stop() is only called while no job runs, so nothing else of the worker's is running)
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
             self.proc = None
             self.status = "stopped"
 
@@ -258,24 +292,36 @@ def _release_for_exclusive():
 gpu.on_exclusive(_release_for_exclusive)
 
 
-def unload_kept_vlm():
-    """GPU hook: training, generation or material analysis takes the GPU - unload the VLM an analysis left loaded
-    in Ollama (the worker keeps it for a while between images; see i2t_worker.VLM_KEEP)."""
-    kept, client.kept_vlm = client.kept_vlm, None
+def unload_kept_vlm(for_analysis: bool = False):
+    """GPU hook: training, generation or material analysis takes the GPU - unload the models the i2t jobs left
+    loaded in Ollama (the worker keeps the VLM for a while between images; see i2t_worker.VLM_KEEP).
+    for_analysis: only the ones kept under 省 VRAM (with it off, analysis runs beside the VLM, as the user chose,
+    and an i2t analysis itself counts as analysis - it must not unload the model it is about to use)."""
+    kept = client.kept_vlm
+    if for_analysis:
+        kept, client.kept_vlm = ([k for k in kept if k.get("low_vram", True)],
+                                 [k for k in kept if not k.get("low_vram", True)])
+    else:
+        client.kept_vlm = []
     if not kept:
         return
     import urllib.request
-    req = urllib.request.Request(kept["host"] + "/api/generate", headers={"Content-Type": "application/json"},
-                                 data=json.dumps({"model": kept["model"], "keep_alive": 0}).encode())
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            r.read()
-    except (OSError, ValueError):
-        pass   # Ollama is gone: nothing is loaded; it unloads by itself after VLM_KEEP otherwise
+    for k in kept:
+        req = urllib.request.Request(k["host"] + "/api/generate", headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"model": k["model"], "keep_alive": 0}).encode())
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+        except (OSError, ValueError):
+            pass   # Ollama is gone: nothing is loaded; it unloads by itself after a while otherwise
+
+
+def unload_kept_for_analysis():
+    unload_kept_vlm(for_analysis=True)
 
 
 gpu.on_exclusive(unload_kept_vlm)
-gpu.on_analysis(unload_kept_vlm)
+gpu.on_analysis(unload_kept_for_analysis)
 
 
 def save_upload(name: str, data: bytes) -> Path:

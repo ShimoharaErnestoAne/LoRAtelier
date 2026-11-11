@@ -188,10 +188,12 @@ def test_worker_keeps_the_vlm_only_while_low_vram_is_on(env, monkeypatch):
     eng.vlm()._chat({})                             # a detail request (i2t sends no keep_alive there)
     assert [p["keep_alive"] for p in sent] == ["2m", "2m"]
     eng._vlm = vlm
-    assert w._kept_vlm() == {"host": "http://127.0.0.1:11434", "model": "qwen3-vl:8b"}
+    assert w._kept_vlm() == [{"host": "http://127.0.0.1:11434", "model": "qwen3-vl:8b", "low_vram": True}]
     low["on"] = False                               # setting turned off: i2t's own keep_alive is sent untouched
     eng.vlm()._chat({"x": 1})
-    assert "keep_alive" not in sent[-1] and w._kept_vlm() is None
+    # ...and the model Ollama then keeps by its own rule is still reported (unloaded for training / generation only)
+    assert "keep_alive" not in sent[-1]
+    assert w._kept_vlm() == [{"host": "http://127.0.0.1:11434", "model": "qwen3-vl:8b", "low_vram": False}]
 
 
 def test_server_unloads_the_kept_vlm_when_the_gpu_is_taken(env, monkeypatch):
@@ -211,11 +213,11 @@ def test_server_unloads_the_kept_vlm_when_the_gpu_is_taken(env, monkeypatch):
 
     import urllib.request
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=10: calls.append((req.full_url, json.loads(req.data))) or R())
-    i2tlink.client.kept_vlm = {"host": "http://127.0.0.1:11434", "model": "qwen3-vl:8b"}
+    i2tlink.client.kept_vlm = [{"host": "http://127.0.0.1:11434", "model": "qwen3-vl:8b", "low_vram": True}]
     gpu.acquire("学習 #1")
     try:
         assert calls == [("http://127.0.0.1:11434/api/generate", {"model": "qwen3-vl:8b", "keep_alive": 0})]
-        assert i2tlink.client.kept_vlm is None
+        assert i2tlink.client.kept_vlm == []
     finally:
         gpu.release("学習 #1")
     gpu.begin_analysis()                            # nothing kept any more: no request
@@ -244,4 +246,4 @@ def test_an_analysis_that_ends_during_training_unloads_at_once(env, monkeypatch)
         if done:
             break
         time.sleep(0.02)
-    assert done == [1] and c.kept_vlm == {"host": "http://h", "model": "m"}
+    assert done == [1] and c.kept_vlm == [{"host": "http://h", "model": "m"}]

@@ -86,8 +86,13 @@ def analyze(path: Path, thumb_path: Path) -> dict:
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(path) as im:
                 fmt = im.format
+                # MPO: a JPEG with a second picture embedded (the preview many cameras add).  The first frame is
+                # the photograph itself, so it is a JPEG here - neither an unknown format nor an animation
+                mpo = fmt == "MPO"
+                if mpo:
+                    fmt = "JPEG"
                 out["format"] = fmt
-                out["animated"] = bool(getattr(im, "is_animated", False))
+                out["animated"] = bool(getattr(im, "is_animated", False)) and not mpo
                 out["jpeg_quality"] = _jpeg_quality(im) if fmt == "JPEG" else None
                 out["mode"] = im.mode
                 im.load()  # full decode: detects truncated / corrupt data

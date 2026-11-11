@@ -209,7 +209,16 @@ def move_project(projects, pid: str, target: Path, busy=None):
             try:
                 _rebase_project(final, str(src), str(final))
             except BaseException:
-                _replace(final, src)   # back where it was, with its paths unchanged (the database rolled back)
+                _replace(final, src)   # back where it was
+                # ...and its paths with it.  The database rolls back when its own rewrite fails, but a run file
+                # that could not be rewritten fails after the database was committed with the new paths
+                try:
+                    _rebase_db(src, str(final), str(src))
+                    _rebase_run_files(src, str(final), str(src), strict=False)
+                except Exception as e:
+                    with _lock:
+                        state.setdefault("notes", []).append(
+                            f"{name}: 元の場所に戻しましたが、保存してあるパスを元に戻せませんでした（{e}）")
                 raise
             return
         total = _tree_size(src)
@@ -297,6 +306,11 @@ def _rebase_value(v: str, old: str, new: str, forms) -> str:
 def _rebase_project(folder: Path, old: str, new: str):
     """Rewrite the project folder's old path in every text value of project.db (one transaction) and in the
     run files that name it."""
+    _rebase_db(folder, old, new)
+    _rebase_run_files(folder, old, new)
+
+
+def _rebase_db(folder: Path, old: str, new: str):
     forms = _forms(old, new)
     db = sqlite3.connect(folder / "project.db")
     try:
@@ -320,6 +334,12 @@ def _rebase_project(folder: Path, old: str, new: str):
         raise
     finally:
         db.close()
+
+
+def _rebase_run_files(folder: Path, old: str, new: str, strict: bool = True):
+    """strict=False (putting a failed move back): a file that cannot be written is passed over - it is the one
+    the move failed on, and still names the old place."""
+    forms = _forms(old, new)
     for d, _dirs, files in os.walk(folder / "runs"):
         for f in files:
             fp = Path(d) / f
@@ -333,7 +353,11 @@ def _rebase_project(folder: Path, old: str, new: str):
                 continue
             nt = _rebase_value(text.strip(), old, new, forms) if fp.suffix.lower() == ".json" else _rebase_text(text, forms)
             if nt != text and nt != text.strip():
-                config.atomic_write_text(fp, nt)
+                try:
+                    config.atomic_write_text(fp, nt)
+                except OSError:
+                    if strict:
+                        raise
 
 
 # ====================================================================== generated / added images

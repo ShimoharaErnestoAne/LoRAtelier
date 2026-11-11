@@ -5,8 +5,11 @@ families (SD1.5 / SDXL / Anima / Krea2 are mutually incompatible).
 """
 from __future__ import annotations
 
+import collections
+import contextlib
 import hashlib
 import json
+import os
 import re
 import struct
 import threading
@@ -320,9 +323,13 @@ def strip_prefix(keys) -> list[str]:
 
 
 def read_safetensors_header(path: Path) -> dict:
-    """Read only the JSON header (cheap even for 26GB files)."""
+    """Read only the JSON header (cheap even for 26GB files).  ValueError for anything that is not one, also a
+    file cut off before the header (0 bytes after a failed copy): callers catch OSError / ValueError."""
     with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
+        head = f.read(8)
+        if len(head) < 8:
+            raise ValueError("safetensors のヘッダーがありません（ファイルが途中で切れています）")
+        n = struct.unpack("<Q", head)[0]
         if n > 200_000_000:
             raise ValueError("header too large")
         hdr = json.loads(f.read(n))
@@ -679,6 +686,43 @@ STANDARD_DIRS = {"checkpoints", "loras", "diffusion_models", "unet", "text_encod
 MODELS_LOCK = threading.RLock()
 
 
+_sample_cache: dict[str, str | None] = {}
+
+
+def sample_digest(path: Path) -> str | None:
+    """A cheap fingerprint of a large file: its size and three 1MB pieces (start, middle, end).  Two files with
+    different fingerprints are different files; equal ones are very likely the same (copies), which is enough to
+    list a copy once, and a first sieve before a full hash.  None when the file cannot be read."""
+    path = Path(path)
+    try:
+        st = path.stat()
+        key = f"{path}|{st.st_size}|{st.st_mtime_ns}"
+        if key not in _sample_cache:
+            piece = 1 << 20
+            h = hashlib.sha1(str(st.st_size).encode())
+            with open(path, "rb") as f:
+                for pos in sorted({0, max(0, st.st_size // 2 - piece // 2), max(0, st.st_size - piece)}):
+                    f.seek(pos)
+                    h.update(f.read(piece))
+            _sample_cache[key] = h.hexdigest()
+        return _sample_cache[key]
+    except OSError:
+        return None
+
+
+def same_file(a: Path, b: Path) -> bool:
+    """One file reachable by two names (a hard link), or a copy (same size and the same sample_digest)."""
+    try:
+        if os.path.samefile(a, b):
+            return True
+        if Path(a).stat().st_size != Path(b).stat().st_size:
+            return False
+    except OSError:
+        return False
+    da = sample_digest(a)
+    return da is not None and da == sample_digest(b)
+
+
 def _models_copy() -> list[dict]:
     """A copy of settings["models"] to change and then store with settings().set().  Changing the stored dicts in
     place raced with another thread's settings save (json.dumps iterating a dict that grows: RuntimeError, and that
@@ -705,9 +749,52 @@ class Library:
                       "train_vae": ("vae", "VAE"), "adapter": ("loras", "Lora"), "fast": ("loras", "Lora"),
                       "fast4": ("loras", "Lora")}
 
+    REPAIR_RETRY_SEC = 3   # a file not found is looked for again after this long (see _repair_paths)
+
     def __init__(self):
         self._lock = MODELS_LOCK
         self._cache: dict[str, dict] = {}
+        self._walks = threading.local()    # folder listings shared inside one scan / repair (see _one_listing)
+        self._not_found: tuple | None = None   # (the missing files looked for, when): _repair_paths
+
+    @contextlib.contextmanager
+    def _one_listing(self):
+        """Inside the block every folder is walked once on this thread, however many names are looked up in it
+        (a scan looks for each model's text encoder, VAE and optional files, a repair for each missing file).
+        The listing is dropped when the outermost block ends, so the next scan sees what changed on disk."""
+        outer = getattr(self._walks, "seen", None)
+        if outer is None:
+            self._walks.seen = {}
+        try:
+            yield
+        finally:
+            if outer is None:
+                self._walks.seen = None
+
+    def _files_in(self, folder: Path) -> list[Path]:
+        """Every file under the folder, subfolders included, sorted."""
+        seen = getattr(self._walks, "seen", None)
+        key = str(folder).lower()
+        if seen is not None and key in seen:
+            return seen[key]
+        out = []
+        for d, _dirs, files in os.walk(folder):
+            out += [Path(d) / f for f in files]
+        out.sort()
+        if seen is not None:
+            seen[key] = out
+        return out
+
+    def _model_files_in(self, folder: Path) -> list[Path]:
+        return [f for f in self._files_in(folder) if f.suffix.lower() in (".safetensors", ".gguf")]
+
+    def _named(self, folder: Path, name: str) -> Path | None:
+        """The first file of that name under the folder (in the folder itself first, then its subfolders)."""
+        hit = folder / name
+        if hit.is_file():
+            return hit
+        low = name.lower()
+        return next((f for f in self._files_in(folder) if f.name.lower() == low), None)
 
     @staticmethod
     def default_dirs() -> list[Path]:
@@ -767,17 +854,17 @@ class Library:
         (ComfyUI users often keep e.g. text_encoders/Qwen-Image-2.1-GGUF/); a file of such a name that does not
         fit the family is passed over.  Then, for te / vae, any file there whose contents fit (other distributors'
         names, e.g. Qwen-Image-2.1-text_encoder-FP8)."""
-        for name in COMPANIONS.get(family, {}).get(kind, []):
-            for d in self._companion_folders(kind):
-                hit = d / name
-                if not hit.is_file():
-                    hit = next((x for x in d.rglob(name) if x.is_file()), None)
-                if hit and (kind not in ("te", "vae") or self.fits(family, kind, str(hit)) is not False):
-                    return str(hit)
-        if kind in ("te", "vae"):
-            for p in self.companion_files()[kind]:
-                if self.fits(family, kind, p):
-                    return p
+        with self._one_listing():
+            folders = self._companion_folders(kind)
+            for name in COMPANIONS.get(family, {}).get(kind, []):
+                for d in folders:
+                    hit = self._named(d, name)
+                    if hit and (kind not in ("te", "vae") or self.fits(family, kind, str(hit)) is not False):
+                        return str(hit)
+            if kind in ("te", "vae"):
+                for p in self.companion_files()[kind]:
+                    if self.fits(family, kind, p):
+                        return p
         return None
 
     def fits(self, family: str, kind: str, path: str) -> bool | None:
@@ -818,7 +905,7 @@ class Library:
         for kind in ("te", "vae"):
             seen, files = set(), []
             for d in self._companion_folders(kind):
-                for f in sorted([*d.rglob("*.safetensors"), *d.rglob("*.gguf")]):
+                for f in self._model_files_in(d):
                     if f.is_file() and str(f).lower() not in seen:
                         seen.add(str(f).lower())
                         files.append(str(f))
@@ -829,6 +916,10 @@ class Library:
         """Registers one model file of the folders this tool reads, as chosen in a model list.  A DiT model takes the
         text encoder / VAE given, else the one found by name; when neither is there, ValueError with what is
         needed ("needs": ["te", "vae"]).  A file already registered returns that model."""
+        with self._one_listing():
+            return self._register_file(path, te, vae)
+
+    def _register_file(self, path: str, te: str, vae: str) -> dict:
         f = Path(path)
         try:
             rf = f.resolve()
@@ -897,7 +988,7 @@ class Library:
         except OSError:
             return out
         for d in dirs:
-            for f in sorted([*d.rglob("*.safetensors"), *d.rglob("*.gguf")]):
+            for f in self._model_files_in(d):
                 dest = self._dest_for(f)
                 if dest and not (config.MODELS_DIR / dest[0] / f.name).exists():   # already there: nothing to move
                     sub, what = dest
@@ -923,33 +1014,44 @@ class Library:
             return "diffusion_models", f"{FAMILY_LABEL.get(fam, fam)} の本体"
         return None
 
-    def _repair_paths(self) -> None:
+    def _repair_paths(self, fresh: bool = False) -> None:
         """A registered model whose file was moved (e.g. from models/anima to models/diffusion_models as the
         settings screen asks) is pointed to the file's new place, found by its name in the folders this tool
-        reads.  The model keeps its id, so projects that use it keep working."""
-        with self._lock:
+        reads.  The model keeps its id, so projects that use it keep working.
+
+        Nothing is read when no file is missing.  A file that was not found (a model whose file was deleted stays
+        registered) is looked for again only after REPAIR_RETRY_SEC, so a page that asks on every redraw does not
+        walk the model folders each time; fresh=True (a scan) always looks."""
+        with self._lock, self._one_listing():
             models = _models_copy()
+            wanted = [(m, k, p) for m in models for k, p in list(m.get("files", {}).items()) if p and not Path(p).exists()]
+            if not wanted:
+                self._not_found = None
+                return
+            names = frozenset((k, p) for _m, k, p in wanted)
+            if not fresh and self._not_found and self._not_found[0] == names \
+                    and time.monotonic() - self._not_found[1] < self.REPAIR_RETRY_SEC:
+                return
             changed = False
-            for m in models:
-                for k, p in list(m.get("files", {}).items()):
-                    if not p or Path(p).exists():
-                        continue
-                    base = k.removeprefix("train_")
-                    folders = self._companion_folders(k) if base in ("te", "vae") else self._folders()
-                    name = Path(p).name
-                    hit = None
-                    for d in folders:
-                        if d.is_dir():
-                            hit = next((x for x in d.rglob(name) if x.is_file()), None)
-                            if hit:
-                                break
-                    if hit and base not in ("te", "vae") and self._info(hit).get("family") != m.get("family"):
-                        hit = None   # same name, different model
-                    if hit:
-                        m["files"][k] = str(hit)
-                        changed = True
+            for m, k, p in wanted:
+                base = k.removeprefix("train_")
+                folders = self._companion_folders(k) if base in ("te", "vae") else self._folders()
+                name = Path(p).name
+                hit = None
+                for d in folders:
+                    if d.is_dir():
+                        hit = self._named(d, name)
+                        if hit:
+                            break
+                if hit and base not in ("te", "vae") and self._info(hit).get("family") != m.get("family"):
+                    hit = None   # same name, different model
+                if hit:
+                    m["files"][k] = str(hit)
+                    changed = True
             if changed:
                 config.settings().set("models", models)
+            left = frozenset((k, p) for m in models for k, p in m.get("files", {}).items() if p and not Path(p).exists())
+            self._not_found = (left, time.monotonic()) if left else None
 
     def _info(self, f: Path) -> dict:
         st = f.stat()
@@ -970,14 +1072,17 @@ class Library:
         return {**self._cache[key], "size": st.st_size}
 
     def scan(self) -> dict:
+        with self._one_listing():   # each folder is listed once for the files, the repairs and the registering
+            return self._scan()
+
+    def _scan(self) -> dict:
         for d in self.default_dirs()[:3] + self.companion_default_dirs():
             d.mkdir(parents=True, exist_ok=True)
         ckpts, loras, seen = [], [], set()
         for folder in self._folders():
             if not folder.is_dir():
                 continue
-            files = sorted([*folder.rglob("*.safetensors"), *folder.rglob("*.gguf")])
-            for f in files:
+            for f in self._model_files_in(folder):
                 rp = str(f.resolve()).lower()
                 if rp in seen:
                     continue
@@ -993,17 +1098,20 @@ class Library:
                 elif info["is_lora"] is False:
                     entry["variant_guess"] = info.get("variant")
                     ckpts.append(entry)
-        # the same file reachable from two folders (copies) is listed once: name + size
+        # the same file reachable from two folders (a hard link or a copy) is listed once.  Name and size alone
+        # are not enough: LoRAs trained twice with the same settings (v1/chr.safetensors, v2/chr.safetensors) have
+        # the same size, and each must stay selectable
         def dedupe(items):
-            out, keys = [], set()
+            out, kept = [], {}
             for it in items:
                 k = (it["name"].lower(), it["size"])
-                if k not in keys:
-                    keys.add(k)
-                    out.append(it)
+                if any(same_file(Path(it["path"]), Path(o["path"])) for o in kept.get(k, [])):
+                    continue
+                kept.setdefault(k, []).append(it)
+                out.append(it)
             return out
         ckpts, loras = dedupe(ckpts), dedupe(loras)
-        self._repair_paths()   # before registering, so a moved file is not added again as a new model
+        self._repair_paths(fresh=True)   # before registering, so a moved file is not added again as a new model
         self._repair_companions()
         self._register(ckpts)
         return {"checkpoints": ckpts, "loras": loras, "misplaced": self.misplaced()}
@@ -1016,12 +1124,13 @@ class Library:
         with self._lock:
             models = _models_copy()
             known = set()
+            copies: dict[tuple, list[Path]] = {}   # (name, size) of the registered files -> those files
             for m in models:
                 for p in (m.get("files", {}).get(k) for k in ("ckpt", "gen", "turbo")):
                     if p:
                         known.add(str(Path(p)).lower())
                         try:
-                            known.add((Path(p).name.lower(), Path(p).stat().st_size))
+                            copies.setdefault((Path(p).name.lower(), Path(p).stat().st_size), []).append(Path(p))
                         except OSError:
                             pass
             added = False
@@ -1037,7 +1146,8 @@ class Library:
                 fam = c["family"]
                 if fam not in ("sdxl", *DIT_FAMILIES) or (c["gguf"] and fam not in GGUF_FAMILIES):
                     continue
-                if c["path"].lower() in known or (Path(c["path"]).name.lower(), c["size"]) in known:
+                if c["path"].lower() in known or any(
+                        same_file(Path(c["path"]), q) for q in copies.get((Path(c["path"]).name.lower(), c["size"]), [])):
                     continue
                 if fam == "sdxl":
                     files = {"ckpt": c["path"]}
@@ -1082,21 +1192,24 @@ class Registry:
     def __init__(self):
         self._lock = MODELS_LOCK
 
+    @staticmethod
+    def _view(m: dict) -> dict:
+        m = dict(m)
+        # the 8-step generation LoRA is optional: without it MOSS-Image samples the normal way
+        m["missing"] = [k for k, p in m.get("files", {}).items() if p and k not in ("fast", "fast4") and not Path(p).exists()]
+        m["variant_info"] = VARIANTS.get(m.get("variant"), {})
+        m["needs_variant"] = bool(m.get("auto")) and not m.get("variant_confirmed") and not m.get("variant")
+        return m
+
     def list(self) -> list[dict]:
-        out = []
-        for m in config.settings().get("models", []):
-            m = dict(m)
-            # the 8-step generation LoRA is optional: without it MOSS-Image samples the normal way
-            m["missing"] = [k for k, p in m.get("files", {}).items() if p and k not in ("fast", "fast4") and not Path(p).exists()]
-            m["variant_info"] = VARIANTS.get(m.get("variant"), {})
-            m["needs_variant"] = bool(m.get("auto")) and not m.get("variant_confirmed") and not m.get("variant")
-            out.append(m)
-        return out
+        return [self._view(m) for m in config.settings().get("models", [])]
 
     def get(self, model_id: str) -> dict | None:
-        for m in self.list():
-            if m["id"] == model_id:
-                return m
+        """One model.  Only its own files are looked at (list() checks every file of every model, and this is
+        called per image while captions are made)."""
+        for m in config.settings().get("models", []):
+            if m.get("id") == model_id:
+                return self._view(m)
         return None
 
     def add(self, name: str, variant: str, files: dict) -> dict:
@@ -1162,11 +1275,36 @@ class Hasher:
 
     MAX_BYTES_PER_SEC = 120 << 20
 
+    class _Queue:
+        """The files waiting to be hashed.  What get() asks for goes to the front: it is needed now (a training
+        that starts, an export), and must not wait behind files queued earlier."""
+
+        def __init__(self):
+            self._items: "collections.deque" = collections.deque()
+            self._cond = threading.Condition()
+
+        def put(self, item, front: bool = False):
+            with self._cond:
+                self._items.appendleft(item) if front else self._items.append(item)
+                self._cond.notify()
+
+        def to_front(self, key: str) -> None:
+            with self._cond:
+                hit = next((it for it in self._items if it[1] == key), None)
+                if hit is not None and self._items[0] is not hit:
+                    self._items.remove(hit)
+                    self._items.appendleft(hit)
+
+        def get(self):
+            with self._cond:
+                while not self._items:
+                    self._cond.wait()
+                return self._items.popleft()
+
     def __init__(self):
-        import queue
         self._lock = threading.Lock()
         self._running: set[str] = set()
-        self._q: "queue.Queue" = queue.Queue()
+        self._q = self._Queue()
         threading.Thread(target=self._loop, daemon=True, name="hasher").start()
 
     def _loop(self):
@@ -1182,19 +1320,31 @@ class Hasher:
         st = p.stat()
         return f"{p}|{st.st_size}|{int(st.st_mtime)}"
 
-    def get(self, path: str) -> str | None:
-        p = Path(path)
-        if not p.exists():
+    def peek(self, path: str) -> str | None:
+        """The hash when it is already known; nothing is queued (a list of every model must not start reading
+        hundreds of GB)."""
+        try:
+            return config.settings().get("hash_cache", {}).get(self._key(Path(path)))
+        except OSError:
             return None
-        key = self._key(p)
+
+    def get(self, path: str) -> str | None:
+        """The hash, or None while it is not known yet: the file is then hashed in the background, ahead of the
+        files asked for earlier.  Never waits."""
+        p = Path(path)
+        try:
+            key = self._key(p)
+        except OSError:   # no such file (any more)
+            return None
         h = config.settings().get("hash_cache", {}).get(key)
         if h:
             return h
         with self._lock:
             if key in self._running:
+                self._q.to_front(key)
                 return None
             self._running.add(key)
-        self._q.put((p, key))
+        self._q.put((p, key), front=True)
         return None
 
     def _run(self, p: Path, key: str):

@@ -454,6 +454,55 @@ def build_prompts(kind, outfit_mode, variant, trigger, cls=None, prompt_set=PROM
 
 
 # ======================================================================== ComfyUI server
+STAGE_SOURCE = "source.txt"   # in each staged folder: the file it was made for (clean_staged)
+_stage_lock = threading.Lock()
+
+
+def _stage_sub(src: Path) -> str:
+    """The subfolder a file is staged in, one per source file: named by its path, size and modification time.  A
+    file replaced under the same name (downloaded again, trained again) gets another name in ComfyUI, which keeps the
+    loaded model and the node outputs by name and would go on using the old one."""
+    import hashlib
+    st = src.stat()
+    return "lsg_" + hashlib.sha1(f"{str(src).lower()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:10]
+
+
+def clean_staged() -> int:
+    """Remove the staged files (hard links, or copies of LoRAs on drives without links) whose source file is gone or
+    was replaced, and the folders of the older naming, which are not used any more.  A hard link keeps the data of a
+    model the user deleted on the disk, so without this the space never came back.  Only data/comfy_models/*/lsg_*
+    is touched; a file in use is left for the next time.  Returns the number of files removed."""
+    removed = 0
+    with _stage_lock:
+        try:
+            kinds = [d for d in COMFY_MODELS.iterdir() if d.is_dir()]
+        except OSError:
+            return 0
+        for kind in kinds:
+            for d in kind.glob("lsg_*"):
+                if not d.is_dir():
+                    continue
+                try:
+                    src = Path((d / STAGE_SOURCE).read_text(encoding="utf-8").strip())
+                    keep = src.is_file() and _stage_sub(src) == d.name
+                except FileNotFoundError:
+                    keep = False   # made before the folders had the note: staged again under the new name when used
+                except ValueError:
+                    keep = False
+                except OSError:
+                    continue       # cannot tell now (the note or the source is held by another program): left
+                if keep:
+                    continue
+                try:
+                    for f in d.iterdir():
+                        f.unlink()
+                        removed += f.name != STAGE_SOURCE
+                    d.rmdir()
+                except OSError:
+                    pass   # in use: next time
+    return removed
+
+
 def _same_copy(dest: Path, src: Path) -> bool:
     """dest is a copy of src made by stage_model (same size and modification time)."""
     try:
@@ -522,33 +571,37 @@ class Comfy:
         """Expose a model file to ComfyUI under data/comfy_models/<kind>/ (hard link, no copy on
         the same volume).  If linking is impossible, the file's own folder is added as an extra
         search path.  Returns the name ComfyUI knows it by."""
-        import hashlib
         src = Path(path)
         if not src.is_file():
             raise RuntimeError(f"ファイルが見つかりません（移動・削除された可能性があります）: {src}")
-        # each source folder gets its own subfolder, so two different files with the same name never collide
-        sub = "lsg_" + hashlib.sha1(str(src.parent).lower().encode()).hexdigest()[:8]
-        dest = COMFY_MODELS / kind / sub / src.name
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # a file replaced in place (e.g. downloaded again under the same name) is a new file: link again
-            if dest.exists() and not os.path.samefile(dest, src):
-                if kind == "loras" and _same_copy(dest, src):
-                    return os.path.join(sub, src.name)   # the copy made below on a drive without links
-                dest.unlink()
-            if not dest.exists():
-                try:
-                    os.link(src, dest)
-                except OSError:
-                    if kind != "loras":
-                        raise
-                    # no hard links on this drive (exFAT, FAT32): a LoRA is small enough to copy, which needs no
-                    # ComfyUI restart and keeps two LoRAs of the same name in different folders apart
-                    tmp = dest.with_name(dest.name + ".part")
-                    shutil.copyfile(src, tmp)
-                    shutil.copystat(src, tmp)
-                    os.replace(tmp, dest)
-            return os.path.join(sub, src.name)
+            with _stage_lock:   # not while clean_staged looks at the folders
+                # each source file gets its own subfolder (_stage_sub), so two different files with the same name
+                # never collide
+                sub = _stage_sub(src)
+                dest = COMFY_MODELS / kind / sub / src.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                note = dest.parent / STAGE_SOURCE
+                if not note.exists():   # written before the file: clean_staged tells by it what the folder is for
+                    note.write_text(str(src), encoding="utf-8")
+                # a file replaced in place (e.g. downloaded again under the same name) is a new file: link again
+                if dest.exists() and not os.path.samefile(dest, src):
+                    if kind == "loras" and _same_copy(dest, src):
+                        return os.path.join(sub, src.name)   # the copy made below on a drive without links
+                    dest.unlink()
+                if not dest.exists():
+                    try:
+                        os.link(src, dest)
+                    except OSError:
+                        if kind != "loras":
+                            raise
+                        # no hard links on this drive (exFAT, FAT32): a LoRA is small enough to copy, which needs no
+                        # ComfyUI restart and keeps two LoRAs of the same name in different folders apart
+                        tmp = dest.with_name(dest.name + ".part")
+                        shutil.copyfile(src, tmp)
+                        shutil.copystat(src, tmp)
+                        os.replace(tmp, dest)
+                return os.path.join(sub, src.name)
         except OSError:
             self.extra_dirs.setdefault(kind, set()).add(str(src.parent))
             return src.name
@@ -569,6 +622,10 @@ class Comfy:
                 return
             for k in ("checkpoints", "diffusion_models", "text_encoders", "vae", "loras"):
                 (COMFY_MODELS / k).mkdir(parents=True, exist_ok=True)
+            try:   # here, while no ComfyUI has the files open
+                clean_staged()
+            except Exception:
+                pass   # housekeeping only
             extra = self._write_extra_paths()
             from .addons import MOSS_EDIT, PPM, RGTHREE, ensure_node
             for name in (PPM, MOSS_EDIT, RGTHREE):
@@ -1146,10 +1203,15 @@ def graph_for(model: dict, lora_name: str | None, strength: float, prompt: str, 
                      width, height, s, prefix)
 
 
-def comfy_lora_file(family: str, src: Path, dest: Path) -> Path:
+def comfy_lora_file(family: str, src: Path, dest: Path, link: bool = False) -> Path:
     """Write the LoRA in the key layout ComfyUI expects for this family.  A file already written from the same
-    LoRA (not older than it) is reused: converting starts the training Python each time."""
-    src, final = Path(src).resolve(), Path(dest).resolve()   # the converter runs with cwd=sd-scripts
+    LoRA (not older than it) is reused: converting starts the training Python each time.
+    link: a family whose LoRA is used as it is may be a hard link to the saved file (the comparison's file in ComfyUI's
+    folder: no second copy of every saved version); the export always gets a file of its own."""
+    # absolute paths: the converter runs with cwd=sd-scripts.  Not resolve(): for a path that does not exist yet it
+    # answers with or without the \\?\ prefix when another thread makes the folder at that moment, and the two callers
+    # then held different locks for the same file (both converted, and one failed to put its file in place)
+    src, final = Path(os.path.abspath(src)), Path(os.path.abspath(dest))
     final.parent.mkdir(parents=True, exist_ok=True)
     with _convert_lock(final):   # export and the comparison may convert the same LoRA at the same time
         try:
@@ -1160,11 +1222,21 @@ def comfy_lora_file(family: str, src: Path, dest: Path) -> Path:
         # never leave a half-written file under the final name; a name of its own, so no other writer can remove it
         dest = final.with_name(f"{final.stem}.{uuid.uuid4().hex[:8]}.part{final.suffix}")
         try:
-            _convert_lora(family, src, dest)
+            if not (link and family not in CONVERTED_FAMILIES and _link_file(src, dest)):
+                _convert_lora(family, src, dest)
             os.replace(dest, final)
         finally:
             dest.unlink(missing_ok=True)
         return final
+
+
+def _link_file(src: Path, dest: Path) -> bool:
+    """A hard link to src at dest; False where that is not possible (another drive, exFAT / FAT32)."""
+    try:
+        os.link(src, dest)
+        return True
+    except OSError:
+        return False
 
 
 _convert_locks: dict[str, threading.Lock] = {}
@@ -1402,11 +1474,18 @@ def run_eval(project, run_id: int, eval_id: int, progress_cb=None):
     lora_names = {}
     wanted = list(spec["checkpoints"]) + (list(spec.get("extra_checkpoints") or ["final"]) if extras else [])
     try:
+        found = {}
         for key in dict.fromkeys(wanted):
             c = ckpts.get(key) if key == "final" else ckpts.get(int(key))
-            if not c:
-                continue
-            lora_names[str(key)] = staged_lora(project.id, run_id, fam, Path(c["path"]))
+            if c:
+                found[str(key)] = c
+        total = _eval_total(spec, found, len(extras))
+        for key, c in found.items():
+            # a stop pressed while the LoRAs are converted or ComfyUI starts is seen here (the callback raises it),
+            # not only after the first image
+            if progress_cb:
+                progress_cb(0, total, None)
+            lora_names[key] = staged_lora(project.id, run_id, fam, Path(c["path"]))
     except BaseException:
         prestart.join()
         comfy.park()   # started above: kept for the next job, stopped after a while unused
@@ -1432,11 +1511,21 @@ def run_eval(project, run_id: int, eval_id: int, progress_cb=None):
         comfy.park()  # free VRAM for scoring / training; the process stays for the next comparison
 
 
+def _eval_total(spec: dict, have, n_extra: int) -> int:
+    """How many images a comparison makes: the columns of the training model and of each other model, for every
+    prompt and seed.  have: the saved versions (as str) whose LoRA is there."""
+    def columns(keys) -> int:
+        return (1 if spec.get("include_base") else 0) + sum(1 for k in keys if str(k) in have) * len(spec["strengths"])
+    n = columns(spec["checkpoints"]) + n_extra * columns(spec.get("extra_checkpoints") or ["final"])
+    return n * len(spec["prompts"]) * len(spec["seeds"])
+
+
 def staged_lora(project_id: str, run_id: int, family: str, src: Path) -> str:
     """The saved LoRA under ComfyUI's loras folder in the layout ComfyUI expects (converted once per saved file and
-    reused, also by the export).  Returns the name ComfyUI knows it by."""
+    reused, also by the export; a family that needs no conversion gets a hard link, not a second copy).  Returns the
+    name ComfyUI knows it by."""
     rel = os.path.join("lorastudio", project_id, f"r{run_id}", Path(src).name)  # ComfyUI lists names with os.sep
-    comfy_lora_file(family, Path(src), COMFY_MODELS / "loras" / rel)
+    comfy_lora_file(family, Path(src), COMFY_MODELS / "loras" / rel, link=True)
     return rel
 
 
@@ -1497,6 +1586,8 @@ def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, mod
                      extras=(), notes=()):
     t_begin = time.time()
     comfy.ensure_started()
+    if progress_cb:   # a stop pressed while ComfyUI was starting: before the first image is drawn, not after it
+        progress_cb(0, _eval_total(spec, lora_names, len(extras)), None)
 
     negative = _negative_for(model["variant"], snap)
     base_col = [("base", None, 0.0)] if spec.get("include_base") else []

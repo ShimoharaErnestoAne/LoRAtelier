@@ -76,11 +76,29 @@ def _patch(e: dict):
     return mod
 
 
+def _use_local_git() -> None:
+    """The portable git setup_env.py fetches when the PC has none (tools/git) goes on PATH.  At import and before
+    every git call, not only when an engine is installed: after a restart the engines fetched with git are
+    asked for their commit, and without git on PATH that failed (ComfyUI could not start, /api/library failed)."""
+    local = config.ROOT / "tools" / "git" / "cmd"
+    path = os.environ.get("PATH", "")
+    if (local / "git.exe").exists() and str(local) not in path.split(os.pathsep):
+        os.environ["PATH"] = str(local) + (os.pathsep + path if path else "")
+
+
+_use_local_git()
+
+
 def _git(d: Path, *args) -> str:
+    """git's output, or "" when git cannot be run (the caller then sees "not the pinned commit")."""
+    _use_local_git()
     # safe.directory: git refuses folders it thinks belong to another user (exFAT drives, copied folders)
-    r = subprocess.run(["git", "-c", f"safe.directory={d.as_posix()}", "-C", str(d), *args], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    return r.stdout
+    try:
+        r = subprocess.run(["git", "-c", f"safe.directory={d.as_posix()}", "-C", str(d), *args], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return r.stdout or ""
 
 
 def _run(argv: list[str], cwd: Path | None = None):
@@ -97,9 +115,7 @@ def install_engine(name: str) -> None:
     _ready.pop(name, None)
     e = _lockfile()["engines"][name]
     d = engine_dir(name)
-    local = config.ROOT / "tools" / "git" / "cmd"   # the portable git setup_env.py fetches when the PC has none
-    if (local / "git.exe").exists() and str(local) not in os.environ["PATH"].split(os.pathsep):
-        os.environ["PATH"] = str(local) + os.pathsep + os.environ["PATH"]
+    _use_local_git()
     if not shutil.which("git"):
         raise RuntimeError("git が見つかりません。setup.bat をもう一度実行すると、このフォルダーの中に git を用意します。")
     if not (d / ".git").exists():
@@ -160,9 +176,16 @@ def ensure_node(name: str) -> bool:
             mark = src / BUNDLE_MARK
             bundled = mark.read_text(encoding="utf-8").strip() if mark.is_file() else None   # no bundled copy: git
             if not (d / ".git").exists() and bundled == e["commit"]:
+                # copied under another name first: a copy cut off halfway (the app closed) must not be left in
+                # place looking ready (its BUNDLE_MARK may already be there).  ".disabled": ComfyUI skips such
+                # folders in custom_nodes
+                tmp = d.with_name(d.name + ".copying.disabled")
+                if tmp.exists():
+                    shutil.rmtree(tmp)
+                shutil.copytree(src, tmp)
                 if d.exists():
                     shutil.rmtree(d)   # an older bundled copy (a git checkout is updated by git instead)
-                shutil.copytree(src, d)
+                os.replace(tmp, d)
             else:
                 install_engine(name)
         except Exception as ex:
@@ -176,19 +199,28 @@ def fetch_tokenizers(repos: list) -> None:
     that training later runs offline."""
     code = ("import sys, json\nfrom huggingface_hub import snapshot_download as d\n"
             "for repo, pats in json.loads(sys.argv[1]):\n    d(repo, allow_patterns=pats)\n")
-    _run([config.TRAIN_PYTHON, "-c", code, json.dumps(repos)])
+    try:
+        _run([config.TRAIN_PYTHON, "-c", code, json.dumps(repos)])
+    except RuntimeError as e:
+        # huggingface_hub's own words for "log in / accept the terms" (not any "401" in the output: a line
+        # number or a commit hash has those digits too)
+        if any(s in str(e) for s in ("GatedRepoError", "401 Client Error", "403 Client Error")):
+            raise NeedLogin(str(e)) from e
+        raise
+
+
+class NeedLogin(Exception):
+    """Hugging Face answered 401 / 403: the model needs a login and the acceptance of its terms."""
 
 
 # ======================================================================== model files
 def _existing(names: list[str], gb: float) -> Path | None:
-    """A file of the same name (or a known other name of the same file) and about the same size anywhere
-    under models/ (e.g. fetched by an older version into models/sdxl), so it is not downloaded twice."""
+    """A whole file of the same name (or a known other name of the same file) and about the same size anywhere
+    under models/ (e.g. fetched by an older version into models/sdxl), so it is not downloaded twice.  A copy
+    that was cut off is passed over (_whole), not registered in place of the download."""
     for f in (f for n in names for f in config.MODELS_DIR.rglob(n)):
-        try:
-            if f.is_file() and abs(f.stat().st_size / 1e9 - gb) <= max(0.02 * gb, 0.05):
-                return f
-        except OSError:
-            pass
+        if f.is_file() and _whole(f, gb):
+            return f
     return None
 
 
@@ -203,20 +235,25 @@ def _comfy_existing(names: list[str], gb: float) -> Path | None:
         if not d.is_dir():
             continue
         for f in (f for n in names for f in d.rglob(n)):
-            try:
-                if f.is_file() and abs(f.stat().st_size / 1e9 - gb) <= max(0.02 * gb, 0.05):
-                    return f
-            except OSError:
-                pass
+            if f.is_file() and _whole(f, gb):
+                return f
     return None
 
 
-def installed(entry: dict) -> dict | None:
-    """The registered model that holds this catalog entry's main file, if any."""
-    names = {_save_name(f).lower() for f in entry["files"].values() if f} | \
-        {_save_name(ch["file"]).lower() for chs in entry.get("choices", {}).values() for ch in chs} | \
-        {n.lower() for ns in entry.get("aliases", {}).values() for n in ns}
-    for m in registry.list():
+MAIN_KEYS = ("ckpt", "gen", "turbo")   # the model itself; a text encoder / VAE is shared by other models of the family
+
+
+def installed(entry: dict, models: list[dict] | None = None) -> dict | None:
+    """The registered model that holds this catalog entry's main file, if any.  models: registry.list() taken once
+    by a caller that asks for many entries."""
+    def main(files: dict) -> dict:
+        return {k: f for k, f in files.items() if k in MAIN_KEYS}
+    # the model's own file only: another model of the same family (a fine-tune registered with the family's usual
+    # text encoder and VAE) is not this one, and must not make it show as added
+    names = {_save_name(f).lower() for f in main(entry["files"]).values() if f} | \
+        {_save_name(ch["file"]).lower() for chs in main(entry.get("choices", {})).values() for ch in chs} | \
+        {n.lower() for ns in main(entry.get("aliases", {})).values() for n in ns}
+    for m in registry.list() if models is None else models:
         if m.get("variant") != entry["variant"] or m["missing"]:
             continue
         if entry.get("merge"):   # an add-on to a model: installed when all of its files are there
@@ -224,7 +261,7 @@ def installed(entry: dict) -> dict | None:
             if all(_save_name(f).lower() in have for f in entry["files"].values() if f) and \
                     all(any(_save_name(ch["file"]).lower() in have for ch in chs) for chs in entry.get("choices", {}).values()):
                 return m
-        elif any(Path(p).name.lower() in names for p in m["files"].values()):
+        elif any(Path(p).name.lower() in names for p in main(m["files"]).values() if p):
             return m
     return None
 
@@ -297,12 +334,28 @@ def _free_name(dest: Path) -> Path:
     return cand
 
 
+def _url(repo: str, path: str) -> str:
+    return f"https://huggingface.co/{repo}/resolve/main/{path}"
+
+
+def _part_file(url: str, dest: Path) -> Path:
+    return dest.with_name(f"{dest.name}.{hashlib.sha1(url.encode()).hexdigest()[:12]}.part")
+
+
+def _part_gb(repo: str, path: str, dest: Path) -> float:
+    """GB of this file an interrupted download left (the next one continues it, so it needs that much less)."""
+    try:
+        return _part_file(_url(repo, path), _free_name(dest)).stat().st_size / 1e9
+    except OSError:
+        return 0.0
+
+
 def _download(repo: str, path: str, dest: Path, token: str | None, st: dict, gb: float | None = None) -> Path:
     """Resumable: an interrupted download continues from the .part file.  The .part is named after the
     source URL, so a different file saved under the same name never continues it.  Returns where the file is:
     dest, or a free name next to it when dest holds some other file (a cut-off manual copy, or another
     model's file with the same generic name such as ae.safetensors), which is left as it is."""
-    url = f"https://huggingface.co/{repo}/resolve/main/{path}"
+    url = _url(repo, path)
     with _lock:
         guard = _in_flight.setdefault(str(dest).lower(), threading.Lock())
     with guard:
@@ -311,7 +364,7 @@ def _download(repo: str, path: str, dest: Path, token: str | None, st: dict, gb:
                 st["done_bytes"] += dest.stat().st_size
                 return dest
             dest = _free_name(dest)
-        tmp = dest.with_name(f"{dest.name}.{hashlib.sha1(url.encode()).hexdigest()[:12]}.part")
+        tmp = _part_file(url, dest)
         have = tmp.stat().st_size if tmp.exists() else 0
         req = urllib.request.Request(url)
         if token:
@@ -336,9 +389,15 @@ def _download(repo: str, path: str, dest: Path, token: str | None, st: dict, gb:
             tmp.unlink(missing_ok=True)
             raise
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise NeedLogin(str(e)) from e
             if not (e.code == 416 and have):   # 416: the .part is already whole (the last try ended after the last byte)
                 raise
         except OSError as e:   # timeout, reset: the .part is kept
+            from .remote import disk_full
+            if disk_full(e):
+                raise RuntimeError(f"空き容量がなくなったため、{dest.name} のダウンロードを中断しました。"
+                                   "空きを増やしてからもう一度追加すると、続きから取得します。") from e
             raise RuntimeError(f"{dest.name} のダウンロード中に接続が切れました。もう一度追加すると続きから取得します。") from e
         # read() returns b"" when the connection drops early: a short file must not be installed.  Without a length
         # from the server, a safetensors file is checked against its own header
@@ -409,8 +468,9 @@ def _work(entry: dict, sources: dict, token: str | None, st: dict) -> None:
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(dest.parent).free / 1e9
-            if free < gb + 2:
-                raise RuntimeError(f"空き容量が不足しています（{name} に約 {gb:.1f}GB 必要 / 空き {free:.1f}GB）。")
+            need = max(0.0, gb - _part_gb(repo, path, dest))   # what an interrupted download already fetched is there
+            if free < need + 2:
+                raise RuntimeError(f"空き容量が不足しています（{name} にあと約 {need:.1f}GB 必要 / 空き {free:.1f}GB）。")
             st["message"] = f"ダウンロード中: {name}"
             files[key] = str(_download(repo, path, dest, token, st, gb))
         needs = entry.get("needs") or {}
@@ -438,18 +498,19 @@ def _work(entry: dict, sources: dict, token: str | None, st: dict) -> None:
         st.update(state="done", model_id=m["id"], message="完了")
     except Cancelled:
         st.update(state="cancelled", message="キャンセルしました")
-    except Exception as e:
-        msg = str(e)
-        if "401" in msg or "403" in msg:
-            msg = "このモデルは Hugging Face でのログインと利用条件への同意が必要です。モデルのページで同意し、アクセストークンを入力してください。"
-        st.update(state="failed", error=msg, message="失敗")
+    except NeedLogin:
+        st.update(state="failed", message="失敗",
+                  error="このモデルは Hugging Face でのログインと利用条件への同意が必要です。モデルのページで同意し、アクセストークンを入力してください。")
+    except Exception as e:   # the real reason, as it is (a git / pip error is not a login problem)
+        st.update(state="failed", error=str(e), message="失敗")
     bus.publish("download", id=entry["id"], state=st["state"])
 
 
 def catalog_view() -> list[dict]:
     out = []
+    models = registry.list()   # once for all entries (it looks at every file of every model)
     for c in CATALOG:
-        m = installed(c)
+        m = installed(c, models)
         if m and not all(engine_ready(e) for e in (c.get("needs") or {}).get("engines", [])):
             m = None   # an engine pin moved on (e.g. the Qwen-Image-2.1 trainer): "追加する" again updates it
         rec = {k: recommend(c, k) for k in c.get("choices", {})}

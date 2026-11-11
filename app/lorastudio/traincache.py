@@ -48,13 +48,26 @@ def group_key(snap: dict) -> str | None:
     return hashlib.sha1(json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
-def _keys(item: dict, masked_run: bool = False) -> tuple[str, str]:
+def _te_extra(snap: dict) -> str:
+    """sd-scripts writes the caption dropout rate into the text-encoder cache files of Anima and MOSS-Image and
+    trains with the rate read from the file (an existing file is only checked for having the field): a run with
+    another rate must not be given those files, or it trains with the earlier run's rate."""
+    if snap.get("engine") in _SD_ENGINES and (snap.get("model") or {}).get("family") != "sdxl":
+        try:
+            rate = float((snap.get("values") or {}).get("caption_dropout_rate") or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        return f"|drop{rate:g}"
+    return ""
+
+
+def _keys(item: dict, masked_run: bool = False, te_extra: str = "") -> tuple[str, str]:
     base = f"{item['sha']}|{json.dumps(item.get('crop'))}" + (f"|prep{item['prep']}" if item.get("prep") else "")
     # in a masked run every latent file holds an alpha mask (all ones for an image without one; sd-scripts stores it
     # in the .npz and encodes again when it is missing or unexpected), so those files are kept apart
     extra = f"|{item['mask']['key']}" if item.get("mask") else "|alpha" if masked_run else ""
     lat = hashlib.sha1((base + extra).encode()).hexdigest()[:24]
-    te = hashlib.sha1((base + "|" + (item.get("caption") or "")).encode("utf-8")).hexdigest()[:24]
+    te = hashlib.sha1((base + "|" + (item.get("caption") or "") + te_extra).encode("utf-8")).hexdigest()[:24]
     return lat, te
 
 
@@ -118,7 +131,7 @@ def prime(project_path: Path, run_dir: Path, snap: dict) -> int:
     present = set(_listing(dest_dir))
     for it in snap.get("items") or []:
         stem = Path(it["file"]).stem
-        lat, te = _keys(it, bool(snap.get("mask")))
+        lat, te = _keys(it, bool(snap.get("mask")), _te_extra(snap))
         for sub, k in (("L", lat), ("T", te)):
             for name in _starting(stored[sub], f"{k}_"):
                 dest = dest_dir / (stem + name[len(k):])
@@ -143,7 +156,7 @@ def harvest(project_path: Path, run_dir: Path, snap: dict) -> int:
     stored = {sub: set(_listing(st / sub)) for sub in ("L", "T")}
     for it in snap.get("items") or []:
         stem = Path(it["file"]).stem
-        lat, te = _keys(it, bool(snap.get("mask")))
+        lat, te = _keys(it, bool(snap.get("mask")), _te_extra(snap))
         for name in _starting(names, f"{stem}_"):
             if name.endswith(".part"):
                 continue

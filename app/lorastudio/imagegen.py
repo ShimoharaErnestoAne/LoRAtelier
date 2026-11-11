@@ -10,7 +10,9 @@ other GPU job takes the GPU, or after the idle time.
 """
 from __future__ import annotations
 
+import copy
 import json
+import os
 import random
 import threading
 import time
@@ -57,28 +59,136 @@ def img_file(name: str) -> Path:
     return next((d / name for d in dirs if (d / name).exists()), dirs[0] / name)
 
 
-def _load(path: Path, default):
+# history.json / presets.json / form.json are kept in memory and read again only when the file changed (its
+# modification time and size): the history keeps every request, and it was read and parsed whole several times for
+# each image made and each look at the page.
+_files: dict[Path, tuple] = {}   # path -> ((mtime_ns, size), data)
+
+
+def _sig(path: Path):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+_RETRY_S = 0.15   # wait before reading a file again that could not be read (longer each time)
+
+
+def _read_text(path: Path, tries: int = 4) -> str | None:
+    """The file's text, None when there is no such file.  A read that fails for a moment (antivirus or backup
+    software holding the file) is retried; one that keeps failing raises, so nothing is saved over the file."""
+    for i in range(tries):
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except UnicodeDecodeError:
+            raise
+        except OSError as e:
+            if i == tries - 1:
+                raise RuntimeError(f"{path.name} を読めませんでした（{e}）。ほかのソフト（ウイルス対策・バックアップなど）が"
+                                   "このファイルを開いていないか確認してから、もう一度試してください。") from e
+            time.sleep(_RETRY_S * (i + 1))
+    return None
+
+
+def _data(path: Path, default):
+    """The file's content as kept in memory: the object itself, for use under _lock (callers hand out copies).
+    No file: default.  A file that cannot be read is not taken for an empty one (the next save would replace the
+    history / the saved settings with nothing): what was read before is used, else RuntimeError.  A broken file
+    is moved aside (<name>.broken-<time>.json) before starting over."""
+    with _lock:
+        sig, hit = _sig(path), _files.get(path)
+        if hit and sig is not None and hit[0] == sig:
+            return hit[1]
+        try:
+            text = _read_text(path)
+        except RuntimeError:
+            if hit and sig is not None:   # still there, only not readable now: this app is its only writer
+                return hit[1]
+            raise
+        except ValueError:
+            text = ""   # not UTF-8: broken
+        if text is None:
+            _files.pop(path, None)
+            return default
+        try:
+            data = json.loads(text)
+            if not isinstance(data, type(default)):
+                raise ValueError("unexpected content")
+        except ValueError:
+            broken = path.with_name(f"{path.stem}.broken-{time.strftime('%Y%m%d-%H%M%S')}{path.suffix}")
+            try:
+                os.replace(path, broken)
+            except OSError as e:
+                raise RuntimeError(f"{path.name} が壊れていて、退避もできませんでした（{e}）。ほかのソフトが"
+                                   "このファイルを開いていないか確認してから、もう一度試してください。") from e
+            _files.pop(path, None)
+            return default
+        _files[path] = (sig, data)
+        return data
+
+
+def _save(path: Path, data):
+    """Write the file (atomically) and keep `data` as its content in memory.  The caller gives `data` away."""
+    with _lock:
+        try:
+            config.atomic_write_json(path, data)
+        except BaseException:
+            _files.pop(path, None)   # memory must not be ahead of the file
+            raise
+        _files[path] = (_sig(path), data)
+
+
+def _load(path: Path, default):
+    """A copy of the file's content the caller may change."""
+    with _lock:
+        return copy.deepcopy(_data(path, default))
+
+
+def _entry_copy(e: dict) -> dict:
+    """A history entry the caller may change (its own keys, settings, images, warnings) without touching the one
+    kept in memory.  Not a deep copy: the history can hold thousands of entries."""
+    out = dict(e)
+    if isinstance(out.get("settings"), dict):
+        out["settings"] = dict(out["settings"])
+    for k in ("images", "warnings"):
+        if isinstance(out.get(k), list):
+            out[k] = list(out[k])
+    return out
 
 
 def history() -> list[dict]:
     with _lock:
-        return _load(HISTORY, [])
+        return [_entry_copy(e) for e in _data(HISTORY, [])]
+
+
+def get_entry(eid: str) -> dict | None:
+    """One request of the history (a copy), None when it is not there."""
+    with _lock:
+        e = next((x for x in _data(HISTORY, []) if x["id"] == eid), None)
+        return _entry_copy(e) if e else None
 
 
 def _save_history(items: list[dict]):
-    config.atomic_write_json(HISTORY, items)
+    _save(HISTORY, items)
+
+
+def _add_entry(e: dict):
+    with _lock:
+        items = _data(HISTORY, [])
+        items.insert(0, copy.deepcopy(e))   # the caller keeps (and returns) its own
+        _save_history(items)
 
 
 def _update(eid: str, **fields):
     with _lock:
-        items = history()
+        items = _data(HISTORY, [])
         for e in items:
             if e["id"] == eid:
-                e.update(fields)
+                e.update(copy.deepcopy(fields))   # e.g. the list of images the running request goes on filling
                 break
         _save_history(items)
     bus.publish("imagegen", id=eid, **{k: v for k, v in fields.items() if k in ("status", "message")})
@@ -99,7 +209,7 @@ def get_form() -> dict:
 
 
 def save_form(form: dict):
-    config.atomic_write_json(FORM, form)
+    _save(FORM, copy.deepcopy(form))
 
 
 def presets() -> list[dict]:
@@ -109,7 +219,7 @@ def presets() -> list[dict]:
 
 
 def _write_presets(items: list[dict]):
-    config.atomic_write_json(PRESETS, items)
+    _save(PRESETS, copy.deepcopy(items))   # callers go on using (and returning) the presets in the list
 
 
 def _update_preset(pid: str, **fields) -> bool:
@@ -232,7 +342,7 @@ def delete_preset(pid: str) -> dict | None:
         if at is None:
             return None
         gone = dict(items.pop(at), index=at)
-        config.atomic_write_json(PRESETS, items)
+        _write_presets(items)
     return gone
 
 
@@ -383,10 +493,7 @@ def submit(form: dict, runner) -> dict:
     }
     entry = {"id": uuid.uuid4().hex[:12], "created": time.time(), "status": "queued", "message": "順番待ち",
              "settings": settings, "images": [], "warnings": []}
-    with _lock:
-        items = history()
-        items.insert(0, entry)
-        _save_history(items)
+    _add_entry(entry)
     job = runner.enqueue_task(OWNER, LABEL, lambda: run(entry["id"]), on_cancel=lambda: cancel(entry["id"]))
     job.detail = (form.get("positive") or "").strip()[:60] or None
     job.entry = entry["id"]
@@ -402,10 +509,7 @@ def _count(form: dict) -> int:
 
 
 def _queue(entry: dict, runner, detail: str) -> dict:
-    with _lock:
-        items = history()
-        items.insert(0, entry)
-        _save_history(items)
+    _add_entry(entry)
     job = runner.enqueue_task(OWNER, LABEL, lambda: run(entry["id"]), on_cancel=lambda: cancel(entry["id"]))
     job.detail = detail[:60] or None
     job.entry = entry["id"]
@@ -442,7 +546,7 @@ def _submit_workflow(form: dict, runner) -> dict:
 
 
 def cancel(eid: str) -> bool:
-    e = next((x for x in history() if x["id"] == eid), None)
+    e = get_entry(eid)
     if not e or e["status"] not in ("queued", "running"):
         return False
     _cancel.add(eid)
@@ -457,7 +561,7 @@ def cancel(eid: str) -> bool:
 
 def delete(eid: str) -> bool:
     with _lock:
-        items = history()
+        items = _data(HISTORY, [])
         e = next((x for x in items if x["id"] == eid), None)
         if not e or e["status"] in ("queued", "running"):
             return False
@@ -481,7 +585,7 @@ def delete(eid: str) -> bool:
 def run(eid: str):
     """Generate one request.  Called from the serial GPU queue (the GPU is already ours)."""
     global _kept
-    e = next((x for x in history() if x["id"] == eid), None)
+    e = get_entry(eid)
     if not e or e["status"] != "queued" or eid in _cancel:
         _cancel.discard(eid)
         return
@@ -728,7 +832,7 @@ KEEP_COMFY_OWNERS.add(LABEL)
 def recover():
     """At startup: requests that were queued or running when the app ended cannot continue."""
     with _lock:
-        items = history()
+        items = _data(HISTORY, [])
         changed = False
         for e in items:
             if e["status"] in ("queued", "running"):
@@ -736,7 +840,7 @@ def recover():
                 changed = True
         if changed:
             _save_history(items)
-    for e in items:
+    for e in history():
         if e["status"] == "cancelled" and e["settings"].get("thumb_for"):
             _preset_thumb_done(e["settings"]["thumb_for"], e["id"], None, "アプリの終了で止まりました")
     prune_preset_thumbs()
@@ -754,7 +858,7 @@ def copy_to_project(projects, eid: str, project_id: str | None, name: str | None
     none is given).  The project's own choices (number of images, excluded angles) are kept; the model the
     LoRA is trained on follows the generation model unless the user chose another one."""
     from .generate import check_recipe
-    e = next((x for x in history() if x["id"] == eid), None)
+    e = get_entry(eid)
     if not e:
         raise KeyError(eid)
     if project_id:

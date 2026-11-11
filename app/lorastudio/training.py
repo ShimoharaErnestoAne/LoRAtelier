@@ -450,7 +450,10 @@ def _write_run(project, run_id, meta, model, fam, engine, now, used_images, valu
             shutil.copyfile(mf, frozen)
             digest = hashlib.sha1(frozen.read_bytes()).hexdigest()[:12]
             mask = {"file": str(frozen), "key": f"{masks.MASK_VERSION}:{mask_mode}:{mask_set['floor']}:{digest}"}
-        items.append({"id": im["id"], "sha": im["sha"], "crop": im.get("crop"), "caption": (im.get("caption") or "").strip() or fallback,
+        # a member's image without a caption: its own character's trigger (the project's own names no character)
+        mk = im.get("_member")
+        own = (members[mk].get("trigger") if members and mk is not None and mk < len(members) else None) or fallback
+        items.append({"id": im["id"], "sha": im["sha"], "crop": im.get("crop"), "caption": (im.get("caption") or "").strip() or own,
                       "file": stem + ext, "src": str(src),
                       **({"prep": PREP_VERSION} if prep else {}), **({"fit": fit} if fit else {}),
                       **({"mask": mask} if mask else {})})
@@ -877,7 +880,7 @@ def translate_error(log_tail: str, rc: int | None) -> dict:
 
 
 # ======================================================================== runner
-STEP_RE = re.compile(r"steps:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([\d:]+)<([\d:?]+),\s*([\d.?]+)\s*(s/it|it/s)?(?:,\s*avr_loss=([\d.eE+-]+|nan))?")
+STEP_RE = re.compile(r"steps:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([\d:]+)<([\d:?]+),\s*([\d.?]+)\s*(s/it|it/s)?(?:,\s*(?:avr_)?loss=([\d.eE+-]+|nan))?")
 CACHE_RE = re.compile(r"(caching latents|cache_latents|Caching latents|caching text encoder|Encoding|cache text encoder)", re.I)
 TQDM_RE = re.compile(r"(\d+)%\|[^|]*\|\s*(\d+)/(\d+)")
 
@@ -1022,6 +1025,8 @@ class Job:
         self.vram_baseline: float | None = None  # shared GPU memory before the engine started; None = not measured
         self.eval_eta: int | None = None         # seconds the comparison after training took last time, if known
         self.vram_ctx: tuple[str, dict] = ("", {})   # (family, values) of the run, for the VRAM advice
+        self.stopped_at_save = False             # the safe stop reached its save point and ended the engine itself
+        self.caches_done = False                 # the engine's separate cache commands all ended well
         self.progress = {"phase": "queued", "step": 0, "total": None, "loss": None, "speed": None, "eta_s": None,
                          "message": "待機中"}
 
@@ -1047,14 +1052,19 @@ class Runner:
         threading.Thread(target=self._loop, daemon=True, name="job-runner").start()
 
     # ---------------------------------------------------------------- queue
-    def enqueue(self, project, run_id, resume=None):
-        # the row says 待機 before the runner can see the job: written after, it could overwrite 準備中
-        self._set(project, run_id, status="queued", progress={"phase": "queued", "message": "待機中"})
+    def enqueue(self, project, run_id, resume=None) -> bool:
+        """False: this run is already waiting or running (the button pressed twice) - a second copy would train the
+        same run again after the first one and write over its files."""
         with self._cond:
+            if self.find(project.id, run_id) is not None:
+                return False
+            # the row says 待機 before the runner can see the job: written after, it could overwrite 準備中
+            self._set(project, run_id, status="queued", progress={"phase": "queued", "message": "待機中"})
             self.jobs.append(Job(project, run_id, resume))
             self._save_queue()
             self._cond.notify_all()
         bus.publish("queue")
+        return True
 
     def _save_queue(self):
         """The waiting training runs, in order, so a reservation survives a restart of the app (call under _cond).
@@ -1118,6 +1128,18 @@ class Runner:
         bus.publish("queue")
         return True
 
+    def drop_tasks(self, match) -> int:
+        """Take waiting tasks (not training runs) out of the queue without calling their on_cancel: the caller has
+        marked their records itself (a generation cancelled on its own page, a material batch stopped or paused
+        before it began).  Returns how many were taken out."""
+        with self._cond:
+            gone = [j for j in self.jobs if getattr(j, "task", None) and match(j)]
+            for j in gone:
+                self.jobs.remove(j)
+        if gone:
+            bus.publish("queue")
+        return len(gone)
+
     def find(self, project_id, run_id) -> Job | None:
         for j in ([self.current] if self.current else []) + self.jobs:
             if j and j.project.id == project_id and j.run_id == run_id and not getattr(j, "task", None):
@@ -1145,8 +1167,9 @@ class Runner:
             self._publish(j)
             return {"accepted": True, "message": j.progress["message"]}
         if not force and j.progress.get("phase") == "training":
-            every = max(1, int(j.project.run(run_id)["config"]["values"]["save_every_n_steps"]))
-            total = int(j.progress.get("total") or j.project.run(run_id)["config"]["values"]["max_train_steps"])
+            vals = j.project.run(run_id)["config"]["values"]
+            every = max(1, int(vals["save_every_n_steps"]))
+            total = int(j.progress.get("total") or vals["max_train_steps"])
             stop_at = ((j.progress.get("step") or 0) // every + 1) * every
             if stop_at >= total:
                 # the next save is the end of the run: let it finish (a stop there would mark a finished run 中止)
@@ -1271,8 +1294,11 @@ class Runner:
             pass
         return None
 
-    def _register_checkpoints(self, job: Job, out_dir: Path, final: bool = False):
-        """final=True after the engine process has exited: nothing can still be being written."""
+    def _register_checkpoints(self, job: Job, out_dir: Path, final: bool = False, last_step: int | None = None):
+        """final=True after the engine process has exited: nothing can still be being written.
+        last_step: the run's last step.  When that step is also a save step the engines write the same weights
+        twice, as "-step<last>" and as the final file; only the final one is listed (the comparison would draw
+        every image twice otherwise).  The file itself is left where it is."""
         if not job.output_name:
             job.output_name = job.project.run(job.run_id)["config"]["output_name"]
         name = job.output_name
@@ -1307,6 +1333,10 @@ class Runner:
             for r in db.execute("SELECT id, path FROM checkpoints WHERE run_id=? AND kind='state'", (job.run_id,)).fetchall():
                 if not Path(r["path"]).exists():
                     db.execute("DELETE FROM checkpoints WHERE id=?", (r["id"],))
+            if last_step and db.execute("SELECT 1 FROM checkpoints WHERE run_id=? AND kind='lora' AND step IS NULL",
+                                        (job.run_id,)).fetchone():
+                db.execute("DELETE FROM checkpoints WHERE run_id=? AND kind='lora' AND step=?", (job.run_id, last_step))
+                new_steps = [(s, k) for s, k in new_steps if (s, k) != (last_step, "lora")]
         if new_steps:
             bus.publish("checkpoints", project=job.project.id, run=job.run_id)
         return new_steps
@@ -1351,7 +1381,9 @@ class Runner:
                     traincache.clear_run(run_dir)
                 except Exception:
                     pass
-            elif (job.progress.get("step") or 0) > 0:   # caching is finished once training steps run
+            # caching is finished once training steps run, or (musubi-tuner) once its separate cache commands ended
+            # well: a run that then fails while loading the model must not make the next one encode everything again
+            elif (job.progress.get("step") or 0) > 0 or job.caches_done:
                 try:
                     traincache.harvest(job.project.path, run_dir, snap)
                 except Exception:
@@ -1364,13 +1396,20 @@ class Runner:
                     pass
 
     def _run_cmds(self, job: Job, snap, run_dir: Path, out_dir: Path, logs: Path, cmds, total: int):
+        def is_cache(c) -> bool:
+            return any("cache_latents" in Path(a).name or "cache_text_encoder_outputs" in Path(a).name for a in c[1][1:3])
+
         for i, cmd in enumerate(cmds):
             phase, argv, cwd = cmd[:3]
             if job.stop_requested_at:
                 break
             log_path = logs / f"{i:02d}_{phase}.log"
-            rc, tail = self._exec(job, phase, argv, cwd, log_path, cmd[3] if len(cmd) > 3 and cmd[3] else total, out_dir)
-            if job.stop_requested_at:
+            rc, tail = self._exec(job, phase, argv, cwd, log_path, cmd[3] if len(cmd) > 3 and cmd[3] else total, out_dir, snap)
+            if rc == 0 and is_cache(cmd) and not any(is_cache(c) for c in cmds[i + 1:]):
+                job.caches_done = True
+            # a safe stop ends the engine itself once the save point is written.  An engine that ended with an error
+            # before that (e.g. out of memory) did not stop at a save point: that is a failure, with its reason
+            if job.stop_requested_at and (job.force or job.stopped_at_save or rc == 0):
                 break
             if rc != 0:
                 err = translate_error(tail, rc)
@@ -1379,7 +1418,7 @@ class Runner:
                 self._set(job.project, job.run_id, status="failed", ended=time.time(), error=err,
                           progress={**job.progress, "phase": "failed", "message": err["message"]})
                 return
-        self._register_checkpoints(job, out_dir, final=True)
+        self._register_checkpoints(job, out_dir, final=True, last_step=total)
         if job.stop_requested_at:
             msg = "強制停止しました。" if job.force else "保存地点で停止しました。"
             self._set(job.project, job.run_id, status="cancelled", ended=time.time(),
@@ -1396,7 +1435,7 @@ class Runner:
         for fn in self.after_train_hooks:
             fn(job.project, job.run_id)
 
-    def _exec(self, job: Job, phase, argv, cwd, log_path: Path, total: int, out_dir: Path):
+    def _exec(self, job: Job, phase, argv, cwd, log_path: Path, total: int, out_dir: Path, snap: dict | None = None):
         engine = next((e for e in ("sd-scripts", "musubi-tuner", "musubi-tuner-qwen21", "sd-scripts-moss") if Path(cwd) == engine_cwd(e)), "")
         env = engine_env(engine)
         flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
@@ -1417,7 +1456,8 @@ class Runner:
                     job.progress.pop("spill_gb", None)
                 update_vram_warning(job)
 
-        snap = job.project.run(job.run_id)["config"]
+        if snap is None:   # the run's snapshot holds every caption: the caller passes the one it has
+            snap = job.project.run(job.run_id)["config"]
         job.vram_ctx = (snap["model"]["family"], snap["values"])
         threading.Thread(target=watch_vram, daemon=True, name="vram-watch").start()
         # runs without optimizer states (texture LoRA, musubi-tuner) stop safely at the next saved LoRA file instead
@@ -1528,9 +1568,11 @@ class Runner:
                                 for c in job.project.checkpoints(job.run_id))):
                     # the engine reported a step after the save point, so the save has completed
                     job.progress["message"] = f"ステップ {job.stop_after_step} を保存しました。停止します。"
+                    job.stopped_at_save = True
                     kill_tree(job.proc.pid)
             if now - last_pub > 1.0:
                 last_pub = now
+                logf.flush()
                 self._publish(job)
                 job.project.q("UPDATE runs SET progress=? WHERE id=?",
                               (json.dumps(job.progress, ensure_ascii=False), job.run_id))

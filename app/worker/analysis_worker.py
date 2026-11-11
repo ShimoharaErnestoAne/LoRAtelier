@@ -44,9 +44,14 @@ def log(*a):
 def load_image(path, crop=None):
     with Image.open(path) as im:
         im.load()
-        im = ImageOps.exif_transpose(im).convert("RGBA")
-    bg = Image.new("RGB", im.size, (255, 255, 255))
-    bg.paste(im, mask=im.getchannel("A"))
+        im = ImageOps.exif_transpose(im)
+        # a full-size RGBA copy of a large photo is costly: only images with transparency are put on white
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.getchannel("A"))
+        else:
+            bg = im.convert("RGB")
     if crop:
         bg = bg.crop(tuple(int(v) for v in crop))
     return bg
@@ -133,13 +138,20 @@ class Models:
         torch = self._torch()
         import torchvision.transforms.functional as TF
         m = self.get_frcnn()
-        x = TF.to_tensor(img).to(self.device)
+        # the detector scales its input to at most 1333 px itself: a 24 MP photo sent whole only fills the VRAM
+        small = img
+        if max(img.size) > 1333:
+            small = img.copy()
+            small.thumbnail((1333, 1333))
+        sx, sy = img.size[0] / small.size[0], img.size[1] / small.size[1]
+        x = TF.to_tensor(small).to(self.device)
         with torch.no_grad():
             r = m([x])[0]
         out = []
         for box, label, score in zip(r["boxes"].cpu().numpy(), r["labels"].cpu().numpy(), r["scores"].cpu().numpy()):
             if int(label) == 1:  # COCO person
-                out.append({"bbox": [float(v) for v in box], "score": float(score)})
+                out.append({"bbox": [float(box[0]) * sx, float(box[1]) * sy, float(box[2]) * sx, float(box[3]) * sy],
+                            "score": float(score)})
         return out
 
     # -- photo person masks (masked training)
@@ -303,7 +315,8 @@ def analyze(path, crop):
         res["ccip"] = [round(float(v), 6) for v in np.asarray(ccip_extract_feature(subj_img)).ravel()]
 
     res["embed"] = [round(float(v), 5) for v in emb_full]
-    if subj_img is not None:
+    # read only where there is no CCIP (the identity check of photographs): not computed and stored for illustrations
+    if subj_img is not None and "ccip" not in res:
         res["subject_embed"] = [round(float(v), 5) for v in M.embed_images([subj_img])[0]]
     if label == "photo":
         res["zs"] = zero_shot(emb_full)
@@ -396,8 +409,13 @@ def make_mask(path, mode, domain, out, crop=None):
             "size": [w, h]}
 
 
-def ccip_diff(feats, refs):
+def ccip_diff(feats, refs=None):
+    """Differences of each feature to each reference; without refs, of all features to each other (computed once,
+    not as a part of the matrix of both lists)."""
     from imgutils.metrics import ccip_batch_differences
+    if not refs:
+        d = ccip_batch_differences([np.asarray(f, dtype=np.float32) for f in feats])
+        return [[float(v) for v in row] for row in d]
     allf = [np.asarray(f, dtype=np.float32) for f in refs + feats]
     d = ccip_batch_differences(allf)
     nref = len(refs)
@@ -435,7 +453,7 @@ def main():
                              if any(im is not None for im in imgs) else [])
                 emit({"rid": rid, "ok": True, "texts": [None if im is None else next(texts, None) for im in imgs]})
             elif op == "ccip_diff":
-                emit({"rid": rid, "ok": True, "matrix": ccip_diff(req["feats"], req["refs"])})
+                emit({"rid": rid, "ok": True, "matrix": ccip_diff(req["feats"], req.get("refs"))})
             elif op == "embed_images":
                 imgs = [load_image(p) for p in req["paths"]]
                 emit({"rid": rid, "ok": True, "embeds": M.embed_images(imgs).round(5).tolist()})

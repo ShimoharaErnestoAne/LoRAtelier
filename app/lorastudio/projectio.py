@@ -32,16 +32,27 @@ APP_LOGS = ("analysis_worker.log", "comfyui.log", "i2t_worker.log", "prefetch_qw
 
 # ====================================================================== deletion
 def _trash_dir(path: Path) -> Path:
-    """data/trash, or a .trash folder next to the path when it is on another drive (a folder cannot be moved
-    across drives in one step; copying a whole project there would take long and need the space twice)."""
+    """data/trash, or on another drive the .trash folder of the place the path is in (a folder cannot be moved
+    across drives in one step; copying a whole project there would take long and need the space twice).
+    For a folder inside a project (a run) too: a .trash inside the project would never be emptied at start-up,
+    and would go into the project's zip and move with it."""
     from .linking import same_drive
-    return TRASH_DIR if same_drive(path, TRASH_DIR) else path.parent / ".trash"
+    if same_drive(path, TRASH_DIR):
+        return TRASH_DIR
+    for place in config.storage_dirs("projects"):
+        if _inside(path, place):
+            return place / ".trash"
+    return path.parent / ".trash"
 
 
 def _to_trash(path: Path) -> Path:
     trash = _trash_dir(path)
     trash.mkdir(parents=True, exist_ok=True)
-    dest = trash / f"{path.name}_{time.strftime('%Y%m%d-%H%M%S')}"
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    dest, n = trash / f"{path.name}_{stamp}", 2
+    while dest.exists():   # two runs of the same number (of two projects) removed in the same second
+        dest = trash / f"{path.name}_{stamp}_{n}"
+        n += 1
     last = None
     for _ in range(10):   # a thumbnail being sent or a virus scan can hold a file for a moment
         try:
@@ -59,7 +70,14 @@ def _remove_later(path: Path):
 
 def empty_trash():
     """Remove what an earlier deletion could not (called at start-up, in the background)."""
-    for trash in [TRASH_DIR, *(r / ".trash" for r in config.storage_dirs("projects"))]:
+    places = config.storage_dirs("projects")
+    trashes = [TRASH_DIR, *(r / ".trash" for r in places)]
+    for r in places:   # runs removed by an older version went to <project>/runs/.trash
+        try:
+            trashes += [d / "runs" / ".trash" for d in r.iterdir() if (d / "runs" / ".trash").is_dir()]
+        except OSError:
+            continue   # e.g. a drive that is not connected
+    for trash in trashes:
         try:
             items = list(trash.iterdir()) if trash.is_dir() else []
         except OSError:
@@ -141,13 +159,23 @@ def training_leftovers(project: Project, skip_runs=()) -> dict:
         files += traincache.run_files(run_dir)
     if not skip_runs:   # the shared store: a run in use may still be copying from it
         files += traincache.store_files(project.path)
-    size = 0
+    size, seen = 0, set()
     for f in files:
         try:
-            size += f.stat().st_size
+            size += _once(f.stat(), seen)
         except OSError:
             pass
     return {"checkpoints": ckpts, "files": files, "bytes": size}
+
+
+def _once(st, seen: set) -> int:
+    """The file's size, 0 when the same file was counted already under another name: ComfyUI's copy of a saved LoRA
+    is a hard link to it where the drive allows, and both names go at the same time."""
+    key = (st.st_dev, st.st_ino)
+    if st.st_ino and key in seen:
+        return 0
+    seen.add(key)
+    return st.st_size
 
 
 def discard_training_leftovers(project: Project, skip_runs=()) -> int:
@@ -155,12 +183,12 @@ def discard_training_leftovers(project: Project, skip_runs=()) -> int:
     listed and can be removed again later).  Returns the bytes freed."""
     lo = training_leftovers(project, skip_runs)
     paths = {r["id"]: Path(r["path"]) for r in project.q("SELECT id, path FROM checkpoints")}
-    freed = 0
+    freed, seen = 0, set()
     for f in lo["files"]:
         try:
-            n = f.stat().st_size
+            st = f.stat()
             f.unlink()
-            freed += n
+            freed += _once(st, seen)
         except OSError:
             pass
     gone = []
@@ -304,7 +332,9 @@ def _db_snapshot(project: Project, include_runs: bool) -> Path:
 def _export_files(project: Project, include_runs: bool):
     skip_top = {"project.db", "project.db-wal", "project.db-shm", "incoming"}
     if not include_runs:
-        skip_top |= {"runs", "exports"}
+        # traincache: latents and text-encoder outputs kept between runs.  They are made again when missing, and
+        # are found only by the model files' paths on this PC, so a zip without the training results leaves them out
+        skip_top |= {"runs", "exports", "traincache"}
     for root, dirs, files in os.walk(project.path):
         rel_root = Path(root).relative_to(project.path)
         if rel_root == Path("."):
