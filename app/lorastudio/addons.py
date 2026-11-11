@@ -19,6 +19,8 @@ import urllib.request
 from pathlib import Path
 
 from . import config
+from .enginefetch import MARK as BUNDLE_MARK   # in a copy made without git: the commit the files are from
+from .enginefetch import fetch_archive, forget_mark, head_commit
 from .events import bus
 from .models import CATALOG, catalog_entry, registry
 from .remote import NoAuthOffHost
@@ -59,12 +61,9 @@ def _engine_ready(name: str) -> bool:
     if not e:
         return False
     d = engine_dir(name)
-    if not (d / ".git").exists():   # copied from the zip's bundled copy (ensure_ppm): the commit it was taken at
-        try:
-            return (d / BUNDLE_MARK).read_text(encoding="utf-8").strip() == e["commit"]
-        except OSError:
-            return False
-    return _git(d, "rev-parse", "HEAD").strip() == e["commit"] and         (not e.get("patch") or _patch(e).applied(d))
+    # read from the folder, never by starting git: LoRAtelier is used on PCs without git, and this is asked on every
+    # ComfyUI start and every redraw of the model list
+    return head_commit(d) == e["commit"] and (not e.get("patch") or _patch(e).applied(d))
 
 
 def _patch(e: dict):
@@ -77,28 +76,12 @@ def _patch(e: dict):
 
 
 def _use_local_git() -> None:
-    """The portable git setup_env.py fetches when the PC has none (tools/git) goes on PATH.  At import and before
-    every git call, not only when an engine is installed: after a restart the engines fetched with git are
-    asked for their commit, and without git on PATH that failed (ComfyUI could not start, /api/library failed)."""
+    """The portable git an older setup fetched into tools/git goes on PATH (git is used only to update a folder
+    that git made, see _fetch_engine; nothing needs it)."""
     local = config.ROOT / "tools" / "git" / "cmd"
     path = os.environ.get("PATH", "")
     if (local / "git.exe").exists() and str(local) not in path.split(os.pathsep):
         os.environ["PATH"] = str(local) + (os.pathsep + path if path else "")
-
-
-_use_local_git()
-
-
-def _git(d: Path, *args) -> str:
-    """git's output, or "" when git cannot be run (the caller then sees "not the pinned commit")."""
-    _use_local_git()
-    # safe.directory: git refuses folders it thinks belong to another user (exFAT drives, copied folders)
-    try:
-        r = subprocess.run(["git", "-c", f"safe.directory={d.as_posix()}", "-C", str(d), *args], capture_output=True,
-                           text=True, encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    return r.stdout or ""
 
 
 def _run(argv: list[str], cwd: Path | None = None):
@@ -109,27 +92,38 @@ def _run(argv: list[str], cwd: Path | None = None):
     return r.stdout
 
 
+def _fetch_engine(e: dict, d: Path) -> None:
+    """The engine's files at its pinned commit into d.  From GitHub's zip, which needs no git.  Only a folder that
+    git made earlier is updated with git, when git runs (it also removes the files the new version dropped); when
+    that does not work, the zip is written over the folder."""
+    _use_local_git()
+    if (d / ".git").is_dir() and shutil.which("git"):
+        # safe.directory: git refuses folders it thinks belong to another user (exFAT drives, copied folders)
+        git = ["git", "-c", f"safe.directory={d.as_posix()}", "-C", str(d)]
+        try:
+            if e.get("fetch"):   # e.g. a pull request head that is not on any branch
+                _run([*git, "fetch", "origin", e["fetch"]])
+            else:
+                _run([*git, "fetch", "--depth", "200", "origin"])
+                if subprocess.run([*git, "cat-file", "-e", e["commit"] + "^{commit}"], capture_output=True).returncode:
+                    _run([*git, "fetch", "origin", e["commit"]])
+            _run([*git, "checkout", "--force", e["commit"]])
+            forget_mark(d)
+            if head_commit(d) == e["commit"]:
+                return
+        except (RuntimeError, OSError) as ex:   # git is there but does not work (blocked, a broken checkout)
+            print(f"LoRAtelier: {d.name} を git で更新できなかったため、zip で取得します（{ex}）", flush=True)
+    fetch_archive(e["url"], e["commit"], d)
+
+
 def install_engine(name: str) -> None:
-    """Clone an optional engine at its pinned commit and install its pinned pip packages into the env
-    it belongs to.  Idempotent."""
+    """Fetch an optional engine at its pinned commit and install its pinned pip packages into the env
+    it belongs to.  Idempotent.  Works on a PC without git."""
     _ready.pop(name, None)
     e = _lockfile()["engines"][name]
     d = engine_dir(name)
-    _use_local_git()
-    if not shutil.which("git"):
-        raise RuntimeError("git が見つかりません。setup.bat をもう一度実行すると、このフォルダーの中に git を用意します。")
-    if not (d / ".git").exists():
-        d.parent.mkdir(parents=True, exist_ok=True)
-        _run(["git", "clone", e["url"], str(d)])
-    git = ["git", "-c", f"safe.directory={d.as_posix()}", "-C", str(d)]
-    if _git(d, "rev-parse", "HEAD").strip() != e["commit"]:
-        if e.get("fetch"):   # e.g. a pull request head that is not on any branch
-            _run([*git, "fetch", "origin", e["fetch"]])
-        else:
-            _run([*git, "fetch", "--depth", "200", "origin"])
-            if subprocess.run([*git, "cat-file", "-e", e["commit"] + "^{commit}"], capture_output=True).returncode:
-                _run([*git, "fetch", "origin", e["commit"]])
-        _run([*git, "checkout", "--force", e["commit"]])
+    if head_commit(d) != e["commit"]:
+        _fetch_engine(e, d)
     if e.get("patch"):
         _patch(e).apply(d)
     if e.get("pip"):
@@ -145,7 +139,6 @@ def install_engine(name: str) -> None:
 PPM = "ComfyUI-ppm"
 MOSS_EDIT = "ComfyUI-Moss-Image-Edit-Native"   # MOSS-Image edit LoRAs (instruction editing from a source image)
 RGTHREE = "rgthree-comfy"   # rgthree's nodes in workflows read from images (SDXL Empty Latent Image ...)
-BUNDLE_MARK = ".lorastudio_commit"   # in a copy made without git: the commit the files are from
 _tried: set[str] = set()
 
 
@@ -166,7 +159,8 @@ def ensure_ppm() -> bool:
 def ensure_node(name: str) -> bool:
     """A custom node pack (ComfyUI-ppm: NegPip, Attention Couple, ...; ComfyUI-Moss-Image-Edit-Native) is put in
     place the first time ComfyUI starts: copied from the zip's bundled copy when it is the pinned commit, else
-    fetched with git (small, no pip packages).  Tried once per run: when neither works, generation goes on without it."""
+    fetched from GitHub as a zip (small, no pip packages; no git needed).  Tried once per run: when neither works,
+    generation goes on without it."""
     if engine_ready(name):
         return True
     if name not in _tried:
@@ -174,7 +168,7 @@ def ensure_node(name: str) -> bool:
         e, d, src = _lockfile()["engines"][name], engine_dir(name), bundled_dir(name)
         try:
             mark = src / BUNDLE_MARK
-            bundled = mark.read_text(encoding="utf-8").strip() if mark.is_file() else None   # no bundled copy: git
+            bundled = mark.read_text(encoding="utf-8").strip() if mark.is_file() else None   # no bundled copy: fetched
             if not (d / ".git").exists() and bundled == e["commit"]:
                 # copied under another name first: a copy cut off halfway (the app closed) must not be left in
                 # place looking ready (its BUNDLE_MARK may already be there).  ".disabled": ComfyUI skips such

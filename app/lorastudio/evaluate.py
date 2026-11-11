@@ -527,6 +527,16 @@ def attention_installed() -> dict[str, bool]:
     return {k: (site / pkg).is_dir() for k, pkg in ATTENTION_PACKAGES.items()}
 
 
+def start_program(what: str, argv: list, run: bool = False, **kw):
+    """subprocess.Popen (run=True: subprocess.run).  When the program is not there, Windows says only
+    "[WinError 2] 指定されたファイルが見つかりません。", without the file: say what could not be started and where
+    it was looked for (seen on another PC as the whole reason a comparison failed)."""
+    try:
+        return (subprocess.run if run else subprocess.Popen)(argv, **kw)
+    except FileNotFoundError:
+        raise RuntimeError(f"{what}を起動できません。{argv[0]} が見つかりません。setup.bat をもう一度実行してください。") from None
+
+
 class Comfy:
     def __init__(self):
         self.proc: subprocess.Popen | None = None
@@ -629,7 +639,7 @@ class Comfy:
             extra = self._write_extra_paths()
             from .addons import MOSS_EDIT, PPM, RGTHREE, ensure_node
             for name in (PPM, MOSS_EDIT, RGTHREE):
-                ensure_node(name)   # put in place on the first start (bundled copy, else a small git clone); without it, generation goes on as before
+                ensure_node(name)   # put in place on the first start (bundled copy, else a small zip from GitHub); without it, generation goes on as before
             self.started_nodes = self._custom_nodes()
             self.started_extra = {k: set(v) for k, v in self.extra_dirs.items()}
             self.started_attention = self.attention
@@ -645,7 +655,8 @@ class Comfy:
             # not --disable-product-tips, which an older ComfyUI would refuse to start with)
             env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", COMFYUI_DISABLE_PRODUCT_TIPS="1")
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-            self.proc = subprocess.Popen(
+            self.proc = start_program(
+                "ComfyUI ",
                 [str(config.COMFY_PYTHON), "main.py", "--listen", config.HOST, "--port", str(config.COMFY_PORT),
                  "--disable-auto-launch", "--extra-model-paths-config", str(extra), "--output-directory", str(out_dir),
                  "--input-directory", str(COMFY_INPUT),
@@ -1250,23 +1261,24 @@ def _convert_lock(final: Path) -> threading.Lock:
 
 COMFY_INPUT = config.DATA_DIR / "comfy_input"   # images a graph loads (LoadImage): the image page's source images
 CONVERTED_FAMILIES = ("anima", "zimage", "qwen_image21")   # their LoRA is rewritten for ComfyUI (the others are copied)
+CONVERTER = "LoRA を ComfyUI 用に変換するプログラム"
 
 
 def _convert_lora(family: str, src: Path, dest: Path) -> Path:
     from .training import engine_env
     if family == "anima":
-        r = subprocess.run([str(config.TRAIN_PYTHON), "networks/convert_anima_lora_to_comfy.py", str(src), str(dest)],
-                           cwd=str(config.SD_SCRIPTS_DIR), env=engine_env("sd-scripts"), capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = start_program(CONVERTER, [str(config.TRAIN_PYTHON), "networks/convert_anima_lora_to_comfy.py", str(src), str(dest)],
+                          run=True, cwd=str(config.SD_SCRIPTS_DIR), env=engine_env("sd-scripts"), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode != 0 or not dest.exists():
             raise RuntimeError("Anima LoRA の ComfyUI 形式への変換に失敗しました: " + (r.stderr or r.stdout)[-400:])
         return dest
     if family == "zimage":
         # musubi-tuner docs/zimage.md: the Diffusers layout ("--target other") is what ComfyUI loads
-        r = subprocess.run([str(config.TRAIN_PYTHON), "convert_lora.py", "--input", str(src), "--output", str(dest),
-                            "--target", "other"],
-                           cwd=str(config.MUSUBI_DIR), env=engine_env("musubi-tuner"), capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = start_program(CONVERTER, [str(config.TRAIN_PYTHON), "convert_lora.py", "--input", str(src), "--output", str(dest),
+                                      "--target", "other"],
+                          run=True, cwd=str(config.MUSUBI_DIR), env=engine_env("musubi-tuner"), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode != 0 or not dest.exists():
             raise RuntimeError("Z-Image LoRA の ComfyUI 形式への変換に失敗しました: " + (r.stderr or r.stdout)[-400:])
         return dest
@@ -1276,10 +1288,10 @@ def _convert_lora(family: str, src: Path, dest: Path) -> Path:
         from .models import FAMILY_ENGINE
         from .training import engine_cwd
         eng = FAMILY_ENGINE[family]
-        r = subprocess.run([str(config.TRAIN_PYTHON), "convert_lora.py", "--input", str(src), "--output", str(dest),
-                            "--target", "other", "--diffusers_prefix", "transformer"],
-                           cwd=str(engine_cwd(eng)), env=engine_env(eng), capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = start_program(CONVERTER, [str(config.TRAIN_PYTHON), "convert_lora.py", "--input", str(src), "--output", str(dest),
+                                      "--target", "other", "--diffusers_prefix", "transformer"],
+                          run=True, cwd=str(engine_cwd(eng)), env=engine_env(eng), capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode != 0 or not dest.exists():
             raise RuntimeError("Qwen-Image-2.1 LoRA の ComfyUI 形式への変換に失敗しました: " + (r.stderr or r.stdout)[-400:])
         return dest

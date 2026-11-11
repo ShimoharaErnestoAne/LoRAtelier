@@ -38,7 +38,7 @@
     "rgthree-comfy": {
       "url": "https://github.com/rgthree/rgthree-comfy.git",
       "commit": "bc48c6aaeca87bedbc14245d89f9bc6be37a630e",
-      "license": "MIT (ComfyUI custom node in its own process; fetched with git, not bundled)",
+      "license": "MIT (ComfyUI custom node in its own process; fetched from GitHub as a zip, not bundled)",
       "optional": true,
       "path": "engines/ComfyUI/custom_nodes/rgthree-comfy",
       "env": "comfy",

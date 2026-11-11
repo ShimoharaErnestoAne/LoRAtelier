@@ -1,6 +1,6 @@
 """One-time environment setup (run by setup.bat).  Idempotent: re-running only does what is
 missing.  Dependencies are installed from the lock files recorded after verification, and
-engines are checked out at the pinned commits - never "latest on every start".
+engines are fetched at the pinned commits (zips from GitHub: no git needed) - never "latest on every start".
 
   envs/app    : UI server (no torch)
   envs/train  : sd-scripts + musubi-tuner + analysis worker (torch cu128)
@@ -19,9 +19,6 @@ import shutil
 import subprocess
 import sys
 import sysconfig
-import tempfile
-import urllib.request
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -53,38 +50,22 @@ def ensure_uv():
     UV = str(user) if user.exists() else shutil.which("uv") or str(Path(sys.executable).parent / "Scripts" / "uv.exe")
 
 
-# portable git (MinGit) fetched into tools/git when the PC has no git; the app puts it on PATH too (addons.py)
-MINGIT_URL = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip"
-MINGIT_SHA256 = "50b04b55425b5c465d076cdb184f63a0cd0f86f6ec8bb4d5860114a713d2c29a"
+# git is not needed (LoRAtelier is downloaded as a zip by people without git): the engines come from GitHub as
+# zips of their pinned commits.  git is used only to update an engine folder that git made (an install by an older
+# version), when a git is there: the PC's own, or the one an older setup put in tools/git.
 GIT_DIR = ROOT / "tools" / "git"
+sys.path.insert(0, str(ROOT / "app"))
+from lorastudio.enginefetch import fetch_archive, forget_mark, head_commit  # noqa: E402  (standard library only)
 
 
-def use_local_git():
+def have_git():
     exe = GIT_DIR / "cmd" / "git.exe"
     if exe.exists() and str(exe.parent) not in os.environ["PATH"].split(os.pathsep):
         os.environ["PATH"] = str(exe.parent) + os.pathsep + os.environ["PATH"]
-
-
-def ensure_git():
-    use_local_git()
-    if shutil.which("git"):
-        return
-    print("git が PC に入っていないため、このフォルダーの中に専用の git（約 45 MB）を用意します。", flush=True)
-    tmp = GIT_DIR.with_name("git.partial")
-    shutil.rmtree(tmp, ignore_errors=True)
-    shutil.rmtree(GIT_DIR, ignore_errors=True)   # a tools/git whose git.exe does not run
-    with tempfile.TemporaryDirectory() as td:
-        z = Path(td) / "mingit.zip"
-        urllib.request.urlretrieve(MINGIT_URL, z)
-        if hashlib.sha256(z.read_bytes()).hexdigest() != MINGIT_SHA256:
-            sys.exit("ダウンロードした git の内容が想定と違います（通信の途中で壊れた可能性があります）。"
-                     "もう一度 setup.bat を実行してください。")
-        with zipfile.ZipFile(z) as f:
-            f.extractall(tmp)
-    tmp.rename(GIT_DIR)   # only a fully extracted git becomes tools/git
-    use_local_git()
-    if not shutil.which("git") or subprocess.run(["git", "--version"], capture_output=True).returncode:
-        sys.exit("用意した git を起動できませんでした。ウイルス対策ソフトが tools\\git をブロックしていないか確認してください。")
+    try:
+        return bool(shutil.which("git")) and subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 def git(d, *args):
@@ -95,14 +76,21 @@ def git(d, *args):
 def ensure_engine(name):
     e = LOCK["engines"][name]
     d = ROOT / "engines" / name
-    if not (d / ".git").exists():
-        run(["git", "clone", e["url"], str(d)])
-    cur = subprocess.run(git(d, "rev-parse", "HEAD"), capture_output=True, text=True).stdout.strip()
-    if cur != e["commit"]:
-        run(git(d, "fetch", "--depth", "200", "origin"))
-        if subprocess.run(git(d, "cat-file", "-e", e["commit"] + "^{commit}"), capture_output=True).returncode:
-            run(git(d, "fetch", "origin", e["commit"]))
-        run(git(d, "checkout", e["commit"]))
+    if head_commit(d) == e["commit"]:   # read from the folder (no git started)
+        return
+    if (d / ".git").is_dir() and have_git():
+        try:
+            run(git(d, "fetch", "--depth", "200", "origin"))
+            if subprocess.run(git(d, "cat-file", "-e", e["commit"] + "^{commit}"), capture_output=True).returncode:
+                run(git(d, "fetch", "origin", e["commit"]))
+            run(git(d, "checkout", e["commit"]))
+            forget_mark(d)
+            if head_commit(d) == e["commit"]:
+                return
+        except (subprocess.CalledProcessError, OSError):
+            pass
+        print(f"engines\\{name} を git で更新できなかったため、zip で取得します。", flush=True)
+    fetch_archive(e["url"], e["commit"], d)
 
 
 def venv(name):
@@ -209,7 +197,6 @@ def main():
     MARKER.unlink(missing_ok=True)
     for d in ("checkpoints", "loras", "diffusion_models", "text_encoders", "vae"):
         (ROOT / "models" / d).mkdir(parents=True, exist_ok=True)   # also done by setup.bat; kept for direct runs
-    ensure_git()
     ensure_uv()
     for name, e in LOCK["engines"].items():
         if not e.get("optional"):   # optional engines are fetched when the model that needs them is added
@@ -240,6 +227,8 @@ if __name__ == "__main__":
         sys.exit(f"\nセットアップの途中で失敗しました（{Path(str(e.cmd[0])).name} が終了コード {e.returncode}）。上の表示を確認してください。\n"
                  "よくある原因: インターネットに接続できない（プロキシを含む）、ディスクの空き不足、"
                  "ファイルが使用中（LoRAtelier やウイルス対策ソフト）。直してから setup.bat をもう一度実行すると、続きから進みます。")
+    except RuntimeError as e:   # an engine could not be fetched (the message says which and why)
+        sys.exit(f"\nセットアップの途中で失敗しました: {e}\n直してから setup.bat をもう一度実行すると、続きから進みます。")
     except OSError as e:
         sys.exit(f"\nセットアップの途中で失敗しました: {e}\n"
                  "ディスクの空きや、ファイルが使用中でないか（LoRAtelier やウイルス対策ソフト）を確認して、setup.bat をもう一度実行してください。")

@@ -58,21 +58,11 @@ def engine_env(engine: str) -> dict:
 
 
 def engine_commit(engine: str) -> str:
-    d = engine_cwd(engine)
-    head = d / ".git" / "HEAD"
-    try:
-        ref = head.read_text().strip()
-        if ref.startswith("ref:"):
-            p = d / ".git" / ref.split(" ", 1)[1]
-            if p.exists():
-                return p.read_text().strip()[:12]
-            packed = (d / ".git" / "packed-refs").read_text()
-            for line in packed.splitlines():
-                if line.endswith(ref.split(" ", 1)[1]):
-                    return line.split()[0][:12]
-        return ref[:12]
-    except OSError:
-        return "unknown"
+    """The engine's commit as recorded with a run (and in the key of the training cache).  Read from the folder:
+    an engine fetched as a zip has no .git (it said "unknown" for every version, so a cache made by an older
+    engine would have been taken for the new one's)."""
+    from .enginefetch import head_commit
+    return head_commit(engine_cwd(engine))[:12] or "unknown"
 
 
 # ======================================================================== preflight

@@ -60,27 +60,27 @@ class _Body(io.BytesIO):
         return False
 
 
-# ------------------------------------------------------------------ git from tools/ after a restart
-def test_bundled_git_is_on_path_before_any_git_call_and_a_missing_git_is_not_an_error(env, monkeypatch):
+# ------------------------------------------------------------------ an engine git fetched, on a PC without git
+def test_an_engine_git_fetched_is_asked_for_its_commit_without_starting_git(env, monkeypatch):
     from lorastudio import addons, config
     monkeypatch.setattr(config, "ROOT", env / "app root")
-    local = env / "app root" / "tools" / "git" / "cmd"
-    local.mkdir(parents=True)
-    (local / "git.exe").write_bytes(b"")
     monkeypatch.setenv("PATH", r"C:\somewhere")
-    ran = []
 
     def run(argv, **kw):
-        ran.append(os.environ["PATH"].split(os.pathsep)[0])
         raise FileNotFoundError("git")
     monkeypatch.setattr(addons.subprocess, "run", run)
     eng = env / "app root" / "engines" / "node"
     (eng / ".git").mkdir(parents=True)
-    monkeypatch.setattr(addons, "_lockfile", lambda: {"engines": {"node": {"commit": "abc", "path": "engines/node"}}})
-    # asked for its commit right after a start (nothing was installed in this run): git is looked for in tools/,
-    # and a PC without any git answers "not ready" instead of failing the request
+    (eng / ".git" / "HEAD").write_text("abc\n", encoding="utf-8")
+    lock = {"engines": {"node": {"commit": "abc", "path": "engines/node"}}}
+    monkeypatch.setattr(addons, "_lockfile", lambda: lock)
+    monkeypatch.setattr(addons, "_ready", {})
+    # asked right after a start (nothing was installed in this run): read from the folder, so the engine is ready
+    # on a PC without git too (it used to fail the request, then to answer "not ready")
+    assert addons.engine_ready("node") is True
+    lock["engines"]["node"]["commit"] = "newer"
+    addons._ready.clear()
     assert addons.engine_ready("node") is False
-    assert ran == [str(local)]
 
 
 def test_a_bundled_node_cut_off_while_copying_does_not_look_ready(env, monkeypatch):

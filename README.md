@@ -39,7 +39,7 @@ LoRAtelier は、キャラクター LoRA とスタイル LoRA を自分の PC �
 
 | やりたいこと | 使うファイル |
 |---|---|
-| 最初に一度だけ、使うための準備をする（数 GB をダウンロードします。Python が入っていない PC では、このフォルダーの中に専用の Python を用意します） | `setup.bat` |
+| 最初に一度だけ、使うための準備をする（数 GB をダウンロードします。Python や git を入れておく必要はありません。専用の Python をこのフォルダーの中に用意し、git は使いません） | `setup.bat` |
 | 起動する（ブラウザーが開きます） | `start.bat` |
 | 同じネットワークにある他の PC からも使えるように起動する | `start_intranet.bat` |
 
@@ -144,7 +144,7 @@ The user interface (screens and help) is in Japanese.
 
 | What to do | File |
 |---|---|
-| First time only: prepare the environment (downloads several GB; on a PC without Python, a private Python is set up inside this folder) | `setup.bat` |
+| First time only: prepare the environment (downloads several GB; Python and git do not need to be installed: a private Python is set up inside this folder, and git is not used) | `setup.bat` |
 | Start (a browser opens) | `start.bat` |
 | Start so that other PCs on the same network can use it too | `start_intranet.bat` |
 
