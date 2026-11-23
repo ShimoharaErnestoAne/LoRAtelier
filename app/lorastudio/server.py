@@ -26,10 +26,10 @@ from .evaluate import EXTRA_MODELS_KEY, MAX_EXTRA_MODELS, _extra_spec, comfy, de
 from .export import export as do_export
 from .gpu import gpu, query_gpus
 from . import addons, i2tlink, imagegen, linking, loraconf, moss_catalog, multichar, pipeline, projectio, promptedit, relocate, remote, traincache
-from .models import FAMILY_FILES, FAMILY_LABEL, VARIANTS, catalog_entry, detect, hasher, library, registry
-from .store import ProjectManager, ProjectMoving, default_trigger
+from .models import FAMILY_FILES, FAMILY_LABEL, VARIANTS, catalog_entry, detect, hasher, library, registry, trainable
+from .store import ProjectManager, ProjectMoving
 from .training import (ACTIVE, QUEUE_FILE, STATUS_LABEL, Job, Runner, create_run, model_train_errors, preflight, resume_block_reason,
-                       state_is_complete)
+                       run_out_dir, state_is_complete)
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 
@@ -148,7 +148,7 @@ def _after_train(project, run_id):
         msg = f"学習は完了しました。比較画像の生成に失敗: {e}"
     # what was measured while it trained stays with the run: the loss curve of the history, and the mark that VRAM
     # ran short (the next start warns that the same settings will be slow again)
-    kept = {k: v for k, v in (run.get("progress") or {}).items() if k in ("loss", "loss_hist", "speed", "vram_short")}
+    kept = {k: v for k, v in (run.get("progress") or {}).items() if k in ("loss", "loss_hist", "speed", "vram_short", "states_removed")}
     runner._set(project, run_id, status="done", ended=time.time(),
                 progress={**kept, "phase": "done", "message": msg, "step": run["config"]["values"]["max_train_steps"],
                           "total": run["config"]["values"]["max_train_steps"]})
@@ -165,7 +165,7 @@ def status():
         "gpus": gpus_cached(), "worker": worker.status, "worker_available": worker.available(),
         "comfy_available": comfy.available(), "train_env": config.TRAIN_PYTHON.exists(),
         "analysis_queue": analyzer.queue_size(), "gpu_owner": gpu.owner,
-        "job": {"project": cur.project.id, "run": cur.run_id, "progress": cur.progress,
+        "job": {"project": cur.project.id, "run": cur.run_id, "progress": _copy(cur.progress),
                 "kind": (cv := _current_view(cur))["kind"], "message": cv["message"]} if cur else None,
         "queue_paused": runner.paused,
         "blur_images": config.settings().get("blur_images", False), "keep_train_cache": traincache.keep(),
@@ -173,10 +173,21 @@ def status():
         "first_run_done": bool(config.settings().get("models")),   # no file checks: asked every 4 s
         "downloads": sum(1 for d in _downloads_view() if d["state"] == "running"),
         "boot": BOOT, "can_restart": LAUNCH is not None,
+        # settings.json was unreadable at this start: {broken, restored, backup} (config.Settings), shown once by the page
+        "settings_recovered": config.settings().recovered,
     }
 
 
 LAUNCH: dict | None = None   # how this server was started (set by __main__; None in tests): 設定 → 再起動 needs it
+
+
+_folder_imports = {"n": 0}   # folder imports copying files now (asked about before a restart)
+
+
+def _copy(progress):
+    """A running job's progress as the answer carries it: the runner thread adds keys to the live dict, and a dict
+    that grows while it is being written out as JSON fails the request."""
+    return dict(progress) if isinstance(progress, dict) else progress
 
 
 def _restart_losses() -> list[str]:
@@ -197,6 +208,13 @@ def _restart_losses() -> list[str]:
         out.append(f"ダウンロード中の {dl} 件が止まります")
     if analyzer.queue_size():
         out.append("素材の解析が止まります（再起動後に続きから解析します）")
+    if relocate.status().get("running"):
+        out.append("データの置き場所の移動が途中で止まります（移し終えていない分は元の場所に残ります）")
+    job = i2tlink.client.job
+    if job:
+        out.append("「画像からプロンプト」の処理が止まります")
+    if _folder_imports["n"]:
+        out.append("フォルダーからの画像の取り込みが途中で止まります（取り込み終えた画像は残ります）")
     return out
 
 
@@ -337,7 +355,7 @@ def get_library():
         lo["conf"] = loraconf.get(lo["path"])
     comp = library.companion_files()
     # whether each text encoder / VAE file fits each model family (read from the file; True / False / None unknown)
-    fits = {kind: {p: {fam: library.fits(fam, kind, p) for fam in generate.GEN_FAMILIES} for p in comp[kind]} for kind in ("te", "vae")}
+    fits = {kind: {p: {fam: library.fits(fam, kind, p) for fam in generate.IMAGE_FAMILIES} for p in comp[kind]} for kind in ("te", "vae")}
     models = [m for m in registry.list() if not m["missing"]]
     for m in models:   # what would stop training with it (the same checks as before training starts)
         m["train_errors"] = model_train_errors(m)
@@ -656,10 +674,63 @@ def _run_member_ids(project, run_id) -> set:
         return set()
 
 
+@app.post("/api/projects/import_raw")
+async def import_project_raw(request: Request):
+    """Raw request body = the project zip.  Written once, straight into the projects folder (.importing, the drive the
+    project goes to), not first to the system's temporary folder on C: as a multipart upload is - a zip with training
+    results can be tens of GB, and C: may not have that room when the projects are kept on another drive."""
+    from starlette.concurrency import run_in_threadpool
+    root = projects.root
+    work = root / ".importing"
+    size = int(request.headers.get("content-length") or 0)
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(work).free
+    except OSError as e:
+        raise HTTPException(400, f"取り込めませんでした: プロジェクトの置き場所 {root} に書き込めません（{e}）。")
+    # the zip and the project it unpacks to are on the drive together for a moment
+    if size and size * 2 > free - 1_000_000_000:
+        raise HTTPException(400, f"取り込めませんでした: 空き容量が足りません（zip と取り込んだプロジェクトで約 {size * 2 / 1e9:.1f}GB 必要、"
+                                 f"空き {free / 1e9:.1f}GB）。")
+    tmp = work / f"upload_{uuid.uuid4().hex}.zip"
+    try:
+        try:
+            with open(tmp, "wb") as f:
+                buf, n = [], 0
+                async for chunk in request.stream():
+                    buf.append(chunk)
+                    n += len(chunk)
+                    if n >= 8 << 20:   # written off the event loop: a slow disk must not stop the whole UI
+                        await run_in_threadpool(f.write, b"".join(buf))
+                        buf, n = [], 0
+                if buf:
+                    await run_in_threadpool(f.write, b"".join(buf))
+        except OSError as e:
+            raise HTTPException(400, f"取り込めませんでした（ファイルの書き込みに失敗）: {e}")
+        except Exception as e:   # the page was closed while sending
+            raise HTTPException(400, f"取り込めませんでした: zip を最後まで受け取れませんでした（{e}）。")
+        return await run_in_threadpool(_import_zip_file, tmp)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass   # held by a virus scan for a moment: removed with the other leftovers at the next start
+
+
+def _import_zip_file(path):
+    with open(path, "rb") as f:
+        return _import_zip(f)
+
+
 @app.post("/api/projects/import")
 def import_project(file: UploadFile = File(...)):
+    """The same as import_raw, as a multipart upload (kept for older pages)."""
+    return _import_zip(file.file)
+
+
+def _import_zip(fileobj):
     try:
-        p = projectio.import_zip(projects, file.file)
+        p = projectio.import_zip(projects, fileobj)
     except zipfile.BadZipFile:
         raise HTTPException(400, "取り込めませんでした: zip ファイルとして読めません（壊れているか、途中までしかありません）。")
     except ValueError as e:
@@ -689,6 +760,9 @@ def _resume_analysis(p):
                 analyzer.ensure_caption(p, im["id"], force=True)   # a failed caption gets one more try
             if mask_mode:
                 analyzer.ensure_mask(p, im["id"], mode=mask_mode)   # masks waiting (or missing: not in a zip) are made
+    if rows:
+        # images an older version of the mechanical check read wrongly (16-bit greyscale read as white) are read again
+        analyzer.refresh_outdated(p)
 
 
 def _restore_exports(p) -> dict:
@@ -792,6 +866,8 @@ def update_project(pid: str, body: dict):
     if "concept_words" in upd:
         upd["concept_words"] = captions.clean_concept_words(upd["concept_words"])
     if "trigger" in upd:
+        if not isinstance(upd["trigger"], (str, type(None))):
+            raise HTTPException(400, "呼び出し語は文字で入れてください")
         t = (upd["trigger"] or "").strip()
         if not t:
             raise HTTPException(400, "呼び出し語を入力してください")
@@ -799,13 +875,15 @@ def update_project(pid: str, body: dict):
             raise HTTPException(400, "呼び出し語にカンマは使えません")
         upd["trigger"] = t
     reset = []
+    if upd.get("model_id"):
+        new_m = registry.get(upd["model_id"])
+        if new_m and new_m.get("variant") in VARIANTS and VARIANTS[new_m["variant"]].get("train") is False:
+            # a generation-only model (MiniMax H3-Image): it has no training settings at all
+            raise HTTPException(400, f"{new_m['name']} では LoRA を作れません（画像の生成にだけ使えるモデルです）。ほかのモデルを選んでください。")
     if "model_id" in upd and "train_overrides" not in upd:
-        # another family: its own engine values (learning rate, rank ...) start from that family's defaults
-        old_m, new_m = registry.get(meta.get("model_id") or ""), registry.get(upd["model_id"] or "")
-        ov = meta.get("train_overrides") or {}
-        if old_m and new_m and old_m["family"] != new_m["family"] and presets.FAMILY_KEYS & set(ov):
-            reset = [presets.FIELDS[k][0] for k in ov if k in presets.FAMILY_KEYS and k in presets.FIELDS]
-            upd["train_overrides"] = {k: v for k, v in ov.items() if k not in presets.FAMILY_KEYS}
+        reset, kept = _family_reset(meta, upd["model_id"])
+        if reset:
+            upd["train_overrides"] = kept
     if upd.get("train_overrides") == {}:
         upd["settings_import"] = None   # "すべて初期値に戻す" also clears the note about copied settings
     p.set_meta(**upd)
@@ -818,6 +896,27 @@ def update_project(pid: str, body: dict):
             p.edit(f"呼び出し語を {new} に変更", changes)
     _after_meta(p, meta, upd.keys())
     return {**_project_info(p), "reset_settings": reset}
+
+
+def _family_reset(meta: dict, model_id) -> tuple[list[str], dict]:
+    """Going to a model of another family: the changed settings that belong to the old family's engine (learning
+    rate, rank ...) start from the new family's defaults.  -> (labels of the settings put back, overrides kept)."""
+    old_m, new_m = registry.get(meta.get("model_id") or ""), registry.get(model_id or "")
+    ov = meta.get("train_overrides") or {}
+    if not (old_m and new_m and old_m["family"] != new_m["family"] and presets.FAMILY_KEYS & set(ov)):
+        return [], ov
+    return ([presets.FIELDS[k][0] for k in ov if k in presets.FAMILY_KEYS and k in presets.FIELDS],
+            {k: v for k, v in ov.items() if k not in presets.FAMILY_KEYS})
+
+
+def _follow_gen_model(p, old: dict, model_id: str) -> list[str]:
+    """The training model follows the generation model (it was unset, or the same model as before): the same
+    steps as choosing it by hand - the other family's settings go back to their defaults, captions (tags /
+    sentences) and masks follow the model.  old: the meta before.  -> labels of the settings put back."""
+    reset, kept = _family_reset(old, model_id)
+    p.set_meta(model_id=model_id, **({"train_overrides": kept} if reset else {}))
+    _after_meta(p, old, {"model_id"})
+    return reset
 
 
 def _after_meta(p, before: dict, keys):
@@ -863,8 +962,9 @@ def _ctx(p, imgs, meta):
     ident = {int(k): v for k, v in ((meta.get("identity") or {}).get("map") or {}).items()}
     meta = dict(meta)
     meta["reference_ids"] = meta.get("reference_ids") or meta.get("auto_reference") or []
-    sig = (json.dumps({k: meta.get(k) for k in ("kind", "outfit_mode", "reference_ids", "concept_words", "concept_target")},
-                      sort_keys=True, default=str),
+    # (the training resolution: the size checks compare the images with it)
+    sig = (json.dumps({**{k: meta.get(k) for k in ("kind", "outfit_mode", "reference_ids", "concept_words", "concept_target")},
+                       "train_res": judge.train_resolution(meta)}, sort_keys=True, default=str),
            json.dumps(ident, sort_keys=True, default=str),
            tuple((im["id"], im["sha"], json.dumps(im.get("crop"), default=str), im.get("ai_key"),
                   json.dumps({k: (im.get("fast") or {}).get(k) for k in ("ok", "phash", "sharpness_p90")}, default=str))
@@ -905,7 +1005,34 @@ def list_images(pid: str):
     # MOSS-Image character LoRA: is the character in hide1's catalog (drawn by name without a LoRA)?  Information only
     report["moss_catalog"] = moss_catalog.character_hint(imgs, results, meta, (registry.get(meta.get("model_id") or "") or {}).get("family"))
     return {"images": [_light(im, results[im["id"]]) for im in imgs], "report": report,
-            "history": p.history_state(), "reference_ids": ctx["reference_ids"]}
+            "history": p.history_state(), "reference_ids": ctx["reference_ids"], "similar_groups": _similar_groups(ctx)}
+
+
+def _similar_groups(ctx) -> list[list[int]]:
+    """Images that the checks call the same file (dup_of) or very similar (near), gathered into groups: a picture
+    similar to two others puts all three in one group.  Shown on the material page to keep one of each group by
+    hand; nothing is excluded automatically.  Groups of 2 or more, ids in order, the largest group first."""
+    parent: dict[int, int] = {}
+
+    def find(i):
+        while parent.setdefault(i, i) != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def join(a, b):
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    for a, b in (ctx.get("dup_of") or {}).items():
+        join(a, b)
+    for a, others in (ctx.get("near") or {}).items():
+        for b in others:
+            join(a, b)
+    groups: dict[int, list[int]] = {}
+    for i in parent:
+        groups.setdefault(find(i), []).append(i)
+    return sorted((sorted(g) for g in groups.values() if len(g) > 1), key=lambda g: (-len(g), g[0]))
 
 
 def _ingest(p, src_iter, after_add=None, failed=None):
@@ -989,8 +1116,11 @@ def import_folder(pid: str, body: dict):
             ids = _ingest(p, it(), failed=failed)
         except Exception as e:   # e.g. the project folder itself became unwritable
             ids, failed = [], failed + [str(e)]
+        finally:
+            _folder_imports["n"] -= 1
         bus.publish("import", project=p.id, added=len(ids), failed=failed)
 
+    _folder_imports["n"] += 1
     threading.Thread(target=run, daemon=True).start()
     return {"queued": len(files)}
 
@@ -1115,7 +1245,10 @@ def edit(pid: str, body: dict):
             im = p.image(c["id"])
             if im is None:
                 raise HTTPException(404, "画像が見つかりません")
-            x0, y0, x1, y1 = [int(round(v)) for v in value]
+            try:
+                x0, y0, x1, y1 = [int(round(v)) for v in value]
+            except (TypeError, ValueError):
+                raise HTTPException(400, "切り抜き範囲の指定が正しくありません")
             x0, y0 = max(0, x0), max(0, y0)
             x1, y1 = min(im["width"], x1), min(im["height"], y1)
             if x1 - x0 < 64 or y1 - y0 < 64:
@@ -1132,6 +1265,10 @@ def edit(pid: str, body: dict):
         raise HTTPException(400, str(e))
     for iid in crop_changed:
         analyzer.submit_ai(p, iid, priority=2)
+    if any(field == "decision" for _, field, _ in changes):
+        # the automatic reference images are chosen among the images not excluded: judged again after the change
+        # (a character project only; debounced)
+        analyzer.after_ai(p)
     return {"history_id": hid, "history": p.history_state()}
 
 
@@ -1245,8 +1382,15 @@ def relink(pid: str, body: dict):
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         for im in missing.pop(h.hexdigest(), []):
-            import shutil
-            shutil.copyfile(fp, p.source_path(im))
+            # under another name first: a copy cut short (app closed, disk full) must not stand as the original
+            dest = p.source_path(im)
+            tmp = dest.with_name(dest.name + ".relink")
+            try:
+                shutil.copyfile(fp, tmp)
+                os.replace(tmp, dest)
+            except OSError as e:
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(500, f"原本を書き戻せませんでした（{dest.name}）: {e}。{fixed} 枚は復元済みです。")
             analyzer.submit_fast(p, im["id"])
             fixed += 1
     return {"fixed": fixed, "still_missing": sum(len(v) for v in missing.values())}
@@ -1317,13 +1461,13 @@ def gen_recipe(pid: str, body: dict):
     # the LoRA is trained on the generation model unless the user chose another one: the training
     # model follows the generation model while it is unset or still equal to the previous one
     cur = p.meta("model_id")
-    if recipe.get("gen_model_id") and registry.get(recipe["gen_model_id"]) and (not cur or cur == before) \
-            and recipe["gen_model_id"] != cur:
-        old = p.get_meta()
-        p.set_meta(model_id=recipe["gen_model_id"])
-        _after_meta(p, old, {"model_id"})   # caption style (tags / sentences) and masks follow the model
+    reset = []
+    gm = registry.get(recipe.get("gen_model_id") or "")
+    can_train = bool(gm) and VARIANTS.get(gm.get("variant") or "", {}).get("train", True)   # not a generation-only model
+    if can_train and (not cur or cur == before) and recipe["gen_model_id"] != cur:
+        reset = _follow_gen_model(p, p.get_meta(), recipe["gen_model_id"])
     chk = generate.check_recipe(recipe, p.meta("kind"), p)
-    return {"check": chk["errors"], "notes": chk["notes"], "project": _project_info(p),
+    return {"check": chk["errors"], "notes": chk["notes"], "project": {**_project_info(p), "reset_settings": reset},
             "default_sampling": generate.default_sampling(registry.get(recipe.get("gen_model_id") or ""), _fast(recipe))}
 
 
@@ -1399,7 +1543,10 @@ def gen_start(pid: str, body: dict | None = None):
     errs = generate.check_recipe(recipe, p.meta("kind"), p)["errors"]
     if errs:
         raise HTTPException(400, " / ".join(errs))
-    count = int((body or {}).get("count") or recipe.get("count") or 48)
+    try:
+        count = int((body or {}).get("count") or recipe.get("count") or 48)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "枚数は数値で入れてください")
     if not 1 <= count <= 200:
         raise HTTPException(400, "枚数は 1〜200 枚で指定してください")
     try:
@@ -1789,7 +1936,7 @@ def imagegen_state(limit: int = 30):
             e["progress"] = imagegen.progress(e["id"])
     ds, edit = imagegen.request_sampling(model, form)
     return {"form": form, "history": hist, "history_more": len(full) - len(hist), "default_sampling": ds, "edit": edit,
-            "native": imagegen.native_size(model), "check": chk["errors"], "notes": chk["notes"],
+            "native": imagegen.native_size(model), "size": imagegen.size_limits(model), "check": chk["errors"], "notes": chk["notes"],
             "presets": _presets_view(full), "attention": imagegen.attention_installed(),
             "workflow": _workflow_view(form.get("workflow"))}
 
@@ -1859,17 +2006,19 @@ def imagegen_preset_delete(pid: str):
     return {"deleted": gone, "presets": _presets_view()}
 
 
+_IG_FORM_KEYS = ("model_id", "loras", "positive", "negative", "width", "height", "count", "seed", "sampling", "init_image", "denoise",
+                 "regions", "vae", "te", "attention", "workflow", "workflow_offer")   # what the image generation form keeps
+
+
 @app.put("/api/imagegen/form")
 def imagegen_form(body: dict):
-    keep = ("model_id", "loras", "positive", "negative", "width", "height", "count", "seed", "sampling", "init_image", "denoise", "regions",
-            "vae", "te", "attention", "workflow", "workflow_offer")
-    form = {k: body.get(k) for k in keep if k in body}
+    form = {k: body.get(k) for k in _IG_FORM_KEYS if k in body}
     imagegen.save_form(form)
     model = registry.get(form.get("model_id") or "")
     chk = imagegen.check(form)
     ds, edit = imagegen.request_sampling(model, form)
     return {"check": chk["errors"], "notes": chk["notes"], "default_sampling": ds, "edit": edit,
-            "native": imagegen.native_size(model)}
+            "native": imagegen.native_size(model), "size": imagegen.size_limits(model)}
 
 
 @app.put("/api/ui")
@@ -1981,7 +2130,10 @@ def llm_conf(body: dict):
 
 
 def negative_used(model: dict | None, sampling: dict | None) -> bool:
-    """At CFG 1 (Krea 2, Z-Image Turbo, Qwen-Image-2.1 ...) the sampler never uses the negative prompt."""
+    """At CFG 1 (Krea 2, Z-Image Turbo, Qwen-Image-2.1 ...) the sampler never uses the negative prompt.
+    MiniMax H3-Image has none at any CFG (its graph gives the sampler a zeroed conditioning)."""
+    if (model or {}).get("family") == "h3_image":
+        return False
     cfg = (sampling or {}).get("cfg")
     ds = generate.default_sampling(model, (sampling or {}).get("fast"))
     try:
@@ -2105,11 +2257,11 @@ def _pnginfo_form(data: bytes) -> dict:
     model_file = None
     if info["model_name"]:
         want = _stem(info["model_name"])
-        reg = next((m for m in registry.list() if not m["missing"] and m["family"] in generate.GEN_FAMILIES
+        reg = next((m for m in registry.list() if not m["missing"] and m["family"] in generate.IMAGE_FAMILIES
                     and any(_stem(m["files"].get(k) or "") == want for k in ("gen", "turbo", "ckpt"))), None)
         if reg:
             form["model_id"] = reg["id"]
-        elif c := next((c for c in scan["checkpoints"] if _stem(c["path"]) == want and c["family"] in generate.GEN_FAMILIES), None):
+        elif c := next((c for c in scan["checkpoints"] if _stem(c["path"]) == want and c["family"] in generate.IMAGE_FAMILIES), None):
             model_file = c["path"]   # not set up yet: the page chooses it in the model list, which sets it up
         else:
             notes.append(f"モデル「{info['model_name']}」はこのパソコンのモデルのフォルダーに見つからなかったので、モデルは今のままです。")
@@ -2147,7 +2299,7 @@ def _pnginfo_form(data: bytes) -> dict:
 
 @app.post("/api/imagegen/start")
 def imagegen_start(body: dict):
-    imagegen.save_form({k: v for k, v in body.items()})
+    imagegen.save_form({k: v for k, v in body.items() if k in _IG_FORM_KEYS})   # the form's fields only, as imagegen_form
     try:
         return imagegen.submit(body, runner)
     except ValueError as e:
@@ -2232,11 +2384,19 @@ def imagegen_copy(eid: str, body: dict):
     """Copy a result's settings into a project's material-generation recipe (a new project if none is given).
     The project's own choices (number of images, excluded angles) are kept."""
     try:
-        return imagegen.copy_to_project(projects, eid, body.get("project_id"), body.get("name"))
+        r = imagegen.copy_to_project(projects, eid, body.get("project_id"), body.get("name"))
     except KeyError:
         raise HTTPException(404, "生成結果またはプロジェクトが見つかりません")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    prev = r.pop("previous_model_id", None)
+    if r.pop("model_changed", False):
+        # the training model followed the generation model: as when it is chosen by hand, the other family's
+        # settings go back to their defaults and the captions (tags / sentences) and masks follow the model
+        p = projects.get(r["project_id"])
+        now = p.get_meta()
+        r["reset_settings"] = _follow_gen_model(p, {**now, "model_id": prev}, now["model_id"])
+    return r
 
 
 # ====================================================================== training
@@ -2262,7 +2422,8 @@ def _plan_with(p):
     used, members = multichar.gather(projects, p, _used_images) if multi else (_used_images(p), None)
     if not model:
         return {"model": None, "used": len(used), "preflight": {"errors": ["ベースモデルが未設定です。"], "warnings": [], "info": {}}}, used, members
-    if not model.get("variant"):
+    if not model.get("variant") or not trainable(model["variant"]):
+        # a model whose kind is not known yet, or one no LoRA can be made on (MiniMax H3-Image): the reason, no settings
         return {"model": model, "used": len(used), "preflight": preflight(p, used, {})}, used, members
     d = _defaults(meta, model, len(used))
     ov = meta.get("train_overrides") or {}
@@ -2354,8 +2515,8 @@ def _snapshot(p):
     meta = p.get_meta()
     model = registry.get(meta.get("model_id") or "")
     ov = meta.get("train_overrides") or {}
-    if not model or not model.get("variant") or not ov:
-        return None
+    if not model or not model.get("variant") or not ov or not trainable(model["variant"]):
+        return None   # (a model no LoRA can be made on has no training settings to compare with)
     # the number of images in use only sets the automatic step count: judging every image of every other project
     # (and keeping their analyses in memory) is needed only when the steps were changed
     n = len(_used_images(p)) if presets._STEP_KEYS & set(ov) else 0
@@ -2601,7 +2762,7 @@ def _current_view(j) -> dict:
         controls = [{"action": "stop", "label": "中止", "danger": True}]
     if msg in (None, "", "待機中") and v["kind"] != "train":
         msg = "実行中"
-    return {**v, "progress": j.progress, "message": msg, "fraction": frac, "controls": controls}
+    return {**v, "progress": _copy(j.progress), "message": msg, "fraction": frac, "controls": controls}
 
 
 @app.get("/api/queue")
@@ -2683,10 +2844,29 @@ def _start_run(p, name):
 
 
 
+def _train_blockers(p) -> list[str]:
+    """What stops any training of this project whatever its material: the model (kind, missing files, files the
+    engine cannot train on), no training environment, no GPU.  Asked before a task starts generating."""
+    model = registry.get(p.meta("model_id") or "")
+    if not model:
+        return ["「LoRA を作るモデル」が選ばれていません（登録が解除された可能性があります）。"]
+    out = list(model_train_errors(model))
+    if not config.TRAIN_PYTHON.exists():
+        out.append("学習環境が未導入です。初回セットアップを実行してください。")
+    if not gpus_cached():
+        out.append("NVIDIA GPU が見つかりません。学習は GPU が必要です（CPU 学習へは切り替えません）。")
+    return out
+
+
 def _pipeline_stop_batch(p, bid):
     st = p.q("SELECT status FROM gen_batches WHERE id=?", (bid,))
     if st and st[0]["status"] == "queued":
-        generate.control.flags[(p.id, bid)] = "stop"
+        # as gen_control: taken out of the queue (left in, it takes the GPU when its turn comes only to end at once)
+        if runner.drop_tasks(lambda j: j.project.id == p.id and getattr(j, "label", None) == f"素材生成 #{bid}"):
+            generate.control.flags.pop((p.id, bid), None)
+            generate._set_status(p, bid, "cancelled", "開始前に中止しました")
+        else:
+            generate.control.flags[(p.id, bid)] = "stop"   # its turn has just come: run_batch checks the flag first
     elif st and st[0]["status"] == "running":
         generate.control.request(p.id, bid, "stop")
 
@@ -2700,6 +2880,7 @@ pipeline.hooks.queue_batch = _queue_batch
 pipeline.hooks.stop_batch = _pipeline_stop_batch
 pipeline.hooks.import_batch = _pipeline_import
 pipeline.hooks.start_training = _start_run
+pipeline.hooks.train_blockers = _train_blockers
 pipeline.hooks.stop_run = lambda p, rid: runner.stop(p, rid)
 pipeline.hooks.analysis_busy = lambda: analyzer.queue_size() > 0 or analyzer.current is not None   # also the item in work
 tasks = pipeline.Pipeline(projects)
@@ -2736,13 +2917,18 @@ def task_add(pid: str, body: dict):
         raise HTTPException(400, "枚数は数値で入れてください")
     if not 0 <= n <= PIPE_MAX_GEN:
         raise HTTPException(400, f"生成する枚数は 0〜{PIPE_MAX_GEN} 枚で指定してください")
-    if not registry.get(p.meta("model_id") or ""):
+    model = registry.get(p.meta("model_id") or "")
+    if not model:
         raise HTTPException(400, "先にこのプロジェクトの「LoRA を作るモデル」を選んでください。")
+    # what would stop the training at the end (after the generation and the analysis took the GPU for hours)
+    stops = _train_blockers(p)
+    if stops:
+        raise HTTPException(400, "このままでは学習を始められないため、登録しませんでした: " + " / ".join(stops))
     if n:
         errs = generate.check_recipe(p.meta("gen_recipe") or {}, p.meta("kind"), p)["errors"]
         if errs:
             raise HTTPException(400, "素材の生成の設定が足りません: " + " / ".join(errs))
-    elif not p.images() and (p.meta("enhance") or {}).get("method") != "words":
+    elif not p.q("SELECT 1 FROM images WHERE removed=0 LIMIT 1") and (p.meta("enhance") or {}).get("method") != "words":
         raise HTTPException(400, "素材がありません。素材を入れるか、生成する枚数を指定してください。")
     t = tasks.add(p, n, body.get("name"))
     ahead = len([x for x in tasks.list() if x["status"] in pipeline.ACTIVE + ("waiting",)]) - 1
@@ -2788,7 +2974,7 @@ def runs(pid: str):
         evals = [dict(e) for e in p.q("SELECT id, created, status, error FROM evals WHERE run_id=? ORDER BY id", (r["id"],))]
         out.append({"id": r["id"], "name": r["name"], "created": r["created"], "ended": r["ended"], "status": r["status"],
                     "status_label": STATUS_LABEL.get(r["status"], r["status"]),
-                    "progress": live.progress if live else r["progress"], "error": json.loads(r["error"]) if r["error"] else None,
+                    "progress": _copy(live.progress) if live else r["progress"], "error": json.loads(r["error"]) if r["error"] else None,
                     "values": cfg.get("values"), "changed": cfg.get("changed"), "n_images": len(cfg.get("items", [])),
                     "model": (cfg.get("model") or {}).get("name"), "model_id": (cfg.get("model") or {}).get("id"),
                     "model_family": (cfg.get("model") or {}).get("family"), "engine": cfg.get("engine"),
@@ -2805,7 +2991,11 @@ def _state_complete(path: str) -> bool:
     """training.state_is_complete, remembered while the folder's files stay as they are (the check opens every file
     of the state, and the run list asks for every state of every run on each update)."""
     try:
-        sig = tuple(sorted((f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in os.scandir(path)))
+        if os.path.isfile(path):   # ai-toolkit's state is one file (optimizer.pt), the engines' others a folder
+            st = os.stat(path)
+            sig = ((os.path.basename(path), st.st_size, st.st_mtime_ns),)
+        else:
+            sig = tuple(sorted((f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in os.scandir(path)))
     except OSError:
         _STATE_CHECKS.pop(path, None)
         return False
@@ -2853,6 +3043,8 @@ def run_resume(pid: str, rid: int):
     r = _run_or_404(p, rid)
     if r["status"] in ACTIVE:
         raise HTTPException(400, "実行中です")
+    if r["status"] not in ("cancelled", "failed"):
+        raise HTTPException(400, "中止または失敗した学習だけ、続きから再開できます（完了した学習の LoRA は上書きしません）。")
     st, why = _resume_state(r, p.checkpoints(rid))
     if not st or why:
         raise HTTPException(400, why)
@@ -3238,7 +3430,7 @@ def _recover_project(p, order: dict, reserved: list) -> None:
                 reserved.append((pos if pos is not None else len(order), r["created"], p, r["id"], resume))
                 continue
         if r["status"] in ACTIVE:
-            out_dir = Path(r["run_dir"] or ".") / "output"
+            out_dir = run_out_dir(Path(r["run_dir"] or "."), r["config"] or {})
             if r["run_dir"] and out_dir.is_dir():
                 try:   # saves written after the runner's last 2 s poll; cut-off files are skipped
                     runner._register_checkpoints(Job(p, r["id"]), out_dir, final=True)
@@ -3248,7 +3440,7 @@ def _recover_project(p, order: dict, reserved: list) -> None:
                 # the training itself had finished (the LoRA is written before this status is set): only the
                 # comparison images were cut off.  Not a failed run - and not one to "resume" over its last steps
                 total = (r["config"].get("values") or {}).get("max_train_steps")
-                kept = {k: v for k, v in (r["progress"] or {}).items() if k in ("loss", "loss_hist", "speed", "vram_short")}
+                kept = {k: v for k, v in (r["progress"] or {}).items() if k in ("loss", "loss_hist", "speed", "vram_short", "states_removed")}
                 runner._set(p, r["id"], status="done", ended=time.time(),
                             progress={**kept, "phase": "done", "step": total, "total": total,
                                       "message": "学習は完了しました。比較画像の生成はアプリの終了で中断されました（「比較を追加」でやり直せます）。"})
@@ -3281,6 +3473,9 @@ def resume_pending_on_startup():
 
     stage("画像生成の履歴", imagegen.recover)
     threading.Thread(target=projectio.empty_trash, daemon=True).start()
+    # files a drop was sending when the app went down: never used again (a new drop gets a new name).  At startup
+    # only - a drop being received now has the same kind of name
+    threading.Thread(target=remote.clean_uploads, daemon=True).start()
     try:
         saved = json.loads(QUEUE_FILE.read_text(encoding="utf-8")) if QUEUE_FILE.exists() else []
     except (OSError, ValueError):

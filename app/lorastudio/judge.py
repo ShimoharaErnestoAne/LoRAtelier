@@ -33,6 +33,15 @@ def _c(key, label, status, source, conf, msg, fix=None):
     return {"key": key, "label": label, "status": status, "source": source, "confidence": conf, "message": msg, "fix": fix}
 
 
+DEFAULT_TRAIN_RES = 1024   # presets.defaults: every model family trains at 1024 unless the project changed it
+
+
+def train_resolution(meta: dict) -> int:
+    """The resolution the project trains at: the value set in the detailed settings, else the default."""
+    res = (meta.get("train_overrides") or {}).get("resolution")
+    return int(res) if isinstance(res, (int, float)) and not isinstance(res, bool) and 256 <= res <= 4096 else DEFAULT_TRAIN_RES
+
+
 def build_context(images: list[dict], meta: dict, identity: dict | None = None) -> dict:
     """Dataset-wide context needed for per-image checks (duplicates, similarity, sharpness baseline)."""
     first_by_sha, dup_of = {}, {}
@@ -82,7 +91,7 @@ def build_context(images: list[dict], meta: dict, identity: dict | None = None) 
     sharp = [im["fast"]["sharpness_p90"] for im in images if im.get("fast") and im["fast"].get("ok")]
     return {"kind": meta.get("kind"), "outfit_mode": meta.get("outfit_mode", "include"), "dup_of": dup_of,
             "near": near, "median_sharp": median(sharp) if sharp else None, "identity": identity or {},
-            "reference_ids": set(meta.get("reference_ids") or []), "train_res": 1024, "style_out": style_out,
+            "reference_ids": set(meta.get("reference_ids") or []), "train_res": train_resolution(meta), "style_out": style_out,
             "concept": meta.get("concept_words") or [], "target": captions.concept_target(meta)}
 
 
@@ -107,11 +116,16 @@ def check_image(im: dict, ctx: dict) -> dict:
     if crop:
         w, h = crop[2] - crop[0], crop[3] - crop[1]
     short = min(w, h)
-    if short < 512:
-        checks.append(_c("res", "解像度", "bad", "事実", "高", f"短辺 {short}px は学習解像度 {ctx['train_res']}px に対して小さすぎます。",
+    # half / three quarters of the training resolution (512 / 768 at the default 1024).  A project trained at a
+    # lower resolution is measured against that one; a higher one does not make the limits stricter than before
+    # (images in use would silently drop out of existing projects)
+    res = ctx.get("train_res") or DEFAULT_TRAIN_RES
+    ref = min(res, DEFAULT_TRAIN_RES)
+    if short < ref // 2:
+        checks.append(_c("res", "解像度", "bad", "事実", "高", f"短辺 {short}px は学習解像度 {res}px に対して小さすぎます。",
                          "より大きい元画像に差し替え"))
-    elif short < 768:
-        checks.append(_c("res", "解像度", "warn", "事実", "高", f"短辺 {short}px。拡大して学習されるため、細部がぼやけて学習される可能性があります。"))
+    elif short < ref * 3 // 4:
+        checks.append(_c("res", "解像度", "warn", "事実", "高", f"短辺 {short}px。学習解像度 {res}px まで拡大して学習されるため、細部がぼやけて学習される可能性があります。"))
     ar = max(w, h) / max(1, min(w, h))
     if ar > 3:
         checks.append(_c("aspect", "縦横比", "warn", "事実", "高", f"縦横比 {ar:.1f}:1 と極端です。切り抜きを検討してください。", "切り抜き"))
@@ -240,6 +254,14 @@ def check_image(im: dict, ctx: dict) -> dict:
                 elif ident.get("method") == "embed" and ident.get("outlier"):
                     checks.append(_c("ident", "同一性", "warn", "推定", "低", "他の素材と傾向が大きく違います（写真の同一人物判定は参考値です）。"))
 
+    # a caption that could not be made, with the reason the analysis kept (analysis._cap_failed).  For information:
+    # the verdict is about the image, and the training check already tells about missing captions
+    if status == "done" and im.get("caption_status") == "failed" and not im.get("caption_edited"):
+        why = im.get("ai_error")
+        checks.append(_c("caption", "説明文", "info", "—", "—",
+                         f"説明文を自動で作れませんでした。理由: {why}" if why else
+                         "説明文を自動で作れませんでした。「説明文を作り直す」でやり直せます。"))
+
     statuses = {c["status"] for c in checks}
     if "bad" in statuses:
         verdict = "exclude"
@@ -257,6 +279,7 @@ def check_image(im: dict, ctx: dict) -> dict:
 
 
 # ------------------------------------------------------------------ dataset level
+DOMAIN_LABEL = {"photo": "写真", "illustration": "イラスト"}
 FRAMING = {"portrait": "顔アップ", "close-up": "顔アップ", "upper body": "上半身", "cowboy shot": "膝上",
            "full body": "全身", "lower body": "下半身"}
 ANGLES = {"from side": "横向き", "profile": "横向き", "from behind": "後ろ向き", "from above": "俯瞰", "from below": "あおり"}
@@ -345,9 +368,15 @@ def dataset_report(images: list[dict], results: dict[int, dict], meta: dict) -> 
     if len(analysed) >= max(3, n // 2):
         tagsets = [set(captions.tags_from_ai(im["ai"])[0]) for im in analysed]
         m = len(tagsets)
-        domains = Counter((im["ai"].get("domain") or {}).get("label") for im in analysed)
+        # photo / illustration is an estimate: the images it is unsure about (confidence 低) are not counted
+        doms = [im["ai"].get("domain") or {} for im in analysed]
+        domains = Counter(d.get("label") for d in doms if d.get("label") in DOMAIN_LABEL and d.get("confidence") != "低")
         if len(domains) > 1 and min(domains.values()) / m > 0.15:
-            notes.append({"level": "warn", "text": f"写真とイラストが混在しています（{dict(domains)}）。意図していなければ片方に揃えると安定します。"})
+            parts = "・".join(f"{DOMAIN_LABEL[k]} {domains[k]} 枚" for k in DOMAIN_LABEL if domains.get(k))
+            unsure = sum(1 for d in doms if d.get("label") in DOMAIN_LABEL and d.get("confidence") == "低")
+            notes.append({"level": "warn", "text": f"写真とイラストが混ざっている可能性があります（{parts}"
+                          + (f"。判定に自信のない {unsure} 枚は数えていません" if unsure else "")
+                          + "）。意図していなければ片方に揃えると安定します。"})
         fr = Counter()
         for ts in tagsets:
             hit = {FRAMING[t] for t in ts if t in FRAMING}

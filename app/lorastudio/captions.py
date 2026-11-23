@@ -286,10 +286,21 @@ def finalize_nl(text: str, kind: str, trigger: str) -> str:
     return f"{trigger} style. {text}"
 
 
+def nl_blank(text: str | None, kind: str, trigger: str) -> bool:
+    """A sentence caption that says nothing: empty, or only the trigger finalize_nl puts in front (what an empty
+    answer of the VLM turns into).  Such a text is not a caption: it is not saved, not cached, and a cached one
+    is not used."""
+    body = " ".join((text or "").split())
+    if trigger:
+        body = re.sub(rf"(?<![\w]){re.escape(trigger)}(?![\w])( style\b)?", " ", body)
+    return not re.search(r"\w", body)
+
+
 def replace_trigger(caption: str, old: str, new: str) -> str:
     if not old:
         return caption
-    return re.sub(rf"(?<![\w]){re.escape(old)}(?![\w])", new, caption)
+    # the new word as it is: in a replacement string "\d" or "\1" (a trigger may contain a backslash) is an error
+    return re.sub(rf"(?<![\w]){re.escape(old)}(?![\w])", lambda m: new, caption)
 
 
 # ---------------------------------------------------------------- bulk tag edits (comma separated captions)

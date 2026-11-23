@@ -36,6 +36,7 @@ class Hooks:
     stop_batch = None       # (project, batch_id) -> None
     import_batch = None     # (project, batch_id) -> number of images added
     start_training = None   # (project, name) -> run id; ValueError with the reason when it cannot start
+    train_blockers = None   # (project) -> what stops any training of it (model, environment, GPU); [] when nothing does
     stop_run = None         # (project, run_id) -> None
     analysis_busy = None    # () -> bool: the analysis queue still has items
 
@@ -69,7 +70,6 @@ class Pipeline:
     # ---------------------------------------------------------------- storage
     def load(self):
         try:
-            import json
             data = json.loads(FILE.read_text(encoding="utf-8")) if FILE.exists() else []
         except (OSError, ValueError):
             data = []
@@ -79,8 +79,9 @@ class Pipeline:
     def _save(self):
         try:
             config.atomic_write_json(FILE, self.tasks)
-        except OSError:
-            pass
+        except OSError as e:
+            # not saved (disk full ...): the tasks go on in memory, but a restart would not know them - written down
+            _log(f"pipeline.json could not be saved: {e}")
 
     def _changed(self, t: dict | None = None):
         self._save()
@@ -207,6 +208,12 @@ class Pipeline:
         if self.paused:
             return
         self._set(t, started=time.time())
+        # checked again when its turn comes (the model may have been unregistered or its files moved since the task
+        # was registered): not after the generation and the analysis took the GPU for hours
+        stops = hooks.train_blockers(p) if hooks.train_blockers else []
+        if stops:
+            self._set(t, status="failed", message="このままでは学習を始められないため、始めませんでした: " + " / ".join(stops))
+            return
         if t["gen_count"] > 0:
             from . import generate
             from .models import registry
@@ -262,7 +269,16 @@ class Pipeline:
                 return
             if now - seen[1] < ANALYSIS_STALL_S:
                 return
-            # nothing is analysing these any more (e.g. the analysis AI could not start): train with what there is
+            # nothing is analysing these any more (e.g. the analysis AI could not start).  Not trained like this: an
+            # image without its caption is learnt with the trigger alone, so its clothes, pose and background become
+            # part of the trigger - for hours, with nobody there to see the warning the training page gives
+            self._pending_seen.pop(t["id"], None)
+            self._set(t, status="failed", message=(
+                f"解析と説明文の作成が {ANALYSIS_STALL_S // 60} 分以上進まず、{left} 枚が説明文のないまま残ったため、学習を始めませんでした。"
+                "説明文がないと、写っている服・ポーズ・背景も呼び出し語の一部として覚えやすくなるためです。"
+                "素材の画面で解析の状態と説明文を確かめてから、学習の画面で「学習を開始」を押してください"
+                "（加えた素材はそのまま残っています）。"))
+            return
         if self._held(t, "解析が終わりました。一時停止中のため、学習を始める前で止めています"):
             return
         self._pending_seen.pop(t["id"], None)
@@ -274,8 +290,7 @@ class Pipeline:
         if self._ended(t):   # cancelled while the run was being reserved
             hooks.stop_run(p, rid)
             return
-        self._set(t, status="training", run=rid, message=f"学習 #{rid} を開始します" +
-                  (f"（解析が終わらなかった画像 {left} 枚はそのまま使います）" if left else ""))
+        self._set(t, status="training", run=rid, message=f"学習 #{rid} を開始します")
 
     def _training(self, t, p):
         # the status columns only, not the whole frozen snapshot (config), every POLL_S seconds

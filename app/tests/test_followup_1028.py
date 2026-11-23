@@ -101,6 +101,7 @@ def test_a_download_cut_without_a_length_is_not_placed_and_continues(env, monkey
     from lorastudio import remote
     whole = _st_bytes(5000)
     placed, answers = [], []
+    monkeypatch.setattr(remote, "RETRY_TRIES", 0)   # one try each: the automatic continuation has its own tests
     monkeypatch.setattr(remote, "probe", lambda url, name, headers=None: {"ok": True})
     monkeypatch.setattr(remote, "_place", lambda st, tmp, name, hint: (placed.append(tmp.read_bytes()), st.update(state="done")))
     monkeypatch.setattr(remote, "_open", lambda url, headers=None, timeout=30: answers.pop(0)(headers or {}))

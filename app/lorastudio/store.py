@@ -409,20 +409,30 @@ class ProjectManager:
         return None
 
     def list(self) -> list[dict]:
-        def mtime(p: Path) -> float:
-            try:
-                return p.stat().st_mtime
-            except OSError:   # deleted since folders() looked
-                return 0.0
+        def updated_of(d: Path) -> float:
+            """When the project was last edited: edits are written to project.db and its WAL.  The folder's own time
+            and an empty WAL are left out: after the app was closed normally SQLite has removed -wal / -shm, and
+            merely opening the project for this list creates them again (empty), which touches the folder - every
+            project would be "updated just now" and the newest-first order would mean nothing."""
+            times = []
+            for name in ("project.db", "project.db-wal"):
+                try:
+                    st = (d / name).stat()
+                except OSError:   # no WAL, or deleted since folders() looked
+                    continue
+                if st.st_size or name == "project.db":
+                    times.append(st.st_mtime)
+            return max(times, default=0.0)
 
+        # the times are read before any project is opened, and the list is sorted by them
+        when = {d: updated_of(d) for d in self.folders()}
         out = []
-        for d in sorted(self.folders(), key=mtime, reverse=True):
+        for d in sorted(when, key=when.get, reverse=True):
             try:
                 p = self.get(d.name)
                 m = p.get_meta()
                 n = p.q("SELECT COUNT(*) c FROM images WHERE removed=0")[0]["c"]
-                # edits are written to project.db (and its WAL), which does not always touch the folder
-                updated = max(f.stat().st_mtime for f in (d, d / "project.db", d / "project.db-wal") if f.exists())
+                updated = when[d]
                 out.append({"id": d.name, "name": m.get("name", d.name), "kind": m.get("kind"), "concept_target": m.get("concept_target"),
                             "enhance": m.get("enhance"),
                             "model_id": m.get("model_id"), "source": m.get("source", "images"), "images": n,

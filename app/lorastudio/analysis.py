@@ -69,6 +69,27 @@ def _cap_ckey(policy: str, img: dict) -> str:
     return f"cap:{policy}:{img['sha'][:24]}:{img.get('crop')}"
 
 
+def _cap_cached(policy: str, img: dict, meta: dict) -> dict | None:
+    """The VLM caption cached for this picture under `policy`, unless it says nothing (older versions cached the
+    bare trigger when the VLM answered with nothing; such an entry is written again instead of used)."""
+    c = cache_get(_cap_ckey(policy, img))
+    if not isinstance(c, dict) or captions.nl_blank(c.get("text"), meta["kind"], meta["trigger"]):
+        return None
+    return c
+
+
+def _cap_failed(project, image_id: int, reason: str | None) -> None:
+    """A caption that could not be made: the state, and why.  The reason is kept in ai_error (empty otherwise once
+    the analysis itself is done) and shown with the image's checks (judge.check_image)."""
+    project.set_fields(image_id, caption_status="failed", ai_error=reason or None)
+
+
+def _cap_made(project, img: dict) -> None:
+    """The reason of an earlier failed caption (see _cap_failed) goes when the caption is made."""
+    if img.get("ai_error") and img.get("ai_status") == "done":
+        project.set_fields(img["id"], ai_error=None)
+
+
 def _mono(meta: dict, img: dict) -> bool:
     return meta["kind"] != "style" and captions.is_monochrome(img)
 
@@ -80,6 +101,7 @@ def _no_caption(img) -> dict:
 
 LOAD_LIMIT_S = 2 * 3600   # a worker call may wait this long for a model download / load
 GPU_RETRY_S = 300         # a worker analysing on the CPU because CUDA failed tries the GPU again after this
+GPU_CAPTION_RETRIES = 3   # a caption that failed because the GPU was unusable is queued again this often, not for ever
 
 class WorkerClient:
     """Owns the analysis worker process.  Restarts it on crash, at most 3 times per 10 min."""
@@ -123,6 +145,8 @@ class WorkerClient:
                 msg = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
+            if not isinstance(msg, dict):
+                continue   # a library printed a bare number or list: not a message (and must not end this thread)
             if "event" in msg:
                 ev = msg["event"]
                 if ev == "ready":
@@ -282,10 +306,25 @@ class Analyzer:
         threading.Thread(target=self._dispatch_loop, daemon=True, name="ai-dispatch").start()
 
     # ---------------------------------------------------------------- stage 1
-    def submit_fast(self, project, image_id: int):
-        self.fast_pool.submit(self._fast, project, image_id)
+    def submit_fast(self, project, image_id: int, redo_ai: bool = False):
+        self.fast_pool.submit(self._fast, project, image_id, redo_ai)
 
-    def _fast(self, project, image_id):
+    def refresh_outdated(self, project) -> int:
+        """Images an older version of the mechanical check read wrongly (fastcheck.outdated: only the ones the
+        change concerns, not every image) are checked again, and analysed and captioned again from the corrected
+        reading (captions edited by hand stay).  Returns how many were queued."""
+        n = 0
+        for r in project.q("SELECT id, fast FROM images WHERE removed=0 AND fast_status='done' AND fast IS NOT NULL"):
+            try:
+                old = fastcheck.outdated(json.loads(r["fast"]))
+            except (TypeError, ValueError):
+                continue
+            if old:
+                self.submit_fast(project, r["id"], redo_ai=True)
+                n += 1
+        return n
+
+    def _fast(self, project, image_id, redo_ai: bool = False):
         img = project.image(image_id)
         if img is None:
             return
@@ -301,13 +340,20 @@ class Analyzer:
         project.set_fields(image_id, **fields)
         bus.image_changed(project.id, image_id)
         if facts.get("ok"):
-            self.submit_ai(project, image_id)
+            self.submit_ai(project, image_id, force=redo_ai, recaption=redo_ai)
+
+    def _recaption(self) -> set:
+        """(project, image) whose caption is written again after the forced analysis (the picture is read anew)."""
+        return self.__dict__.setdefault("_recap", set())
 
     # ---------------------------------------------------------------- stage 2/3
-    def submit_ai(self, project, image_id: int, priority: int = 5, force: bool = False):
+    def submit_ai(self, project, image_id: int, priority: int = 5, force: bool = False, recaption: bool = False):
         img = project.image(image_id)
         if img is None or img["fast_status"] != "done":
             return
+        if force and recaption:
+            with self._qlock:
+                self._recaption().add((project.id, image_id))
         key = ai_key(img["sha"], img.get("crop"))
         if not force and img.get("ai_key") == key and img["ai_status"] == "done":
             self.ensure_caption(project, image_id)
@@ -389,15 +435,17 @@ class Analyzer:
             return
         if how == "now":
             project.set_auto_caption(image_id, text, img_key)
+            _cap_made(project, img)
             bus.image_changed(project.id, image_id)
             return
         if not force and self._inflight().get((project.id, image_id)) == img_key:
             return   # the VLM is writing exactly this caption right now: its result is applied when it comes
-        cached = cache_get(_cap_ckey(_policy(meta), img))
+        cached = _cap_cached(_policy(meta), img, meta)
         if cached is not None:
             text = (captions.mark_monochrome(cached["text"], meta["kind"], captions.project_style(meta))
                     if _mono(meta, img) else cached["text"])
             project.set_auto_caption(image_id, text, img_key)
+            _cap_made(project, img)
             bus.image_changed(project.id, image_id)
             return
         project.set_fields(image_id, caption_status="pending")
@@ -406,6 +454,30 @@ class Analyzer:
     def _inflight(self) -> dict:
         """(project, image) -> caption key the VLM is writing right now (set while a caption batch runs)."""
         return self.__dict__.setdefault("_captioning", {})
+
+    def _gpu_tries(self) -> dict:
+        """(project, image) -> how often its caption was queued again because the GPU was unusable."""
+        return self.__dict__.setdefault("_gpu_retries", {})
+
+    def _captions_again(self, pid: str, image_ids: list[int], after: float = GPU_RETRY_S + 15):
+        """Captions that failed because the worker's GPU was unusable (after a sleep, a driver reset): the worker
+        tries the GPU again GPU_RETRY_S after it failed (WorkerClient.call), so they are queued again then."""
+        tries = self._gpu_tries()
+        for i in image_ids:
+            tries[(pid, i)] = tries.get((pid, i), 0) + 1
+
+        def run():
+            try:
+                project = self.projects.get(pid)
+            except KeyError:
+                return   # deleted or being moved meanwhile
+            for i in image_ids:
+                img = project.image(i)
+                if img and not img["removed"] and img["caption_status"] == "failed":
+                    self.ensure_caption(project, i, force=True)
+        t = threading.Timer(after, run)
+        t.daemon = True
+        t.start()
 
     def carry_trigger(self, project, old_meta: dict):
         """After only the trigger changed: the VLM captions written for the old trigger are kept with the word
@@ -586,7 +658,7 @@ class Analyzer:
                 for i in image_id:
                     # only the ones still waiting: part of the batch may already have its caption (cache, tags)
                     if (project.image(i) or {}).get("caption_status") in ("pending", "running"):
-                        project.set_fields(i, caption_status="failed")
+                        _cap_failed(project, i, message)
                         bus.image_changed(pid, i)
         except Exception:
             pass   # the project is gone, or the database cannot be written either
@@ -617,21 +689,24 @@ class Analyzer:
             else:   # captions: the analysis itself is fine
                 self._mark_failed(op, pid, image_id, msg)
             return
-        if not gpu.begin_analysis(timeout=0):
+        waited = not gpu.begin_analysis(timeout=0)
+        if waited:
             bus.publish("analysis", state="paused", reason=gpu.owner)
             gpu.begin_analysis()
-            bus.publish("analysis", state="running")
-            # the wait may have been a whole training run: the project may have been deleted or moved meanwhile
-            with self._qlock:
-                dropped = not self._taken
-            project = None if dropped else self._project(op, pid, image_id, item)
-            if project is None:
-                gpu.end_analysis()
-                return
-        with self._qlock:
-            self.current = item
-            self._taken = []
+        # from here the GPU counts as used by the analysis: given back whatever happens (an error while the project
+        # is opened again would otherwise keep training and generation waiting for the rest of the session)
         try:
+            if waited:
+                bus.publish("analysis", state="running")
+                # the wait may have been a whole training run: the project may have been deleted or moved meanwhile
+                with self._qlock:
+                    dropped = not self._taken
+                project = None if dropped else self._project(op, pid, image_id, item)
+                if project is None:
+                    return
+            with self._qlock:
+                self.current = item
+                self._taken = []
             if op == "analyze":
                 self._do_analyze(project, image_id)
             elif op.startswith("mask:"):
@@ -652,6 +727,14 @@ class Analyzer:
         with self._qlock:
             forced = (project.id, image_id) in self._forced
             self._forced.discard((project.id, image_id))
+            reread = forced and (project.id, image_id) in self._recaption()
+            self._recaption().discard((project.id, image_id))
+        if reread:   # the caption cached for this picture was written from the old reading of the file
+            recaption = True
+            try:
+                _cache_path(_cap_ckey(_policy(project.get_meta()), img)).unlink(missing_ok=True)
+            except OSError:
+                pass
         # the same file (e.g. added twice) may have been analysed while this one was queued
         cached = None if forced else cache_get(key)
         if cached is not None:
@@ -695,13 +778,14 @@ class Analyzer:
         key = _policy(meta)
         todo = []
         for img in imgs:   # written meanwhile (e.g. queued again while a batch with it was running): no VLM call
-            cached = cache_get(_cap_ckey(key, img))
+            cached = _cap_cached(key, img, meta)
             if cached is None:
                 todo.append(img)
                 continue
             mono = _mono(meta, img)
             text = captions.mark_monochrome(cached["text"], meta["kind"], style) if mono else cached["text"]
             project.set_auto_caption(img["id"], text, key + (":mono" if mono else ""))
+            _cap_made(project, img)
             bus.image_changed(project.id, img["id"])
         imgs = todo
         if not imgs:
@@ -720,6 +804,13 @@ class Analyzer:
             for img in imgs:
                 self._inflight().pop((project.id, img["id"]), None)
         texts = (res.get("texts") or []) if res.get("ok") else []
+        # the worker's GPU was unusable (it says so instead of captioning on the CPU): queued again once the worker
+        # has tried the GPU again, a limited number of times per image
+        tries = self._gpu_tries()
+        no_gpu = not res.get("ok") and res.get("reason") == "gpu"
+        again = [img["id"] for img in imgs if no_gpu and tries.get((project.id, img["id"]), 0) < GPU_CAPTION_RETRIES]
+        if not res.get("ok"):
+            why = res.get("error") or "説明文を作る AI から結果が返りませんでした。"
         now_meta = project.get_meta()
         for n, img in enumerate(imgs):
             cur = project.image(img["id"])
@@ -728,17 +819,33 @@ class Analyzer:
             stale = (cur is None or cur["removed"] or cur["sha"] != img["sha"] or cur.get("crop") != img.get("crop")
                      or cur["caption_status"] != "running" or not cur.get("ai")
                      or self._caption_plan(now_meta, cur)[1] != keys[img["id"]])
-            if n < len(texts) and texts[n] is not None:   # None: the worker could not read that image
-                text = captions.finalize_nl(texts[n], meta["kind"], meta["trigger"])
+            raw = texts[n] if n < len(texts) else None   # None: the worker could not read that image
+            text = None if raw is None else captions.finalize_nl(raw, meta["kind"], meta["trigger"])
+            # an answer with nothing in it is not a caption: saved (and cached) it would be the bare trigger, for good
+            if text is not None and not captions.nl_blank(text, meta["kind"], meta["trigger"]):
                 cache_put(_cap_ckey(key, img), {"text": text})
+                tries.pop((project.id, img["id"]), None)
                 if stale:
                     continue
                 if _mono(meta, img):
                     text = captions.mark_monochrome(text, meta["kind"], style)
                 project.set_auto_caption(img["id"], text, keys[img["id"]])
+                _cap_made(project, cur)
             elif not stale:
-                project.set_fields(img["id"], caption_status="failed")
+                if no_gpu:
+                    reason = why + (f"{GPU_RETRY_S // 60} 分ほどあとに、自動でもう一度試します。" if img["id"] in again else
+                                    f"自動でのやり直しは {GPU_CAPTION_RETRIES} 回までで止めました。GPU が使えるようになってから"
+                                    "「説明文を作り直す」を押してください。続くときは PC を再起動してください。")
+                elif not res.get("ok"):
+                    reason = why
+                elif raw is None:
+                    reason = "説明文を作る AI が、この画像を読み込めませんでした。"
+                else:
+                    reason = "説明文を作る AI が、中身のない文を返しました。「説明文を作り直す」でもう一度試せます。"
+                _cap_failed(project, img["id"], reason)
             bus.image_changed(project.id, img["id"])
+        if again:
+            self._captions_again(project.id, again)
 
     # ---------------------------------------------------------------- dataset-level identity
     def after_ai(self, project):
@@ -771,7 +878,10 @@ class Analyzer:
         refs = [r for r in (meta.get("reference_ids") or []) if any(i["id"] == r for i in imgs)]
         anime = [i for i in imgs if i["ai"].get("ccip")]
         ident = {}
-        sig = hashlib.sha1(json.dumps([[i["id"], i["ai_key"]] for i in imgs] + [refs]).encode()).hexdigest()
+        # images the user excluded (e.g. another character that got in) do not decide what "the character" is:
+        # they are still judged, but the automatic reference and the photos' centre come from the others
+        out = {i["id"] for i in imgs if i.get("decision") == "exclude"}
+        sig = hashlib.sha1(json.dumps([[i["id"], i["ai_key"]] for i in imgs] + [refs] + [sorted(out)]).encode()).hexdigest()
         if (meta.get("identity") or {}).get("sig") == sig:
             return
         if len(anime) >= 2:
@@ -796,15 +906,17 @@ class Analyzer:
                 mat = res["matrix"]
                 ids = [i["id"] for i in anime]
                 auto = False
+                cand = [a for a, iid in enumerate(ids) if iid not in out] or list(range(len(ids)))
+
+                def medoid():   # the image most similar to the others, among the ones not excluded
+                    return min(cand, key=lambda a: sorted(mat[a][b] for b in cand)[len(cand) // 2])
                 if not refs:
-                    # automatic reference: the image most similar to the others (medoid)
-                    best = min(range(len(ids)), key=lambda a: sorted(mat[a])[len(ids) // 2])
-                    refs = [ids[best]]
+                    refs = [ids[medoid()]]   # automatic reference
                     auto = True
                 ref_idx = [ids.index(r) for r in refs if r in ids]
                 if not ref_idx:
                     # the chosen references have no CCIP (e.g. a photo): compare with the automatic one instead
-                    ref_idx = [min(range(len(ids)), key=lambda a: sorted(mat[a])[len(ids) // 2])]
+                    ref_idx = [medoid()]
                 for a, iid in enumerate(ids):
                     ident[iid] = {"method": "ccip", "diff": round(min(mat[a][r] for r in ref_idx), 4)}
                 project.set_meta(auto_reference=refs if auto else [])
@@ -812,10 +924,13 @@ class Analyzer:
         if len(photos) >= 4:
             import numpy as np
             E = np.array([i["ai"]["subject_embed"] for i in photos])
-            c = E.mean(0)
+            keep = np.array([i["id"] not in out for i in photos])
+            if keep.sum() < 4:   # too few left to say what is usual: all of them, as before
+                keep[:] = True
+            c = E[keep].mean(0)
             c /= np.linalg.norm(c)
             s = E @ c
-            mu, sd = s.mean(), s.std() + 1e-6
+            mu, sd = s[keep].mean(), s[keep].std() + 1e-6
             for i, v in zip(photos, s):
                 ident[i["id"]] = {"method": "embed", "sim": round(float(v), 4), "outlier": bool(v < mu - 2.5 * sd and v < 0.75)}
         project.set_meta(identity={"sig": sig, "map": {str(k): v for k, v in ident.items()}})

@@ -55,13 +55,22 @@ VARIANTS = {
                      "prediction": "flow", "verified": False},
     "zimage_base": {"family": "zimage", "label": "Z-Image Base 系", "caption": "natural",
                     "prediction": "flow", "verified": False},
-    # MOSS-Image, trained with sd-scripts v0.12.1 (docs/moss_image_train_network.md).
+    # MOSS-Image, trained with sd-scripts (v0.13.0, the same pin as SDXL / Anima; docs/moss_image_train_network.md).
     # SFT and Base share the DiT structure: the variant comes from the file name, else the user picks it.
     "moss_image_sft": {"family": "moss_image", "label": "MOSS-Image SFT", "caption": "natural",
                        "prediction": "flow", "verified": False},
     "moss_image_base": {"family": "moss_image", "label": "MOSS-Image Base", "caption": "natural",
                         "prediction": "flow", "verified": False},
+    # MiniMax H3-Image (2026-11-10, ComfyUI v0.45.0): generation, editing and - since 2026-11-23, experimental - LoRA
+    # training with ai-toolkit (ostris, arch minimax_h3_image, 2026-11-10: the first engine that takes this
+    # checkpoint; musubi-tuner's MiniMax-H3 is the video bases only).  The checkpoint is distilled to 6 steps with
+    # its own output heads (PDD), so it is trained on those 6 sigmas with the engine's training adapter.
+    "h3_image": {"family": "h3_image", "label": "MiniMax H3-Image", "caption": "natural", "prediction": "flow",
+                 "verified": False},
 }
+H3_TRAIN_NOTE = ("MiniMax H3-Image の LoRA は、学習エンジン ai-toolkit で学習します。学習には、おすすめのモデルの"
+                 "「MiniMax H3-Image 学習用ファイル」（学習アダプターと学習エンジン）が必要です。"
+                 "33B の大きなモデルのため、VRAM 24GB 以上を目安にしています（ファイルの大きさから決めた目安です）。")
 UNAVAILABLE_NOTE: dict[str, str] = {}
 KREA2_NOTE = ("Krea 2 の学習には RAW 版の本体（bf16、約 26GB）が必要です。Turbo 版や量子化した版は、画像生成と素材の生成にだけ使えます。"
               "学習した LoRA は Turbo 版で使う想定です。")
@@ -70,9 +79,14 @@ QWEN_IMAGE_NOTE = ("Qwen-Image-2512 は 20B の大きなモデルです。学習
 ANIMA29_NOTE = ("Anima 2.9B は、Anima の層を 28 から 40 に増やしたモデルです（試作版）。テキストエンコーダーと VAE は Anima と同じものを使います。"
                 "Anima（2B）で作った LoRA は層の並びが違うため、効き方が変わることがあります。")
 ZIMAGE_NOTE = "Turbo 系で学習するときは、Turbo 用の学習アダプター（約 0.3GB）を使います。"
-MOSS_NOTE = ("学習には MOSS-Image に対応した新しい版の学習エンジン（sd-scripts v0.12.1）を別に入れて使います。")
+MOSS_NOTE = ("学習には、SDXL・Anima と同じ学習エンジン（sd-scripts v0.13.0）を使います。MOSS-Image を追加したときに、高速化用の部品（triton-windows）を学習用の環境に入れます。")
 QWEN21_NOTE = ("学習には、Qwen-Image-2.1 に対応した学習エンジン（musubi-tuner の開発版）を別に入れて使います。"
                "Qwen-Image-2.1 は Qwen Research License のモデルで、商用には使えません。")
+# MiniMax-H3-Image Community License Agreement (read 2026-11-11): I.5 Excluded Territories, V.3 Outputs may not be used
+# to improve any other AI model, IV.1 written authorization above 1M USD of annual revenue or for a hosted service
+H3_LICENSE = ("MiniMax-H3-Image Community License のモデルです。EU・英国・韓国・米国は、このライセンスで使える地域に含まれていません。"
+              "生成した画像を、ほかの AI モデルの学習に使うことも認められていません。利用の前に、モデルのページでライセンスを確認してください。")
+H3_NOTE = H3_TRAIN_NOTE + H3_LICENSE
 
 
 VARIANTS["qwen_image"]["note"] = QWEN_IMAGE_NOTE
@@ -83,6 +97,7 @@ VARIANTS["zimage_base"]["note"] = ZIMAGE_NOTE
 VARIANTS["anima29"]["note"] = ANIMA29_NOTE
 VARIANTS["moss_image_sft"]["note"] = MOSS_NOTE
 VARIANTS["moss_image_base"]["note"] = MOSS_NOTE
+VARIANTS["h3_image"]["note"] = H3_NOTE
 
 
 def experimental_note(variant: str | None) -> str | None:
@@ -98,7 +113,8 @@ def trainable(variant: str) -> bool:
     return available(variant) and VARIANTS.get(variant, {}).get("train", True)
 
 FAMILY_ENGINE = {"sdxl": "sd-scripts", "anima": "sd-scripts", "krea2": "musubi-tuner", "qwen_image": "musubi-tuner",
-                 "qwen_image21": "musubi-tuner-qwen21", "zimage": "musubi-tuner", "moss_image": "sd-scripts-moss"}
+                 "qwen_image21": "musubi-tuner-qwen21", "zimage": "musubi-tuner", "moss_image": "sd-scripts-moss",
+                 "h3_image": "ai-toolkit"}
 
 # files each family needs, beyond the main checkpoint: (key, label, required)
 FAMILY_FILES = {
@@ -122,6 +138,10 @@ FAMILY_FILES = {
                    ("vae", "FLUX.2 VAE（flux2-vae_small）", True),
                    ("fast", "8 ステップ高速生成 LoRA（SFT 版の生成用、任意）", False),
                    ("fast4", "4 ステップ高速生成 LoRA（SFT 版の生成用、任意）", False)],
+    "h3_image": [("ckpt", "MiniMax H3-Image DiT（INT8 ConvRot 版・W4A8 版・bf16 版）", True),
+                 ("te", "Qwen3-VL-32B テキストエンコーダー（qwen3vl_32b_minimax_h3_int8_convrot など）", True),
+                 ("vae", "MiniMax H3-Image VAE（minimax_h3_image_vae_fp16）", True),
+                 ("adapter", "学習アダプター（minimax_h3_image_training_adapter_v1、学習に必要）", False)],
 }
 # families whose registered model needs at least one of these files
 FAMILY_ONE_OF = {"qwen_image": ("ckpt", "gen"), "qwen_image21": ("ckpt", "gen"), "krea2": ("turbo", "ckpt")}
@@ -309,6 +329,46 @@ CATALOG = [
                "te": ("Comfy-Org/Qwen3-VL", "text_encoders/qwen3vl_4b_bf16.safetensors", 8.88, "text_encoders"),
                "vae": ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/vae/qwen_image_vae.safetensors", 0.25, "vae")},
      "needs": {"tokenizers": [["Qwen/Qwen3-VL-4B-Instruct", ["*.json", "*.txt", "merges*", "vocab*", "*.model", "*.jinja"]]]}},
+    # MiniMax H3-Image (Comfy-Org/MiniMax-H3-Image, file list and sizes read 2026-11-11).  ComfyUI's template
+    # image_minimax_h3_image_t2i uses the INT8 DiT, the INT8 text encoder and the fp16 VAE.  Which file suits which
+    # VRAM is this tool's choice from the file sizes (ComfyUI's page gives no VRAM figures): unverified.  The text
+    # encoder is the one of MiniMax H3 (video), so a file already there is not fetched again.  The prompt expander
+    # of the template (qwen3.5_9b_w4a8_gptq) is not used: the prompt goes to the model as typed.
+    {"id": "h3_image", "variant": "h3_image", "name": "MiniMax H3-Image",
+     "license": "MiniMax-H3-Image Community License（EU・英国・韓国・米国は対象外）", "gated": False,
+     "note": "6 ステップで生成する、33B の大きなモデルです。LoRA の学習には、このほかに「MiniMax H3-Image 学習用ファイル」を追加します。" +
+             "本体とテキストエンコーダーは VRAM に収まらない大きさなので、収まらない分はメインメモリに置いて動かします。"
+             "お使いの GPU の VRAM に合わせて、本体とテキストエンコーダーの版を選びます（どの版がどの VRAM に合うかは、"
+             "ファイルの大きさから決めた目安です）。" + H3_LICENSE,
+     "files": {"ckpt": None, "te": None,   # picked from "choices"
+               "vae": ("Comfy-Org/MiniMax-H3-Image", "vae/minimax_h3_image_vae_fp16.safetensors", 1.17, "vae")},
+     "choices": {
+         "ckpt": [{"id": "w4a8", "label": "W4A8 版（12.5GB・VRAM 20GB 未満向け）", "max_vram": 19,
+                   "file": ("Comfy-Org/MiniMax-H3-Image", "diffusion_models/minimax_h3_image_pruned_w4a8.safetensors", 12.55, "diffusion_models")},
+                  {"id": "int8", "label": "INT8 ConvRot 版（21.0GB・VRAM 20GB 以上、ComfyUI の標準の構成）", "max_vram": 44,
+                   "file": ("Comfy-Org/MiniMax-H3-Image", "diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors", 20.98, "diffusion_models")},
+                  {"id": "bf16", "label": "bf16 版（40.2GB・VRAM 48GB 以上、元の品質）", "max_vram": 999,
+                   "file": ("Comfy-Org/MiniMax-H3-Image", "diffusion_models/minimax_h3_image_pruned_bf16.safetensors", 40.23, "diffusion_models")}],
+         "te": [{"id": "nvfp4", "label": "テキストエンコーダー NVFP4 版（15.7GB・VRAM 24GB 未満向け）", "max_vram": 23,
+                 "file": ("Comfy-Org/MiniMax-H3-Image", "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", 15.69, "text_encoders")},
+                {"id": "int8", "label": "テキストエンコーダー INT8 版（27.1GB・VRAM 24GB 以上、ComfyUI の標準の構成）", "max_vram": 999,
+                 "file": ("Comfy-Org/MiniMax-H3-Image", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors", 27.14, "text_encoders")}]}},
+    # MiniMax H3-Image LoRA training (experimental): ostris's training adapter (ai-toolkit's default for this arch,
+    # ui.tsx assistant_lora_path; repo ostris/minimax_h3_training_adapter, 155MB, read 2026-11-23: no model card, so no
+    # license is stated), the engine itself with its own env (engines.lock.json "ai-toolkit", envs/aitk.lock.txt), and
+    # the tokenizer / processor / text encoder config ai-toolkit reads from MiniMaxAI/MiniMax-H3 (FL2VA/, small files).
+    {"id": "h3_image_train", "variant": "h3_image", "name": "MiniMax H3-Image 学習用ファイル",
+     "license": "学習アダプター: ライセンスの記載なし（配布ページに説明がありません）／学習エンジン ai-toolkit: MIT",
+     "gated": False, "merge": True,
+     "needs_model": "先に MiniMax H3-Image を追加してください。学習用ファイルは MiniMax H3-Image に追加して使います。",
+     "note": "MiniMax H3-Image の LoRA を学習するためのファイルです。学習アダプター（ostris 氏作、0.16GB）と、"
+             "学習エンジン ai-toolkit を入れます。学習エンジンは今の学習環境と部品の版が違うため、専用の環境（envs\\aitk）を作り、"
+             "数 GB の部品を取得します（初回だけ、時間がかかります）。NVIDIA のドライバーが CUDA 12.6 以上に対応している必要があります。"
+             "学習アダプターの配布ページには、ライセンスの記載がありません。使う前に配布ページを確認してください。" + H3_LICENSE,
+     "files": {"adapter": ("ostris/minimax_h3_training_adapter", "minimax_h3_image_training_adapter_v1.safetensors", 0.16, "loras")},
+     "needs": {"engines": ["ai-toolkit"],
+               "tokenizers": [["MiniMaxAI/MiniMax-H3", ["FL2VA/tokenizer/*", "FL2VA/processor/*", "FL2VA/text_encoder/*.json",
+                                                        "FL2VA/text_encoder/*.txt"]]]}},
 ]
 
 
@@ -415,6 +475,13 @@ def detect_header(hdr: dict, name: str = "") -> dict:
         res["int8"] = any(k.endswith((".weight_scale", ".comfy_quant")) for k in keys) or \
             any(str(v.get("dtype", "")) == "I8" for v in hdr.values() if isinstance(v, dict))
         return res
+    if {"video_patch_proj.weight", "condition_proj.weight"} <= bare:
+        # MiniMax H3 (ComfyUI model_detection.py): the image checkpoint is the one without the audio stream
+        if "audio_patch_proj.weight" in bare:
+            res.update(evidence="MiniMax H3 の動画用モデルです（このツールでは未対応）")
+            return res
+        res.update(family="h3_image", variant="h3_image", confidence="高", evidence="MiniMax H3-Image の DiT 構造", note=H3_NOTE)
+        return res
     if any(k.startswith(("txtfusion.", "tmlp.", "txtmlp.")) or ".txtfusion." in k for k in keys):
         res.update(family="krea2", variant="krea2", confidence="中", evidence="Krea 2 系のテキスト融合層")
         res["note"] = KREA2_NOTE
@@ -469,6 +536,9 @@ def moss_edit_format(meta: dict, name: str = "") -> str | None:
 
 # sd-scripts lora_generic keys of the MOSS-Image DiT (layers.N.proj.q / k / v / o / ffn_up_gate / ffn_down)
 _MOSS_LORA_KEY = re.compile(r"^lora_unet_layers_\d+_proj_(q|k|v|o|ffn_up_gate|ffn_down)\.")
+# MiniMax H3 / H3-Image DiT modules (blocks.N.attn.qkv_proj, also in token_refiner): ComfyUI's generic layout
+# (diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight, as Comfy-Org's turbo LoRAs) and the lora_unet_ one
+_H3_LORA_KEY = re.compile(r"(^|[._])blocks[._]\d+[._]attn[._]qkv_proj[._]")
 
 
 def detect_lora_header(hdr: dict, name: str = "") -> dict:
@@ -495,6 +565,11 @@ def detect_lora_header(hdr: dict, name: str = "") -> dict:
             k.startswith(("lora_unet_layers_", "lora_unet_context_refiner_", "lora_unet_noise_refiner_"))
             or ".context_refiner." in k or ".noise_refiner." in k or (".layers." in k and ".feed_forward.w" in k) for k in keys):
         return {"family": "zimage", "evidence": "Z-Image 用"}
+    if "minimax" in arch or "minimax" in base or "minimax-h3" in (meta.get("base_model") or "").lower() \
+            or any(_H3_LORA_KEY.search(k) for k in keys):
+        # the image and the video checkpoints share the module names: a LoRA made for MiniMax H3 (video) loads too,
+        # and what it does on H3-Image depends on the LoRA
+        return {"family": "h3_image", "evidence": "MiniMax H3 / H3-Image 用"}
     if "qwen-image-2.1" in arch or "qwen_image_21" in arch or "qwen_image_21" in base:
         return {"family": "qwen_image21", "evidence": "Qwen-Image-2.1 用"}
     if "qwen-image" in arch or "qwen_image" in arch or base.startswith("qwen_image"):
@@ -505,7 +580,8 @@ def detect_lora_header(hdr: dict, name: str = "") -> dict:
 
 
 FAMILY_LABEL = {"sdxl": "SDXL 系", "anima": "Anima", "krea2": "Krea 2", "sd15": "SD1.5 / SD2", "flux": "FLUX",
-                "qwen_image": "Qwen-Image", "qwen_image21": "Qwen-Image-2.1", "zimage": "Z-Image", "moss_image": "MOSS-Image"}
+                "qwen_image": "Qwen-Image", "qwen_image21": "Qwen-Image-2.1", "zimage": "Z-Image", "moss_image": "MOSS-Image",
+                "h3_image": "MiniMax H3-Image"}
 
 
 def read_gguf_header(path) -> tuple[dict, list[str]]:
@@ -624,6 +700,11 @@ COMPANIONS = {
                    "fast": ["moss_image_8steps_dmd2.safetensors", "moss_image_sft_8steps_dmd_latest.safetensors",
                             "moss_image_sft_8steps_dmd.safetensors"],
                    "fast4": ["moss_image_sft_4step_v2.0.safetensors"]},
+    # the INT8 one first: what ComfyUI's template uses
+    "h3_image": {"te": ["qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "qwen3vl_32b_minimax_h3_bf16.safetensors"],
+                 "vae": ["minimax_h3_image_vae_fp16.safetensors"],
+                 "adapter": ["minimax_h3_image_training_adapter_v1.safetensors"]},
 }
 OPTIONAL_COMPANIONS = ("train_te", "train_vae", "adapter", "fast", "fast4")
 
@@ -634,7 +715,16 @@ def companion_fit(family: str, kind: str, hdr: dict) -> bool | None:
     2026-10-26): the Qwen-Image-2.1 VAE is the Wan 2.2 layout with a temporal kernel of 1; the older Wan 2.1 one
     (qwen_image_vae) makes 5-D latents, which the 2.1 model rejects ("too many values to unpack (expected 4)")."""
     hdr = {k: v for k, v in hdr.items() if k != "__metadata__"}
+    shape = lambda key: (hdr.get(key) or {}).get("shape") or []
     if kind == "vae":
+        # MiniMax H3 VAEs (a ViT decoder).  The image one as ComfyUI tells it (comfy/sd.py): a single-frame decoder
+        # (proj_out 768) of width 1024; the video VAE and p-h3-image's are other files (headers read 2026-11-11)
+        h3 = "decoder.transformer_blocks.0.scale1" in hdr and "decoder.x_embedder.weight" in hdr
+        if h3 or family == "h3_image":
+            h3_image = h3 and shape("decoder.proj_out.weight")[:1] == [768] and shape("decoder.x_embedder.weight")[:1] == [1024]
+            if family == "h3_image":
+                return True if h3_image else (None if h3 else False)
+            return False
         if "decoder.middle.0.residual.0.gamma" not in hdr:
             # a Diffusers / Flux / SD layout VAE (decoder.conv_in): the latent channels it decodes (its input
             # channels) say which models it is for: 4 SD / SDXL, 16 Flux.1 ae (Z-Image), 32 Flux.2 (MOSS-Image)
@@ -659,9 +749,11 @@ def companion_fit(family: str, kind: str, hdr: dict) -> bool | None:
         if family == "moss_image":
             return True if qwen35 else (False if len(emb) == 2 else None)
         if qwen35:
-            return False if family in ("qwen_image21", "qwen_image", "anima", "krea2", "zimage") else None
+            return False if family in ("qwen_image21", "qwen_image", "anima", "krea2", "zimage", "h3_image") else None
         if len(emb) != 2:
             return None
+        if family == "h3_image":   # Qwen3-VL-32B: width 5120, with its vision tower (the INT8 and NVFP4 files alike)
+            return emb[1] == 5120 and any(k.startswith(("visual.", "model.visual.")) for k in hdr)
         # the width of the Qwen model: Qwen3-VL 8B / Qwen2.5-VL 7B / Qwen3 0.6B (Anima); 2560 is Qwen3 4B (Z-Image)
         # and Qwen3-VL 4B (Krea 2), told apart by the vision tower the VL files carry
         if family in ("qwen_image21", "qwen_image", "anima"):
@@ -673,7 +765,7 @@ def companion_fit(family: str, kind: str, hdr: dict) -> bool | None:
             return (not vision) if family == "zimage" else (True if vision else None)
     return None
 # DiT-only families: the model file, a text encoder and a VAE (see COMPANIONS)
-DIT_FAMILIES = ("anima", "qwen_image", "qwen_image21", "krea2", "zimage", "moss_image")
+DIT_FAMILIES = ("anima", "qwen_image", "qwen_image21", "krea2", "zimage", "moss_image", "h3_image")
 # families whose GGUF file is registered as the light generation file ("gen"), paired with the bf16 one if found
 GGUF_FAMILIES = ("qwen_image", "qwen_image21")
 # Folders under models/ that hold model files in the layout this version reads (plus the i2t tool's own folder and

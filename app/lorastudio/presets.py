@@ -46,7 +46,8 @@ _BASE_STEPS = {("sdxl", "character"): 1600, ("sdxl", "style"): 2400,
                ("qwen_image", "character"): 1200, ("qwen_image", "style"): 1600,
                ("qwen_image21", "character"): 1200, ("qwen_image21", "style"): 1600,
                ("zimage", "character"): 1200, ("zimage", "style"): 1600,
-               ("moss_image", "character"): 1200, ("moss_image", "style"): 1600}
+               ("moss_image", "character"): 1200, ("moss_image", "style"): 1600,
+               ("h3_image", "character"): 1200, ("h3_image", "style"): 1600}
 
 
 def auto_steps(family: str, kind: str, n_images: int) -> int:
@@ -125,6 +126,13 @@ def defaults(family: str, kind: str, variant: str, n_images: int, vram_mb: int |
             swap = 28 if vram_mb < 11500 else 16 if vram_mb < 13500 else 0
         d.update(learning_rate=1e-4, network_dim=16, network_alpha=1.0, train_batch_size=1, optimizer_type="AdamW8bit",
                  lr_scheduler="constant", blocks_to_swap=swap, convrot_int8=int8_dit, convrot_int8_text_encoder=int8_te)
+    elif family == "h3_image":
+        # ai-toolkit (arch minimax_h3_image), in its own option names.  The arch's UI defaults (ui.tsx): LoRA rank and
+        # alpha 16; its general defaults: lr 1e-4, adamw8bit, constant schedule, batch 1.  The model is made for 4 MP
+        # and more ("lower resolutions show more artifacts"), so it trains at 2048 (the 4 MP its own samples use).
+        # The step counts are this tool's, as for the other DiT families.  None of this has run in this tool.
+        d.update(learning_rate=1e-4, network_dim=16, network_alpha=16, train_batch_size=1, optimizer_type="adamw8bit",
+                 lr_scheduler="constant", resolution=2048)
     if family in NO_CAPTION_DROPOUT:
         del d["caption_dropout_rate"]   # not shown, not varied in まとめて予約
     return d
@@ -254,19 +262,100 @@ def validate(family: str, values: dict) -> list[str]:
         errs.append("下準備の学習ステップ数は 50 以上にしてください。")
     if "leco_guidance" in values and not (0.1 <= float(values["leco_guidance"]) <= 10):
         errs.append("効果の強さ（学習時）は 0.1〜10 にしてください。")
+    if "caption_dropout_rate" in values:
+        # a rate, not a percentage: 10 (meant as 10%) would drop the caption at every step, and the LoRA would be
+        # trained to the end without its trigger word
+        try:
+            rate = float(values["caption_dropout_rate"])
+        except (TypeError, ValueError):
+            rate = -1.0
+        if not (0 <= rate < 1):
+            errs.append("説明文ドロップアウト率は 0 以上 1 未満の数で入れてください（10% なら 0.1）。")
     return errs
 
 
+# Optimizer names the engines take as written, compared in lower case (sd-scripts library/optimizer.py get_optimizer,
+# musubi-tuner training/trainer_base.py get_optimizer).  Any other name is looked up as a class of torch.optim (case
+# sensitive), or imported as module.Class when it has a dot.
+_SD_OPTIMIZERS = {"adamw", "adamw8bit", "pagedadamw8bit", "pagedadamw", "pagedadamw32bit", "lion", "lion8bit", "pagedlion8bit",
+                  "sgdnesterov", "sgdnesterov8bit", "dadaptation", "dadaptadampreprint", "dadaptadagrad", "dadaptadam",
+                  "dadaptadan", "dadaptadanip", "dadaptlion", "dadaptsgd", "prodigy", "adafactor", "radamschedulefree",
+                  "adamwschedulefree", "sgdschedulefree"}
+_MUSUBI_OPTIMIZERS = {"adamw", "adamw8bit", "adafactor"}
+_TORCH_OPTIMIZERS = {"Adafactor", "Adadelta", "Adagrad", "Adam", "Adamax", "AdamW", "ASGD", "LBFGS", "NAdam", "RAdam", "RMSprop",
+                     "Rprop", "SGD", "SparseAdam"}   # torch.optim.__all__ of the train env (torch 2.8)
+# transformers SchedulerType (case sensitive) plus diffusers' piecewise_constant; "adafactor..." by its prefix;
+# musubi-tuner also has "rex"
+_SCHEDULERS = {"linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup", "inverse_sqrt",
+               "reduce_lr_on_plateau", "cosine_with_min_lr", "cosine_warmup_with_min_lr", "warmup_stable_decay", "greedy",
+               "piecewise_constant"}
+
+
+# ai-toolkit (toolkit/optimizer.py get_optimizer, compared in lower case; dadaptation* / prodigy* by their prefix) and
+# its schedulers (toolkit/scheduler.py get_lr_scheduler)
+AITK_FAMILIES = ("h3_image",)
+_AITK_OPTIMIZERS = {"adam8", "adamw8", "adam8bit", "ademamix8bit", "adamw8bit", "lion8bit", "adam", "adamw", "lion", "adagrad",
+                    "adafactor", "automagic", "automagic2", "automagic3", "automagic4", "automagicexperiment", "adamconvrot"}
+_AITK_SCHEDULERS = {"cosine", "cosine_with_restarts", "step", "constant", "linear", "constant_with_warmup"}
+
+
+def setting_warnings(family: str, values: dict) -> list[str]:
+    """Settings the engine would take but that are probably not what was meant (shown before the start; the start is
+    not refused).  A misspelt optimizer or scheduler name fails only after the model has been loaded."""
+    out = []
+    musubi = family in NO_CAPTION_DROPOUT   # the musubi-tuner families
+    opt = str(values.get("optimizer_type") or "")
+    if family in AITK_FAMILIES:
+        known_opt = opt.lower() in _AITK_OPTIMIZERS or opt.lower().startswith(("dadaptation", "prodigy"))
+    else:
+        known_opt = "." in opt or opt in _TORCH_OPTIMIZERS or opt.lower() in (_MUSUBI_OPTIMIZERS if musubi else _SD_OPTIMIZERS)
+    if opt and not known_opt:
+        out.append(f"オプティマイザー「{opt}」は、この学習エンジンが知っている名前の中にありません。綴りが違うと、モデルを読み込んだ"
+                   "あとで学習が失敗します。入れた名前を確かめてください（初期値に戻すこともできます）。")
+    sch = str(values.get("lr_scheduler") or "")
+    if family in AITK_FAMILIES:
+        known_sch = sch in _AITK_SCHEDULERS
+    else:
+        known_sch = sch in _SCHEDULERS or sch.startswith("adafactor") or (musubi and sch.lower() == "rex")
+    if sch and not known_sch:
+        out.append(f"学習率スケジューラー「{sch}」は、この学習エンジンが知っている名前の中にありません。綴りが違うと、モデルを読み込んだ"
+                   "あとで学習が失敗します。入れた名前を確かめてください（名前は小文字で書きます。例: cosine、constant）。")
+    try:
+        rate = float(values.get("caption_dropout_rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    if 0.5 <= rate < 1:
+        out.append(f"説明文ドロップアウト率が {rate:g} です。学習の半分以上で説明文（呼び出し語を含む）を使わないため、"
+                   "呼び出し語が効きにくい LoRA になる可能性があります。")
+    return out
+
+
+def min_bucket_reso(resolution: int) -> int:
+    """sd-scripts dataset setting: the shortest side a bucket may have.  The engine makes the buckets from the
+    resolution's area with sides from this value up (library/model_util.py make_bucket_resolutions), so with the
+    earlier fixed 512 a run at 512 had one square bucket and a run at 640 none beyond 1.5:1 - images of another
+    shape were cropped to fit, without a word.  Half the resolution keeps the range a 1024 run has (up to 4:1);
+    1024 and above stay at 512, so their buckets (and caches) are as before."""
+    return max(256, min(512, int(resolution) // 2 // 64 * 64))
+
+
 def estimate_disk_gb(family: str, values: dict) -> float:
-    """Rough upper bound of disk use for a run (checkpoints + last 2 resume states + caches).  musubi-tuner runs and
-    texture LoRA runs from image pairs save no resume states (training.saves_state)."""
+    """Rough upper bound of disk use for a run (checkpoints + resume states + caches).  musubi-tuner runs and
+    texture LoRA runs from image pairs save no resume states (training.saves_state).
+    Resume states: with save_last_n_steps_state = 2 x the save interval (training._common_save) sd-scripts keeps the
+    states of the last three save steps (library/checkpoint_io.py save_and_remove_state_stepwise removes the one
+    three intervals back) and writes one more at the end of the run; they stay until the user discards them."""
+    # h3_image: from the training adapter of ai-toolkit (155MB, ranks not stated), a guess
     per_rank_mb = {"sdxl": 7.0, "anima": 4.5, "krea2": 20.0, "qwen_image": 36.0, "qwen_image21": 18.0, "zimage": 9.0,
-                   "moss_image": 9.0}[family]
+                   "moss_image": 9.0, "h3_image": 10.0}[family]
     lora_mb = per_rank_mb * int(values["network_dim"])
     n_ckpt = math.ceil(values["max_train_steps"] / max(1, int(values["save_every_n_steps"]))) + 1   # 0: validate() reports it
-    state_mb = 0 if family in ("krea2", "qwen_image", "qwen_image21", "zimage") or "copy_steps" in values else lora_mb * 3 * 2
+    n_states = min(3, int(values["max_train_steps"]) // max(1, int(values["save_every_n_steps"]))) + 1
+    # ai-toolkit keeps one optimizer.pt (written over at every save)
+    n_states = 1 if family in AITK_FAMILIES else n_states
+    state_mb = 0 if family in ("krea2", "qwen_image", "qwen_image21", "zimage") or "copy_steps" in values else lora_mb * 3 * n_states
     cache_mb = {"sdxl": 600, "anima": 800, "krea2": 3000, "qwen_image": 3000, "qwen_image21": 3000, "zimage": 1500,
-                "moss_image": 2000}[family]
+                "moss_image": 2000, "h3_image": 4000}[family]
     if "copy_steps" in values:   # texture LoRA from image pairs: a merged base model (fp16) lives in the run until it ends
         cache_mb += 7200 + 600
     return round((lora_mb * n_ckpt + state_mb + cache_mb) / 1024 + 1.0, 1)

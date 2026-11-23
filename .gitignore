@@ -1,6 +1,7 @@
 # 公開するものだけを並べる（それ以外はすべて対象外）
 /*
 !/.gitignore
+!/.gitattributes
 !/app/
 !/engines/
 !/envs/

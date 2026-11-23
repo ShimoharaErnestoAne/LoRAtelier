@@ -9,7 +9,7 @@ const main = $("#main");
 
 async function api(path, opts = {}) {
   const o = { method: opts.method || (opts.body ? "POST" : "GET"), headers: {} };
-  if (S.unloading) o.keepalive = true;   // pagehide: the request outlives the page
+  if (S.unloading || opts.keepalive) o.keepalive = true;   // pagehide: the request outlives the page
   if (opts.body instanceof FormData) o.body = opts.body;
   else if (opts.body !== undefined) { o.body = JSON.stringify(opts.body); o.headers["Content-Type"] = "application/json"; }
   let r, text = "";
@@ -17,7 +17,10 @@ async function api(path, opts = {}) {
   try { r = await fetch(path, o); text = await r.text(); } catch { throw new Error("LoRAtelier に接続できません（起動しているか確認してください）"); }
   let data = null, parsed = !text;
   try { if (text) { data = JSON.parse(text); parsed = true; } } catch { /* not JSON */ }
-  if (!r.ok) throw new Error((data && data.detail) || `HTTP ${r.status}`);
+  // FastAPI's own 422 carries a list of {loc, msg}: its messages are shown, not "[object Object]"
+  const dt = data && data.detail;
+  const detail = Array.isArray(dt) ? dt.map((x) => (x && x.msg) || String(x)).join(" / ") : dt && typeof dt === "object" ? JSON.stringify(dt) : dt;
+  if (!r.ok) throw new Error(detail || `HTTP ${r.status}`);
   if (!parsed) throw new Error("LoRAtelier から想定外の応答が返りました（起動し直してから、もう一度試してください）");
   return data;
 }
@@ -132,9 +135,17 @@ function connectEvents() {
   if (eventSrc || document.hidden) return;
   const es = eventSrc = new EventSource("/api/events");
   // connected (again): what ended while no events came is asked for (the i2t page's running job; i2t.js)
-  es.onopen = () => { if (typeof iResync === "function") iResync(); };
+  let opened = false;
+  es.onopen = () => {
+    if (typeof iResync === "function") iResync();
+    // the browser reconnected by itself (PC back from sleep, server restarted): what ended while no events came
+    if (opened) resyncAfterGap();
+    opened = true;
+  };
   es.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
+    if (m.type === "run" && ["done", "failed", "cancelled"].includes(m.status)) noteRunEnd(m);
+    else if (m.type === "pipeline") noteTasksSoon();
     if (m.type === "queue" || (m.type === "run" && m.status)) refreshQueueSoon();
     if (S.route[0] === "jobs" && ["queue", "run", "gen", "imagegen", "eval", "pipeline", "i2t", "download"].includes(m.type)) refreshJobsSoon();
     if (m.type === "download") refreshStatusSoon();   // the header's ダウンロード中 count
@@ -157,8 +168,69 @@ function connectEvents() {
     else if (m.type === "import" && (m.failed || []).length) importFailed(m.failed);
   };
 }
+/* Events were not arriving for a while (tab hidden for long, connection lost): the parts they keep up to date
+   are asked for again. */
+function resyncAfterGap() {
+  refreshStatusSoon();
+  refreshQueueSoon();
+  if (S.project) { refreshImages(); refreshRunsSoon(); }
+  if (S.route[0] === "jobs") refreshJobsSoon();
+  if (S.route[0] === "gen") igReloadSoon();
+  if (S.route[0] === "presets") plReloadSoon();
+}
 let hiddenTimer = null;
+/* A long job that ended (a training run done / failed / stopped, a LoRA creation task done or failed): a toast that
+   opens it, a mark in front of the tab's title while the tab is not looked at, and - only when the user turned it on
+   in 設定 → 表示 - a notification of the browser.  Each ending is told once. */
+const NOTIFY_KEY = "lorastudio_notify";
+const _told = new Set();
+let _titleMark = "";
+function notifyOn() { try { return localStorage.getItem(NOTIFY_KEY) === "1"; } catch { return false; } }
+function tellEnded(key, ok, title, body, hash) {
+  if (_told.has(key)) return;
+  _told.add(key);
+  toast(`${title}: ${body}`, ok ? "" : "err", { label: "開く", fn: () => { location.hash = hash; }, ms: ok ? 15000 : 30000 });
+  if (!document.hidden) return;
+  // the mark stays until the tab is looked at again; a failure is not hidden by a later success
+  if (_titleMark !== "!") _titleMark = ok ? "✓" : "!";
+  document.title = `${_titleMark} ${document.title.replace(/^[✓!] /, "")}`;
+  if (notifyOn() && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    try {
+      const n = new Notification(`LoRAtelier: ${title}`, { body, tag: key });
+      n.onclick = () => { window.focus(); location.hash = hash; n.close(); };
+    } catch { /* the browser refused it: the toast and the title still say so */ }
+  }
+}
+async function noteRunEnd(m) {
+  let name = S.project && S.project.id === m.project ? S.project.name : "";
+  if (!name) { try { name = (await api(`/api/projects/${m.project}`)).name; } catch { name = ""; } }
+  const where = name ? `「${name}」の学習 #${m.run}` : `学習 #${m.run}`;
+  const text = { done: "完了しました。結果タブで比較画像を確かめられます", failed: "失敗しました。学習の履歴で原因を確かめられます",
+                 cancelled: "止まりました" }[m.status];
+  tellEnded(`run:${m.project}:${m.run}`, m.status === "done", where, text,
+    m.status === "done" ? `#/p/${m.project}/results` : `#/p/${m.project}/train`);
+}
+let _taskSeen = null;   // task id -> status, as last asked (null: not asked yet, nothing is told for the first answer)
+const noteTasksSoon = debounce(async () => {
+  let d;
+  try { d = await api("/api/tasks"); } catch { return; }
+  const first = _taskSeen === null;
+  const seen = _taskSeen || new Map();
+  for (const t of d.tasks || []) {
+    const before = seen.get(t.id);
+    seen.set(t.id, t.status);
+    if (first || before === t.status || !["done", "failed"].includes(t.status)) continue;
+    // a task that ended with its training: the run's own ending has said it already
+    if (t.status === "done" && t.run != null && _told.has(`run:${t.project}:${t.run}`)) continue;
+    tellEnded(`task:${t.id}`, t.status === "done", `LoRA 作成タスク${t.project_name ? `「${t.project_name}」` : ""}`,
+      t.status === "done" ? "完了しました" : `失敗しました（${t.message || "理由はジョブのページで確かめられます"}）`, "#/jobs");
+  }
+  _taskSeen = seen;
+}, 600);
+noteTasksSoon();   // the tasks as they are now, so that only what ends from here on is told
+
 document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && _titleMark) { _titleMark = ""; document.title = document.title.replace(/^[✓!] /, ""); }
   clearTimeout(hiddenTimer);
   if (document.hidden) {
     hiddenTimer = setTimeout(() => { if (document.hidden && eventSrc) { eventSrc.close(); eventSrc = null; } }, 5 * 60 * 1000);
@@ -166,10 +238,7 @@ document.addEventListener("visibilitychange", () => {
   }
   if (eventSrc) return;
   connectEvents();
-  refreshStatusSoon();
-  if (S.project) { refreshImages(); refreshRunsSoon(); }
-  if (S.route[0] === "gen") igReloadSoon();
-  if (S.route[0] === "presets") plReloadSoon();
+  resyncAfterGap();
 });
 const refreshStatusSoon = debounce(refreshStatus, 300);
 
@@ -182,6 +251,14 @@ async function refreshStatus() {
   try { S.status = await api("/api/status"); } catch { return; }
   const st = S.status, jp = $("#jobpill"), ap = $("#aipill");
   document.documentElement.classList.toggle("blurimg", st.blur_images === true);
+  const rec = st.settings_recovered;
+  if (rec && !S.recoveredShown) {   // settings.json could not be read at this start: said once, until closed
+    S.recoveredShown = true;
+    toast(rec.restored
+      ? `設定ファイル（settings.json）が壊れていたため、1 つ前に保存した内容で起動しました。最後に変えた設定が戻っている場合があります。壊れていたファイルは ${rec.broken} に残してあります。`
+      : `設定ファイル（settings.json）が壊れていて、1 つ前に保存した内容も読めなかったため、初期設定で起動しました。モデルの登録やデータの置き場所は、設定画面で設定し直してください。壊れていたファイルは ${rec.broken} に残してあります。`,
+      "err", { label: "閉じる", fn: () => {}, ms: 30 * 60 * 1000 });
+  }
   if (st.job) {
     const p = st.job.progress || {};
     jp.hidden = false;
@@ -370,10 +447,12 @@ async function importProjects(files) {
     _importing = file;
     busy(true);
     drawImportBusy(file);
-    const fd = new FormData();
-    fd.append("file", file);
     try {
-      const p = await api("/api/projects/import", { body: fd });
+      // the file itself as the body: written once into the projects folder (not first to C:'s temporary folder)
+      const r = await fetch("/api/projects/import_raw", { method: "POST", body: file });
+      let p = null;
+      try { p = await r.json(); } catch { /* not JSON */ }
+      if (!r.ok) throw new Error((p && p.detail) || `HTTP ${r.status}`);
       done++;
       const lo = p.loras || { added: [], failed: [] };
       toast(`「${p.name}」をプロジェクトとして取り込みました` + (lo.added.length ? `。LoRA ${lo.added.length} 個（${lo.added.join("、")}）を LoRA の一覧に加えました` : ""),
@@ -486,7 +565,7 @@ function newForm(kind, models, source, target) {
   if (source === "generate") return newGenForm(kind);
   if (source === "multi") return newMultiForm(models);
   if (kind === "enhance") return newEnhanceForm(models, target === "slider");
-  const ms = models.models.filter((m) => !m.missing.length);
+  const ms = models.models.filter((m) => !m.missing.length && m.variant_info.train !== false);
   $("#newform").innerHTML = `<div class="panel" style="margin-bottom:20px">
     <h2>${kind === "concept" && target ? "衣装・物・場所・ポーズ・表情" : KIND_LABEL[kind]} LoRA を作成</h2>
     <div class="form">
@@ -532,7 +611,7 @@ async function enhanceCatalog() {
 async function newMultiForm(models) {
   let list;
   try { list = (await api("/api/projects")).filter((p) => p.kind === "character" && p.source !== "multi" && !p.error); } catch (e) { return fail(e); }
-  const ms = models.models.filter((m) => !m.missing.length);
+  const ms = models.models.filter((m) => !m.missing.length && m.variant_info.train !== false);
   $("#newform").innerHTML = `<div class="panel" style="margin-bottom:20px">
     <h2>複数キャラ LoRA を作成</h2>
     <div class="muted small">選んだキャラクター LoRA のプロジェクトの採用画像・説明文・呼び出し語を、そのまま使って 1 つの LoRA にします。
@@ -724,9 +803,14 @@ async function openProject(pid, tab) {
     const sel = $("#ph-model");
     if (!sel || S.project.id !== pid) return;
     const usable = d.models.filter((m) => !m.missing.length && m.variant_info.train !== false && m.variant_info.available !== false);
-    sel.innerHTML = (S.project.model_id ? "" : `<option value="">選んでください</option>`) + usable.map((m) =>
+    // the project's model is gone or cannot train (unregistered, file missing): said so, instead of showing the
+    // first model of the list as if it were chosen (choosing that one would not even fire "change")
+    const known = usable.some((m) => m.id === S.project.model_id);
+    sel.innerHTML = (!S.project.model_id ? `<option value="">選んでください</option>`
+      : known ? "" : `<option value="" selected>今のモデルは使えません。選んでください</option>`) + usable.map((m) =>
       `<option value="${m.id}" ${m.id === S.project.model_id ? "selected" : ""}>${esc(m.name)}（${esc(m.variant_info.label || m.family)}）</option>`).join("");
     sel.onchange = async () => {
+      if (!sel.value && S.project.model_id) return;   // the "cannot be used" line is not a choice
       await saveMeta({ model_id: sel.value || null }, "LoRA を作るモデルを変えました（次の学習から使われます）");
       if (!S.project || S.project.id !== pid) return;
       if ((S.project.reset_settings || []).length) toast(`前のモデル向けの設定（${S.project.reset_settings.join("、")}）を初期値に戻しました`);
@@ -822,6 +906,7 @@ function renderMaterial() {
         </div>
         <div id="m-gen"></div>
         <div id="m-report"></div>
+        <div id="m-similar"></div>
         <div id="m-tags"></div>
         <div class="toolbar"><div class="chips" id="m-filters"></div><div class="spacer"></div>
           <input type="text" id="m-search" value="${esc(S.search)}" placeholder="説明文・タグで絞り込み" style="width:180px"></div>
@@ -837,7 +922,9 @@ function renderMaterial() {
   $("#m-tags-open").onclick = () => { S.tagsOpen = !S.tagsOpen; drawTagList(); };
   if ($("#m-capmode")) $("#m-capmode").onchange = async (e) => {
     try {
-      S.project = await api(`/api/projects/${S.project.id}`, { method: "PATCH", body: { caption_mode: e.target.value } });
+      const pid = S.project.id, p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { caption_mode: e.target.value } });
+      if (!S.project || S.project.id !== pid) return;   // another page meanwhile: its project must not come back
+      S.project = p;
       toast("説明文の作り方を変えました。手で直した説明文はそのまま残し、ほかの自動説明文を作り直します");
       refreshImages();
     } catch (err) { fail(err); }
@@ -925,8 +1012,10 @@ const refreshImages = debounce(async () => {
   _imgFailed = false;
   if (my !== _imgReq || !S.project || S.project.id !== pid) return;
   S.images = d.images; S.report = d.report; S.history = d.history; S.refs = d.reference_ids || [];
+  S.simGroups = d.similar_groups || [];
+  countChecks();
   if (!$("#m-grid")) return;
-  drawReport(); drawGrid(); drawBulk(); drawUndo(); drawTagList();
+  drawReport(); drawGrid(); drawBulk(); drawUndo(); drawTagList(); drawSimilar();
   if (S.focus != null) {
     const im = S.images.find((x) => x.id === S.focus);
     if (im && (!S.detail || detailSig(im) !== S.detailSig)) loadDetail(S.focus, true);
@@ -972,8 +1061,11 @@ function drawReport() {
     const n = k === "attention" || k === "all" ? S.images.length : k === "used" ? used : k === "unused" ? S.images.length - used : (c[k] || 0);
     if (!["attention", "all", "used", "unused"].includes(k) && !n) return "";
     return `<span class="chip ${S.filter === k ? "on" : ""}" data-f="${k}">${label} ${n}</span>`;
-  }).join(""));
+  }).join("") + ((S.checkCounts || []).length ? `<select id="m-reason" title="注意や問題の理由ごとに、その画像だけを表示します。表示した画像は、上の一括の操作でまとめて採用・除外できます">
+      <option value="">理由で絞る…</option>${S.checkCounts.map(([k, e]) =>
+        `<option value="chk:${esc(k)}" ${S.filter === "chk:" + k ? "selected" : ""}>${esc(e.label)} ${e.n}</option>`).join("")}</select>` : ""));
   $$("#m-filters .chip").forEach((ch) => ch.onclick = () => { S.filter = ch.dataset.f; trimSelection(); drawReport(); drawGrid(); drawBulk(); });
+  if ($("#m-reason")) $("#m-reason").onchange = (e) => { S.filter = e.target.value || "attention"; trimSelection(); drawReport(); drawGrid(); drawBulk(); };
   const sug = (rep.coverage || {}).concept_suggest || [];
   const nMissing = S.images.filter((i) => (i.checks || []).some((x) => x.key === "missing")).length;
   setHTML($("#m-report"), (nMissing ? `<div class="notes"><div class="note warn">元画像が見つからない画像が ${nMissing} 枚あります。移動したときは、今の場所を指定すると戻せます。
@@ -987,11 +1079,58 @@ function drawReport() {
   $$("[data-addc]", $("#m-report")).forEach((b) => b.onclick = async () => {
     const words = (S.project.concept_words || []).concat([b.dataset.addc]);
     try {
-      S.project = await api(`/api/projects/${S.project.id}`, { method: "PATCH", body: { concept_words: words } });
+      const pid = S.project.id, p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { concept_words: words } });
+      if (!S.project || S.project.id !== pid) return;
+      S.project = p;
       if ($("#ph-concept")) $("#ph-concept").value = S.project.concept_words.join(", ");
       toast(`「${b.dataset.addc}」を覚えさせたい${conceptUI(S.project).noun}に加えました（自動説明文を作り直します）`);
       refreshImages();
     } catch (e) { fail(e); }
+  });
+}
+
+/* 似ている組: the images the checks call the same file or very similar, in groups (server _similar_groups).  One of
+   a group is kept and the others excluded with one press; it is an ordinary edit (undoable), nothing is excluded
+   automatically and no file is deleted. */
+function drawSimilar() {
+  const el = $("#m-similar");
+  if (!el) return;
+  const byId = new Map(S.images.map((i) => [i.id, i]));
+  const groups = (S.simGroups || []).map((g) => g.filter((id) => byId.has(id))).filter((g) => g.length > 1);
+  if (!groups.length) { setHTML(el, ""); return; }
+  const pid = S.project.id;
+  const head = `<div class="row"><b>似ている組が ${groups.length} 組あります</b>
+      <span class="muted small">同じファイルか、とてもよく似た画像の組です。同じような画像が多いと、その構図に偏って覚えやすくなります。表情や角度が違う画像は、残す価値があります。</span>
+      <div class="spacer"></div><button class="small" id="m-sim-toggle">${S.simOpen ? "閉じる" : "組を見る"}</button></div>`;
+  const body = !S.simOpen ? "" : groups.map((g, gi) => `<div class="simgroup" style="margin-top:8px"><div class="small muted">組 ${gi + 1}（${g.length} 枚）</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px">${g.map((id) => {
+        const im = byId.get(id);
+        return `<div class="simitem" style="text-align:center">
+          <img src="/api/projects/${pid}/thumb/${id}" alt="" loading="lazy" data-simfocus="${id}" title="#${id} ${esc(im.name)}（クリックで詳細）"
+            style="width:110px;height:110px;object-fit:cover;border-radius:6px;cursor:pointer;${im.use ? "" : "opacity:.45"}">
+          <div class="small">#${id}${im.use ? "" : "（不採用）"}</div>
+          <button class="small" data-simkeep="${gi}:${id}" title="この画像は採用のままにして、組のほかの画像を除外します（元に戻せます）">この画像だけ残す</button></div>`;
+      }).join("")}</div></div>`).join("");
+  if (!setHTML(el, `<div class="panel" style="margin-bottom:10px">${head}${body}</div>`)) return;
+  $("#m-sim-toggle").onclick = () => { S.simOpen = !S.simOpen; drawSimilar(); };
+  $$("[data-simfocus]", el).forEach((im) => im.onclick = () => {
+    const id = +im.dataset.simfocus;
+    S.sel.clear(); S.sel.add(id); S.focus = id; drawGrid(); drawBulk(); loadDetail(id);
+  });
+  $$("[data-simkeep]", el).forEach((b) => b.onclick = async () => {
+    const [gi, keep] = b.dataset.simkeep.split(":").map(Number);
+    const others = groups[gi].filter((id) => id !== keep);
+    b.disabled = true; b.textContent = "除外しています…";
+    try {
+      await flushCaption();
+      const changes = [{ id: keep, field: "decision", value: "use" }, ...others.map((id) => ({ id, field: "decision", value: "exclude" }))];
+      optimistic([keep], (im) => { im.decision = "use"; im.use = true; });
+      optimistic(others, (im) => { im.decision = "exclude"; im.use = false; });
+      const r = await api(`/api/projects/${pid}/edit`, { body: { label: `似ている組で #${keep} だけ残す（${others.length}枚を除外）`, changes } });
+      if (!S.project || S.project.id !== pid) return;
+      S.history = r.history; drawUndo(); drawSimilar();
+      toast(`#${keep} を残して、${others.length} 枚を除外しました（元画像は消していません）`, "", { label: "元に戻す", fn: () => undoRedo("undo") });
+    } catch (e) { b.disabled = false; b.textContent = "この画像だけ残す"; fail(e); refreshImages(); }
   });
 }
 
@@ -1092,12 +1231,31 @@ function drawTagList() {
   });
 }
 
+/* The reasons the checks give (a warning or a problem, by its key), counted once each time the image list is
+   fetched: 「理由で絞る」 shows the images of one reason, so the bulk buttons act on them only. */
+function countChecks() {
+  const m = new Map();
+  for (const im of S.images) {
+    for (const k of new Set((im.checks || []).filter((c) => c.status === "warn" || c.status === "bad").map((c) => c.key))) {
+      const c = (im.checks || []).find((x) => x.key === k);
+      const e = m.get(k) || { label: c.label, n: 0 };
+      e.n++;
+      m.set(k, e);
+    }
+  }
+  S.checkCounts = [...m.entries()].sort((a, b) => b[1].n - a[1].n);
+  // the reason chosen is gone (the images were fixed or removed): back to the default list
+  if (String(S.filter).startsWith("chk:") && !m.has(S.filter.slice(4))) S.filter = "attention";
+}
+const hasReason = (im, key) => (im.checks || []).some((c) => c.key === key && (c.status === "warn" || c.status === "bad"));
+
 function visibleImages() {
   let list = S.images.slice();
   const f = S.filter;
-  if (f === "used") list = list.filter((i) => i.use);
+  if (String(f).startsWith("chk:")) list = list.filter((i) => hasReason(i, f.slice(4)));
+  else if (f === "used") list = list.filter((i) => i.use);
   else if (f === "unused") list = list.filter((i) => !i.use);
-  else if (!["attention", "all"].includes(f)) list = list.filter((i) => i.verdict === f);
+  else if (!["attention", "all"].includes(f) && !String(f).startsWith("chk:")) list = list.filter((i) => i.verdict === f);
   if (S.search) list = list.filter((i) => (i.caption + " " + i.tags.join(" ") + " " + i.name).toLowerCase().includes(S.search));
   if (f === "attention") list.sort((a, b) => (VORDER[a.verdict] - VORDER[b.verdict]) || (a.id - b.id));
   return list;
@@ -1331,7 +1489,11 @@ async function loadDetail(id, soft = false) {
   }
   if (!soft) box.innerHTML = `<div class="muted">読み込み中…</div>`;
   let d;
-  try { d = await api(`/api/projects/${S.project.id}/images/${id}`); } catch (e) { return fail(e); }
+  try { d = await api(`/api/projects/${S.project.id}/images/${id}`); }
+  catch (e) {
+    if (!soft && my === _detReq && box.isConnected) box.innerHTML = `<div class="err small">${esc(e.message)}</div>`;
+    return fail(e);
+  }
   if (my !== _detReq || S.focus !== id) return;
   // keep the user's in-progress caption edit
   const ta = $("#d-cap");
@@ -1556,7 +1718,9 @@ const refreshStartBar = debounce(async () => {
   const el = $("#m-start");
   if (!el || !S.project) return;
   let plan;
-  try { plan = await api(`/api/projects/${S.project.id}/train/plan`); } catch (e) { el.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+  const pid = S.project.id;
+  try { plan = await api(`/api/projects/${pid}/train/plan`); } catch (e) { el.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+  if (!S.project || S.project.id !== pid || $("#m-start") !== el) return;   // another page meanwhile
   S.plan = plan;
   const pf = plan.preflight;
   const [running, reserved] = trainingState(S.project.id);
@@ -1685,6 +1849,7 @@ async function renderGen() {
   } catch (e) { if ($("#m-gen") === el) el.innerHTML = `<div class="panel gen err">${esc(e.message)}</div>`; return; }
   // another project or tab was opened meanwhile: this answer is the previous project's recipe, not drawn (nor saved from)
   if (!S.project || S.project.id !== pid || $("#m-gen") !== el) return;
+  if (!S.genOpen) { el.innerHTML = ""; return; }   // closed while it was loading
   S.gen = gen; S.lib = lib;
   drawGenForm();
   drawGenBatches();
@@ -1696,26 +1861,30 @@ function genModelLabel(m) {
 }
 
 /* 画像生成 / LoRA 作成: 検証済み once it worked on this PC (an image generated with the model; comparison images made
-   with a LoRA trained on it), 未確認 until then.  Nothing says a model "may not work". */
-function modelChecksHtml(checked) {
+   with a LoRA trained on it), 未確認 until then.  Nothing says a model "may not work".
+   lora false: a model no LoRA can be made on has no LoRA 作成 mark. */
+function modelChecksHtml(checked, lora = true) {
   const c = checked || {};
   const one = (k, label, how) => c[k]
     ? `<span style="color:var(--ok)" title="${esc(new Date(c[k] * 1000).toLocaleString("ja-JP"))} にこの PC で動きました">${label} 検証済み</span>`
     : `<span class="muted" title="${esc(how)}">${label} 未確認</span>`;
-  return `<span class="small">${one("gen", "画像生成", "このモデルで画像を 1 回生成すると「検証済み」になります")} ・ ${one("lora", "LoRA 作成", "このモデルで学習した LoRA の比較画像ができると「検証済み」になります")}</span>`;
+  return `<span class="small">${one("gen", "画像生成", "このモデルで画像を 1 回生成すると「検証済み」になります")}${lora ? ` ・ ${one("lora", "LoRA 作成", "このモデルで学習した LoRA の比較画像ができると「検証済み」になります")}` : ""}</span>`;
 }
 
 const GEN_FAMILIES = ["sdxl", "anima", "qwen_image", "qwen_image21", "krea2", "zimage", "moss_image"];
+// 画像生成 also takes MiniMax H3-Image; 素材の生成 does not (its license does not allow its images to train another
+// model).  A LoRA can be made on it (experimental, ai-toolkit) from material made otherwise.
+const IMAGE_FAMILIES = [...GEN_FAMILIES, "h3_image"];
 
 /* Generation models grouped by the folder their file is in, labelled by file name, so every checkpoint
    placed in models\checkpoints (or an added folder) can be picked individually. */
-function genModelOptions(lib, selected) {
+function genModelOptions(lib, selected, families = GEN_FAMILIES) {
   const groups = {};
   const add = (path, html) => {
     const dir = path.split(/[\\/]/).slice(0, -1).join("\\");
     (groups[dir] = groups[dir] || []).push([path.split(/[\\/]/).pop(), html]);
   };
-  for (const m of lib.models.filter((x) => GEN_FAMILIES.includes(x.family))) {
+  for (const m of lib.models.filter((x) => families.includes(x.family))) {
     const f = m.files.gen || m.files.turbo || m.files.ckpt || "";   // Krea 2 registers its generation file as "turbo"
     const v = m.variant_info && m.variant_info.label;
     // 学習 対応 / 非対応: the checks made before training starts (train_errors), the reasons on hover
@@ -1727,9 +1896,11 @@ function genModelOptions(lib, selected) {
   for (const c of lib.checkpoints || []) {
     if (c.model_id) continue;
     const name = c.path.split(/[\\/]/).pop();
-    add(c.path, GEN_FAMILIES.includes(c.family) && (!c.gguf || ["qwen_image", "qwen_image21"].includes(c.family))
+    add(c.path, families.includes(c.family) && (!c.gguf || ["qwen_image", "qwen_image21"].includes(c.family))
       ? `<option value="file:${esc(c.path)}">${esc(name)}（${esc(c.family_label)}・未設定）</option>`
-      : `<option disabled title="${esc(c.evidence || "")}">${esc(name)}（使えません: ${esc(c.evidence || "種類を判別できません")}）</option>`);
+      : IMAGE_FAMILIES.includes(c.family) && !c.gguf
+        ? `<option disabled title="${esc(c.family_label)} は画像生成の画面で使えます">${esc(name)}（${esc(c.family_label)}・素材の生成には使えません）</option>`
+        : `<option disabled title="${esc(c.evidence || "")}">${esc(name)}（使えません: ${esc(c.evidence || "種類を判別できません")}）</option>`);
   }
   return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)).map(([dir, items]) =>
     `<optgroup label="${esc(dir)}">${items.sort((a, b) => a[0].localeCompare(b[0])).map((x) => x[1]).join("")}</optgroup>`).join("");
@@ -1748,7 +1919,7 @@ async function pickFileModel(sel, then) {
   const done = async (id) => {
     box.querySelector(".pickfile")?.remove();
     S.lib = await api("/api/library");
-    sel.innerHTML = `<option value="">選んでください</option>${genModelOptions(S.lib, id)}`;
+    sel.innerHTML = `<option value="">選んでください</option>${genModelOptions(S.lib, id, sel.id === "ig-model" ? IMAGE_FAMILIES : GEN_FAMILIES)}`;
     await then(id);
   };
   try {
@@ -1818,6 +1989,8 @@ function drawGenForm() {
   const exp = new Set(r.exclude_poses || []);
   const exg = new Set(r.exclude_groups || []);
   const trainSel = S.project.model_id || "";
+  // the same condition as the header's list: files present, and a LoRA can be made on it
+  const trainable = models.filter((m) => !(m.missing || []).length && (m.variant_info || {}).train !== false && (m.variant_info || {}).available !== false);
   const isStyle = S.project.kind === "style";
   el.innerHTML = `<div class="panel gen">
     <div class="row"><h2 style="margin:0">AI で素材を生成</h2>
@@ -1835,7 +2008,7 @@ function drawGenForm() {
       <label>プロンプト</label><textarea id="g-pos" rows="8" placeholder="${isStyle ? "例: watercolor, soft colors, thick outlines, flat color, masterpiece, best quality" : "例: 1girl, silver hair, long hair, red eyes, white dress, masterpiece, best quality"}">${esc(r.positive || "")}</textarea>
       <label></label><div class="small" id="g-trig"></div>
       <label>ネガティブ</label><textarea id="g-neg" rows="5" placeholder="例: lowres, bad anatomy, bad hands, watermark">${esc(r.negative || "")}</textarea>
-      <label>LoRA を作るモデル</label><div class="row"><select id="g-train"><option value="">生成モデルと同じ</option>${models.map((m) => `<option value="${m.id}" ${m.id === trainSel ? "selected" : ""}>${esc(genModelLabel(m))}</option>`).join("")}</select>
+      <label>LoRA を作るモデル</label><div class="row"><select id="g-train"><option value="">生成モデルと同じ</option>${trainable.some((m) => m.id === trainSel) || !trainSel ? "" : `<option value="${esc(trainSel)}" selected>今のモデルは使えません。選んでください</option>`}${trainable.map((m) => `<option value="${m.id}" ${m.id === trainSel ? "selected" : ""}>${esc(genModelLabel(m))}</option>`).join("")}</select>
         <span class="muted small">学習の土台にするモデルです。生成モデルと別のものも選べます。</span></div>
       <label>枚数</label><div class="row">${(() => {
         const n = r.count || 48, preset = [24, 48, 72].includes(n);
@@ -1883,7 +2056,11 @@ function drawGenForm() {
   $("#g-pos").addEventListener("input", debounce(() => drawTrigPreview("#g-loras", "#g-pos", "#g-trig"), 200));
   $$("#g-pos, #g-neg").forEach((x) => attachTagComplete(x, { escape: true, sep: true, moss: () => modelFamily($("#g-model")?.value || S.project.model_id) === "moss_image" }));
   $("#g-train").onchange = async (e) => {
-    try { S.project = await api(`/api/projects/${S.project.id}`, { method: "PATCH", body: { model_id: e.target.value || readRecipe().gen_model_id || null } });
+    const pid = S.project.id;
+    try {
+      const p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { model_id: e.target.value || readRecipe().gen_model_id || null } });
+      if (!S.project || S.project.id !== pid) return;
+      S.project = p;
       toast("LoRA を作るモデルを変更しました"); refreshStartBar(); } catch (err) { fail(err); }
   };
   $("#g-start").onclick = startGen;
@@ -2124,7 +2301,8 @@ function genDrawInit() {
         <input type="number" id="g-den" min="0.05" max="1" step="0.05" style="width:80px" value="${esc(r.denoise ?? 0.75)}">
         <span class="muted small">小さいほど元画像に近くなります。小さすぎると、どの画像も元画像と同じポーズ・アングルになり、学習の素材として偏ります（0.7〜0.85 を目安に）。</span></div>` : ""}
     <div class="row" style="margin-top:4px">${list.length < GEN_SRC_MAX ? `<button class="small" id="g-init-pick">${list.length ? "元画像を追加" : "画像を選ぶ"}</button>` : ""}
-      <span class="muted small">画像をここにドロップするか、貼り付ける（Ctrl+V）と、その画像をもとに素材を生成します（I2I、${GEN_SRC_MAX} 枚まで）。
+      <span class="muted small">画像をここにドロップするか、マウスをこの枠に乗せて貼り付ける（Ctrl+V）と、その画像をもとに素材を生成します（I2I、${GEN_SRC_MAX} 枚まで）。
+        枠の外で貼り付けた画像は、素材に加わります。
         複数入れると 1 枚ずつ順に使います。アングル・表情などの指定はそのまま足します。背景のある元画像では、背景が残ることがあります。</span>
       <input type="file" id="g-init-file" accept="image/*" multiple hidden></div>`;
   const pick = $("#g-init-pick");
@@ -2159,8 +2337,11 @@ async function genAddInit(files) {
   S.gen.recipe = { ...readRecipe(), init_images: names };
   genDrawInit(); saveRecipe();
 }
+/* Ctrl+V on the material tab adds material (as its toolbar says); an image goes to the source images of material
+   generation only when it is pasted with the mouse over their box. */
 document.addEventListener("paste", (e) => {
-  if (!$("#g-init") || ["INPUT", "TEXTAREA"].includes((document.activeElement || {}).tagName)) return;
+  const box = $("#g-init");
+  if (!box || !box.matches(":hover") || ["INPUT", "TEXTAREA"].includes((document.activeElement || {}).tagName)) return;
   const files = [...(e.clipboardData ? e.clipboardData.items : [])].filter((x) => x.type.startsWith("image/")).map((x) => x.getAsFile());
   if (files.length) { e.preventDefault(); genAddInit(files); }
 });
@@ -2202,16 +2383,15 @@ function genModelPending() {
 }
 
 async function startGen() {
-  const b = $("#g-start"), n = genCount();
+  const b = $("#g-start"), n = genCount(), pid = S.project.id;
   if (genModelPending()) return;
   if (!(n >= 1 && n <= GEN_MAX)) return toast(`枚数は 1〜${GEN_MAX} 枚で指定してください`, "err");
   b.disabled = true;
   try {
     if (!(await saveRecipe())) throw new Error("生成の設定を保存できなかったため、開始しませんでした");
-    const r = await api(`/api/projects/${S.project.id}/gen/start`, { body: { count: n } });
+    const r = await api(`/api/projects/${pid}/gen/start`, { body: { count: n } });
     toast(`生成 #${r.batch_id} を開始しました`);
-    S.genBatch = r.batch_id;
-    await reloadGen();
+    if (S.project && S.project.id === pid) { S.genBatch = r.batch_id; await reloadGen(); }
   } catch (e) { fail(e); }
   b.disabled = false;
 }
@@ -2224,13 +2404,13 @@ function genCount() {
 
 /* One button for the whole way: registers a LoRA creation task (generate -> add -> analyse -> train). */
 async function startAuto() {
-  const b = $("#g-auto"), n = genCount();
+  const b = $("#g-auto"), n = genCount(), pid = S.project.id;
   if (genModelPending()) return;
   if (!(n >= 1 && n <= GEN_MAX)) return toast(`枚数は 1〜${GEN_MAX} 枚で指定してください`, "err");
   b.disabled = true;
   try {
     if (!(await saveRecipe())) throw new Error("生成の設定を保存できなかったため、登録しませんでした");
-    const r = await api(`/api/projects/${S.project.id}/tasks`, { body: { gen_count: n } });
+    const r = await api(`/api/projects/${pid}/tasks`, { body: { gen_count: n } });
     toast(r.ahead > 0 ? `全自動の作成を登録しました（${n} 枚）。前に ${r.ahead} 件あり、順番が来たら始まります。` : `全自動の作成を始めました（${n} 枚）。`,
       "", { label: "ジョブを開く", fn: () => { location.hash = "#/jobs"; } });
   } catch (e) { fail(e); }
@@ -2748,7 +2928,12 @@ function maskPanelHtml(m) {
 
 function bindMaskPanel(m) {
   const save = async (mask) => {
-    try { S.project = await api(`/api/projects/${S.project.id}`, { method: "PATCH", body: { mask } }); loadPlan(); } catch (e) { fail(e); }
+    const pid = S.project.id;
+    try {
+      const p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { mask } });
+      if (!S.project || S.project.id !== pid) return;
+      S.project = p; loadPlan();
+    } catch (e) { fail(e); }
   };
   if ($("#t-mask-on")) $("#t-mask-on").onchange = (e) => save({ on: e.target.checked, floor: m.floor });
   if ($("#t-mask-floor")) $("#t-mask-floor").onchange = (e) => {
@@ -2764,13 +2949,16 @@ function bindMaskPanel(m) {
 let ovChain = Promise.resolve(), ovPending = 0;
 function saveOverrides(change) {
   const pid = S.project.id;
+  // asked for while the page is closing (a field committed by pagehide): the request below is sent a moment
+  // later, when S.unloading is already off again, so it is told here to outlive the page
+  const leaving = !!S.unloading;
   ovPending++;
   ovChain = ovChain.then(async () => {
     if (!S.project || S.project.id !== pid) return;
     const ov = { ...(S.project.train_overrides || {}) };
     change(ov);
     try {
-      const p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { train_overrides: ov } });
+      const p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { train_overrides: ov }, keepalive: leaving });
       if (S.project && S.project.id === pid) S.project = p;
     } catch (e) { fail(e); }
   }).finally(() => { if (--ovPending === 0 && S.project && S.project.id === pid) loadPlan(); });
@@ -2899,13 +3087,18 @@ async function drawSources() {
   $$("[data-apply]", el).forEach((b) => b.onclick = async () => {
     const [type, id] = b.dataset.apply.split(":");
     b.disabled = true;
+    const pid = S.project.id;
     try {
-      const r = await api(`/api/projects/${S.project.id}/train/apply`, { body: { [type === "preset" ? "preset_id" : "project_id"]: id, fixed_steps: $("#t-fixed").checked } });
+      const r = await api(`/api/projects/${pid}/train/apply`, { body: { [type === "preset" ? "preset_id" : "project_id"]: id, fixed_steps: $("#t-fixed").checked } });
+      if (!S.project || S.project.id !== pid) return;
       S.project = r.project;
       el.innerHTML = "";
       loadPlan();
       toast("設定を読み込みました。詳細設定で内容を確かめてください。", "", { label: "元に戻す", fn: async () => {
-        try { S.project = await api(`/api/projects/${S.project.id}/train/restore`, { body: r.previous }); loadPlan(); } catch (e) { fail(e); }
+        try {
+          const p = await api(`/api/projects/${pid}/train/restore`, { body: r.previous });
+          if (S.project && S.project.id === pid) { S.project = p; loadPlan(); }
+        } catch (e) { fail(e); }
       } });
     } catch (e) { fail(e); b.disabled = false; }
   });
@@ -3112,7 +3305,9 @@ async function drawRemodel(pid) {
   go.onclick = async () => {
     go.disabled = true;
     try {
-      S.project = await api(`/api/projects/${pid}`, { method: "PATCH", body: { model_id: $("#rm-model").value } });
+      const p = await api(`/api/projects/${pid}`, { method: "PATCH", body: { model_id: $("#rm-model").value } });
+      if (!S.project || S.project.id !== pid) return;
+      S.project = p;
       const reset = S.project.reset_settings || [];
       toast(`LoRA を作るモデルを ${S.project.model ? S.project.model.name : "選んだモデル"} に変えました。「学習」で学習を始めてください` +
         (reset.length ? `（前のモデル向けの設定 ${reset.join("、")} は初期値に戻しました）` : ""));
@@ -3138,6 +3333,10 @@ async function renderResults(soft = false) {
   const ev = evals.find((e) => e.id === S.resultsEv) || evals.find((e) => e.status === "done" || e.status === "running") || evals[0];
   const ckpts = run.checkpoints.filter((c) => c.kind === "lora");
   const kept = soft ? formState(body) : null;
+  // a background redraw (another run saved a checkpoint) keeps what the user's last action printed for this run:
+  // the export result with its 「学習データを破棄しますか」 and the opened hints
+  const printed = soft && S.resShown && S.resShown.pid === pid && S.resShown.run.id === run.id
+    ? ["x-res", "fix-out"].map((id) => $("#" + id, body)).filter((n) => n && n.childNodes.length) : [];
   S.rcForm = kept;   // "回どうしを比べる" is drawn after a request: it restores its part itself
   body.innerHTML = `
     <div class="row" style="margin-bottom:10px">
@@ -3160,6 +3359,7 @@ async function renderResults(soft = false) {
   drawRunPicker(usable);
   drawExport(run, ckpts);
   drawFix(run, ev);
+  printed.forEach((n) => { const cur = $("#" + n.id, body); if (cur) cur.replaceWith(n); });
   drawRemodel(pid);
   S.resShown = { pid, run, ckpts, evId: ev ? ev.id : null, evIds: evals.map((e) => e.id), el: $("#r-cmp") };
   if (kept) { restoreForm(body, kept); if ($("#m-str")) $("#m-str").dispatchEvent(new Event("input")); }   // recounts the images
@@ -3311,6 +3511,8 @@ function ckLabel(k, ckpts) {
 
 function drawCompare(run, ev, ckpts) {
   const el = $("#r-cmp");
+  // a choice made in another run (opened from 「結果を見る」, or the run was deleted) is not a choice in this one
+  if (S.picked && S.picked.run !== run.id) S.picked = null;
   if (!ev) { el.innerHTML = `<div class="muted">比較画像はまだありません。下の「比較を追加」から生成できます。</div>`; return; }
   if (ev.status === "failed") { el.innerHTML = `<div class="err">比較画像の生成に失敗しました: ${esc(ev.error || "")}</div>`; return; }
   const res = ev.results || {};
@@ -3319,7 +3521,7 @@ function drawCompare(run, ev, ckpts) {
   const sc = res.scores || {};
   const url = (f, t) => `/api/projects/${S.project.id}/runs/${run.id}/evals/${ev.id}/${encodeURIComponent(f)}${t ? "?thumb=1" : ""}`;
   const rec = res.recommend;
-  if (!S.picked && rec && ev.status === "done") S.picked = { ckpt: rec.ckpt, strength: rec.strength, auto: true };
+  if (!S.picked && rec && ev.status === "done") S.picked = { run: run.id, ckpt: rec.ckpt, strength: rec.strength, auto: true };
   const pickKey = S.picked ? `${S.picked.ckpt}|${S.picked.strength}` : "";
   // one table per model: the training model first, then the other models of the comparison (images with "model")
   const table = (mid, recKey, mname) => {
@@ -3372,7 +3574,7 @@ function drawCompare(run, ev, ckpts) {
   $$("[data-zoom]", el).forEach((im) => im.onclick = () => openLightbox([{ src: im.dataset.zoom, cap: im.dataset.cap }], 0));
   $$("[data-pick]", el).forEach((r) => r.onchange = () => {
     const [ckpt, strength] = r.dataset.pick.split("|");
-    S.picked = { ckpt, strength: parseFloat(strength) };
+    S.picked = { run: run.id, ckpt, strength: parseFloat(strength) };
     drawCompare(run, ev, ckpts); drawExport(run, ckpts);
   });
 }
@@ -3426,7 +3628,10 @@ function drawMore(run, ckpts) {
   $("#m-rand").onclick = () => { $("#m-seeds").value = randomSeeds(3); count(); };
   count();
   drawExtraModels($("#m-models"), run.model_family, run.model_id, count);
-  $("#m-run").onclick = async () => {
+  $("#m-run").onclick = async (e) => {
+    const b = e.currentTarget, label = b.textContent;
+    if (b.disabled) return;
+    b.disabled = true; b.textContent = "追加しています…";
     try {
       const body = { checkpoints: $$(".m-ck:checked").map((c) => c.value === "final" ? "final" : +c.value),
         extra_models: $$(".m-xm:checked").map((c) => c.value),
@@ -3437,7 +3642,8 @@ function drawMore(run, ckpts) {
       const r = await api(`/api/projects/${S.project.id}/runs/${run.id}/eval`, { body });
       toast(`比較 #${r.eval_id}（${r.n_images} 枚）を順番待ちに追加しました`);
       setTimeout(() => { if ($("#r-body") && S.project) renderResults(); }, 800);
-    } catch (e) { fail(e); }
+    } catch (err) { fail(err); }
+    if (b.isConnected) { b.disabled = false; b.textContent = label; }
   };
 }
 
@@ -3468,7 +3674,8 @@ async function drawExtraModels(el, family, ownId, count = () => {}) {
 
 function drawExport(run, ckpts) {
   const el = $("#r-export");
-  let pick = S.picked;
+  const keptDest = $("#x-dest") ? $("#x-dest").value : "";   // choosing another column redraws this panel: the typed folder stays
+  let pick = S.picked && S.picked.run === run.id ? S.picked : null;
   let ck = pick ? ckpts.find((c) => (c.step ?? "final") + "" === pick.ckpt + "") : null;
   // no comparison to pick from (it failed or was never made): the saved LoRA can still be chosen here
   const direct = !ck && ckpts.length && !$("#r-cmp [data-pick]");
@@ -3486,6 +3693,7 @@ function drawExport(run, ckpts) {
     <div class="row" style="margin-top:8px"><button class="primary" id="x-go" ${ck ? "" : "disabled"}>書き出す</button>
       <span class="muted small">LoRA 本体・使い方・学習条件を保存します。学習画像は含めません。既存ファイルは上書きせず版を分けます。</span></div>
     <div id="x-res"></div>`;
+  if (keptDest) $("#x-dest").value = keptDest;
   if (ck) $("#x-go").onclick = async () => {
     if (direct) {
       const v = $("#x-ck").value;
@@ -3498,13 +3706,16 @@ function drawExport(run, ckpts) {
       const cl = r.comfy_link;
       $("#x-res").innerHTML = `<div class="note" style="margin-top:8px">書き出しました: <b>${esc(r.file)}</b>
         ${$("#x-dest").value.trim() ? "" : ` <button class="small" data-opendir="loras">loras フォルダーを開く</button>`}
-        <br>${r.info.trigger ? `呼び出し語: ${esc(r.info.trigger)} ・ ` : "呼び出し語は要りません ・ "}強さ ${pick.strength} から試してください。
+        <br>${(r.info.characters || []).length ? `呼び出し語: ${r.info.characters.map((c) => `${esc(c.trigger)}（${esc(c.name)}）`).join(" / ")} ・ `
+          : r.info.trigger ? `呼び出し語: ${esc(r.info.trigger)} ・ ` : "呼び出し語は要りません ・ "}強さ ${pick.strength} から試してください。
+        <button class="small primary" id="x-try" title="学習に使ったモデル・書き出した LoRA・強さ・呼び出し語を画像生成の入力欄に入れて、画像生成の画面に移ります">画像生成で試す →</button>
         ${cl ? (cl.path ? `<br>ComfyUI からは次の名前で使えます（${cl.kind === "copy" ? "このドライブはリンクを作れないため、コピーして置きました" : "リンクなので容量は増えません"}）: ${esc(cl.path)}` : `<br><span class="muted">${esc(cl.message || "")}</span>`) : ""}</div>
         ${r.leftover_bytes > 0 ? `<div class="note" id="x-discard" style="margin-top:8px">
           <div class="row"><b>学習データ（${fmtSize(r.leftover_bytes)}）を破棄しますか？</b>
             <button id="xd-yes">はい</button><button id="xd-no">いいえ</button></div>
           <div class="muted small">このプロジェクトのすべての回の途中保存の LoRA、再開用の保存データ、学習用キャッシュを消します。書き出した LoRA の元の保存版、素材、説明文、比較画像は残すので、あとで学習し直すこと（別のモデル向けも）はできます。消した保存版は比較や書き出しに使えなくなり、途中からの再開もできなくなります。</div></div>` : ""}`;
       bindOpenDir($("#x-res"));
+      $("#x-try").onclick = (ev) => tryExportedLora(ev.currentTarget, run, r, pick.strength);
       if ($("#xd-no")) $("#xd-no").onclick = () => $("#x-discard").remove();
       if ($("#xd-yes")) $("#xd-yes").onclick = async (e) => {
         e.target.disabled = true; e.target.textContent = "破棄しています…";
@@ -3512,12 +3723,41 @@ function drawExport(run, ckpts) {
           const d = await api(`/api/projects/${S.project.id}/training_leftovers/discard`, { body: {} });
           toast(`学習データを破棄しました${d.freed ? `（${fmtSize(d.freed)} 空きました）` : ""}` +
             (d.skipped_runs.length ? `。学習中・比較画像の作成中の回は残しました` : ""));
+          if ($("#x-discard")) $("#x-discard").remove();
           renderResults(true);
         } catch (err) { e.target.disabled = false; e.target.textContent = "はい"; fail(err); }
       };
     } catch (e) { $("#x-res").innerHTML = `<div class="err">${esc(e.message)}（完了していません）</div>`; }
     b.disabled = false; b.textContent = "書き出す";
   };
+}
+
+/* 「画像生成で試す」 after an export: the image generation form gets the model the run was trained on, the exported
+   LoRA at the strength recorded, and the trigger word(s) in front of the prompt typed there (not twice); the rest of
+   the form (size, seed, negative ...) stays as it was.  A workflow kept from an image is not used (it would ignore
+   the LoRA). */
+async function tryExportedLora(btn, run, r, strength) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "画像生成の入力欄に入れています…";
+  try {
+    const [g, d] = await Promise.all([api("/api/imagegen"), api("/api/models")]);
+    const form = { ...(g.form || {}) };
+    const model = d.models.find((m) => m.id === run.model_id && !(m.missing || []).length);
+    if (model) form.model_id = model.id;
+    const words = (r.info.characters || []).length ? r.info.characters.map((c) => c.trigger) : r.info.trigger ? [r.info.trigger] : [];
+    const pos = form.positive || "";
+    const have = pos.split(",").map((x) => x.trim().toLowerCase());
+    const add = words.filter((w) => w && !have.includes(w.trim().toLowerCase()));
+    form.positive = add.length ? add.join(", ") + (pos.trim() ? ", " + pos.trim() : "") : pos;
+    form.loras = [{ path: r.file, strength: strength ?? 1 }];
+    form.workflow = "";
+    await api("/api/imagegen/form", { method: "PUT", body: form });
+    S.ig = null;
+    location.hash = "#/gen";
+    toast(model ? `「${model.name}」と書き出した LoRA（強さ ${strength ?? 1}）を入れました。プロンプトを確かめて「生成」を押してください`
+      : "書き出した LoRA を入れました。学習に使ったモデルが今は登録されていないか、ファイルが見つからないため、モデルは今のままです。同じ系列のモデルを選んでください", model ? "" : "err");
+  } catch (e) { fail(e); }
+  if (btn.isConnected) { btn.disabled = false; btn.textContent = label; }
 }
 
 function drawFix(run, ev) {
@@ -3751,6 +3991,8 @@ async function renderSettings(keep = false) {
   const nav = NAV;
   S.project = null;
   $("#crumbs").innerHTML = `<span>›</span><span>設定</span>`;
+  // coming from another page: that page (whose buttons need its project) does not stay while the lists load
+  if (keep !== true && !$("#s-catalog")) main.innerHTML = `<div class="muted">読み込み中…</div>`;
   let d, st, lib, sto;
   try { lib = await api("/api/library"); [d, st, sto] = await Promise.all([api("/api/models"), api("/api/status"), api("/api/storage")]); } catch (e) { return navStale(nav) ? undefined : fail(e); }
   if (navStale(nav)) return;
@@ -3768,6 +4010,8 @@ async function renderSettings(keep = false) {
       ${st.can_restart ? `<div class="row" style="margin-top:10px" id="s-rs"><button id="s-restart">LoRAtelier を再起動</button>
         <span class="muted small">新しいウィンドウで起動し直し、今のウィンドウは閉じます。この画面は起動が終わると自動で読み込み直します。</span></div>` : ""}</div>
     <div class="panel" style="margin-bottom:14px"><h2>表示</h2>
+      <label class="row"><input type="checkbox" id="s-notify" ${notifyOn() ? "checked" : ""}> 処理が終わったらブラウザーの通知で知らせる</label>
+      <div class="muted small">学習や LoRA 作成タスクが終わったときに、この画面を見ていなくても、Windows の通知で知らせます。オンにすると、ブラウザーが通知を許可するかを尋ねます。この設定は、このブラウザーにだけ保存されます。通知を使わなくても、画面の右下の知らせと、タブの名前の前の「✓」（完了）や「!」（失敗）で分かります。</div>
       <label class="row"><input type="checkbox" id="s-blur" ${st.blur_images === true ? "checked" : ""}> 画像をぼかして表示する</label>
       <div class="muted small">画面に出る画像をすべてぼかします。画像にマウスを乗せると右上に目のボタンが出て、押すとその画像だけ表示され、もう一度押すとまたぼけます。画像そのもののクリックは、ぼかしていないときと同じ動き（拡大や選択）になります。目で表示した画像は、拡大したときも表示されます。見た目だけの設定で、学習・解析・生成や画像ファイルには影響しません。</div></div>
     <div class="panel" style="margin-bottom:14px"><h2>学習用キャッシュ</h2>
@@ -3793,7 +4037,7 @@ async function renderSettings(keep = false) {
         <b>${esc(m.name)}</b>${m.variant ? `<span class="kind">${esc(m.variant_info.label || m.variant)}</span>` : ""}
         ${famVariants(m.family).length > 1 && (!m.variant || m.needs_variant || (m.auto && !m.variant_confirmed)) ? `<select data-variant="${m.id}">
           <option value="">${m.variant ? "系統（推定）を確認してください" : "系統を選んでください（学習に必要）"}</option>${famVariants(m.family).map(([k, v]) => `<option value="${k}" ${k === m.variant ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select>` : ""}
-        ${modelChecksHtml(m.checked)}
+        ${modelChecksHtml(m.checked, m.variant_info.train !== false)}
         ${m.missing.length ? `<span class="err small">ファイルが見つかりません: ${m.missing.join(", ")}</span>` : ""}
         <span class="muted small">${Object.entries(m.files).map(([k, p]) => `${k}: ${esc(p)}${m.hash && m.hash[k] ? "" : "（ハッシュ計算中）"}`).join("<br>")}</span>
         <div class="spacer"></div><button data-del="${m.id}">登録解除</button></div>`).join("") : `<div class="muted">まだありません。</div>`}</div>
@@ -3863,10 +4107,12 @@ async function renderSettings(keep = false) {
   $$("[data-rmroot]").forEach((b) => b.onclick = async () => {
     try { await api("/api/library/roots/remove", { body: { path: b.dataset.rmroot } }); toast("場所を外しました（ファイルはそのままです）"); renderSettings(); } catch (e) { fail(e); }
   });
-  $$("[data-del]").forEach((b) => b.onclick = async () => {
+  // two presses, as for the other deletions: projects, saved settings and the 検証済み marks point at the model's id
+  $$("[data-del]").forEach((b) => b.onclick = () => confirmClick(b, "もう一度押すと解除", async () => {
+    b.disabled = true;
     try { await api(`/api/models/${b.dataset.del}`, { method: "DELETE" }); toast("登録を解除しました（ファイルは削除していません）"); renderSettings(); }
-    catch (e) { fail(e); }
-  });
+    catch (e) { b.disabled = false; fail(e); }
+  }));
   bindMisplaced(main, renderSettings);
   bindStorage(main);
   $("#s-tcache").onchange = async (e) => {
@@ -3903,6 +4149,20 @@ async function renderSettings(keep = false) {
         renderSettings();
       } catch (err) { ev.target.disabled = false; ev.target.textContent = "はい"; fail(err); }
     };
+  };
+  $("#s-notify").onchange = async (e) => {
+    const on = e.target.checked;
+    const save = (v) => { try { localStorage.setItem(NOTIFY_KEY, v ? "1" : "0"); } catch { /* private window: not kept */ } };
+    if (!on) { save(false); return; }
+    if (typeof Notification === "undefined") { e.target.checked = false; return toast("このブラウザーは通知に対応していません", "err"); }
+    let perm = Notification.permission;
+    if (perm === "default") { try { perm = await Notification.requestPermission(); } catch { perm = "denied"; } }
+    if (perm !== "granted") {
+      e.target.checked = false; save(false);
+      return toast("ブラウザーで通知が許可されていないため、オンにできませんでした。ブラウザーのサイトの設定で、このページの通知を許可してください", "err");
+    }
+    save(true);
+    toast("処理が終わったら、ブラウザーの通知でも知らせます");
   };
   $("#s-blur").onchange = async (e) => {
     document.documentElement.classList.toggle("blurimg", e.target.checked);
@@ -4126,7 +4386,7 @@ async function drawCatalog() {
     const choices = Object.entries(x.choices || {}).map(([k, opts]) => `<select data-choice="${x.id}" data-key="${k}">${opts.map((o) =>
       `<option value="${o.id}" ${o.id === x.recommended[k] ? "selected" : ""}>${esc(o.label)}${o.id === x.recommended[k] ? "（この PC に推奨）" : ""}</option>`).join("")}</select>`).join("");
     const state = x.deferred ? `<span class="small muted">準備中（積み残し）</span>` :
-      x.installed_model ? `${x.checked ? modelChecksHtml(x.checked) + " " : ""}<span class="small" style="color:var(--ok)">追加済み</span>` :
+      x.installed_model ? `${x.checked ? modelChecksHtml(x.checked, x.train !== false) + " " : ""}<span class="small" style="color:var(--ok)">追加済み</span>` :
       s && s.state === "running" ? `<span class="small">${esc(s.message || "")} ${(s.done_bytes / 1e9).toFixed(1)} / ${(s.total_bytes / 1e9).toFixed(1)} GB</span>
         ${s.cancel ? "" : `<button class="small" data-dlcancel="${x.id}">キャンセル</button>`}` :
       s && s.state === "done" ? `<span class="small" style="color:var(--ok)">完了</span>` :
@@ -4403,7 +4663,18 @@ const IG_STATUS = { queued: "順番待ち", running: "生成中", done: "完了"
 const IG_SIZES = {
   1024: [["正方形", 1024, 1024], ["縦 2:3", 832, 1216], ["横 3:2", 1216, 832], ["縦 3:4", 896, 1152], ["横 4:3", 1152, 896], ["縦 9:16", 768, 1344], ["横 16:9", 1344, 768]],
   1328: [["正方形", 1328, 1328], ["縦 2:3", 1056, 1584], ["横 3:2", 1584, 1056], ["縦 3:4", 1104, 1472], ["横 4:3", 1472, 1104], ["縦 9:16", 928, 1664], ["横 16:9", 1664, 928]],
+  // MiniMax H3-Image: about 4 MP (2048 x 2048, what ComfyUI's node makes by default), sides in multiples of 32
+  2048: [["正方形", 2048, 2048], ["縦 2:3", 1664, 2496], ["横 3:2", 2496, 1664], ["縦 3:4", 1760, 2368], ["横 4:3", 2368, 1760], ["縦 9:16", 1536, 2720], ["横 16:9", 2720, 1536]],
 };
+// the sides the chosen model takes: {step, min, max} from the server (16 / 512 / 2048; MiniMax H3-Image 32 / 512 / 6272)
+const igLimits = () => (S.ig && S.ig.size) || { step: 16, min: 512, max: 2048 };
+const igFitSide = (v) => { const l = igLimits(); return Math.max(l.min, Math.min(l.max, Math.round(v / l.step) * l.step)); };
+function igSizeLimits() {
+  const l = igLimits();
+  for (const id of ["#ig-w", "#ig-h"]) { const i = $(id); if (i) { i.step = l.step; i.min = l.min; i.max = l.max; } }
+  const n = $("#ig-sizenote");
+  if (n) n.textContent = `生成時に ${l.step} の倍数（${l.min}〜${l.max}）にそろえます` + (l.max > 2048 ? "。大きいほど、時間とメモリを多く使います" : "");
+}
 
 async function renderImageGen() {
   const nav = NAV;
@@ -4433,7 +4704,7 @@ async function renderImageGen() {
       <label>保存した設定</label><div id="ig-presets"></div>
       <label>画像から読み込む</label><div id="ig-info"></div>
       <label>モデル</label>
-      <div><div class="row"><select id="ig-model" style="max-width:100%"><option value="">選んでください</option>${genModelOptions(S.lib, f.model_id)}</select>
+      <div><div class="row"><select id="ig-model" style="max-width:100%"><option value="">選んでください</option>${genModelOptions(S.lib, f.model_id, IMAGE_FAMILIES)}</select>
         <button class="small" id="ig-rescan" title="フォルダーを読み直します">再読み込み</button>
         <button class="small" data-opendir="checkpoints">フォルダーを開く</button></div></div>
       <label>LoRA（任意）</label><div><div id="ig-loras"></div><button id="ig-addlora" class="small">＋ LoRA を追加</button> <button id="ig-urllora" class="small" title="Hugging Face や Civitai の LoRA のページの URL から取得して追加します">URL から追加</button></div>
@@ -4453,7 +4724,7 @@ async function renderImageGen() {
       <label>画像サイズ</label><div><div class="row" id="ig-sizes"></div>
         <div class="row" style="margin-top:4px"><span class="small muted">幅</span><input type="number" id="ig-w" step="16" min="512" max="2048" style="width:90px" value="${esc(f.width || S.ig.native)}">
           <span class="small muted">高さ</span><input type="number" id="ig-h" step="16" min="512" max="2048" style="width:90px" value="${esc(f.height || S.ig.native)}">
-          <span class="muted small">生成時に 16 の倍数（512〜2048）にそろえます</span></div></div>
+          <span class="muted small" id="ig-sizenote">生成時に 16 の倍数（512〜2048）にそろえます</span></div></div>
       <label>左右で描き分ける（任意）</label><div>
         <div class="row"><textarea id="ig-left" rows="2" style="flex:1;min-width:200px" placeholder="左側だけに描くもの（例: 1girl, red hair, red dress）">${esc((f.regions || {}).left || "")}</textarea>
           <textarea id="ig-right" rows="2" style="flex:1;min-width:200px" placeholder="右側だけに描くもの（例: 1girl, blue hair, black coat）">${esc((f.regions || {}).right || "")}</textarea></div>
@@ -4489,6 +4760,7 @@ async function renderImageGen() {
   <div id="ig-history" style="margin-top:14px"></div>`;
   igDrawLoras(f.loras || []);
   igDrawPresets();
+  igSizeLimits();
   igDrawSizes();
   igDrawCheck(S.ig.check, S.ig.notes);
   igDrawHistory();
@@ -4602,6 +4874,7 @@ async function igApplyPreset(pid) {
   const p = (S.ig.presets || []).find((x) => x.id === pid);
   S.igPreset = p ? p.id : null;
   if (!p) { igDrawPresets(); return; }
+  igSaveSoon.cancel();   // a save of the inputs typed just before would land over the preset
   try {
     await api("/api/imagegen/form", { method: "PUT", body: presetForm(igRead(), p) });
   } catch (e) { return fail(e); }
@@ -5245,8 +5518,10 @@ function igNegNote() {
   if (!n) return;
   const { cfg, from } = igCfg();
   const noPlace = from === "workflow" && S.ig.workflow.negative === false;
-  n.hidden = !(noPlace || (cfg != null && cfg <= 1));
+  const h3 = from !== "workflow" && modelFamily(($("#ig-model") || {}).value || "") === "h3_image";
+  n.hidden = !(noPlace || h3 || (cfg != null && cfg <= 1));
   if (n.hidden) return;
+  if (h3) { n.textContent = "MiniMax H3-Image はネガティブプロンプトを使わないモデルのため、ネガティブプロンプトは生成に使われません。"; return; }
   const dcfg = (S.ig.default_sampling || {}).cfg;
   const wfOff = "「workflow を使わない」を押すと、下の欄のモデルと設定で生成します。";
   n.textContent = noPlace ? `この workflow にはネガティブを書く場所がないため、ネガティブプロンプトは使わずに生成します。${wfOff}`
@@ -5344,7 +5619,10 @@ function igDrawInit() {
       <div><div class="row"><span class="small" ${S.ig.edit ? "hidden" : ""}>変化の強さ</span>
           <input type="number" id="ig-den" min="0.05" max="1" step="0.05" style="width:80px" value="${esc(f.denoise ?? 0.6)}" ${S.ig.edit ? "hidden" : ""}>
           <button class="small" id="ig-init-x">元画像を外す</button></div>
-        ${S.ig.edit ? `<div class="small"><b>指示で編集します。</b>編集用の LoRA（MOSS-Image）を選んでいるので、元画像をプロンプトに書いた指示どおりに直します。
+        ${S.ig.edit === "h3" ? `<div class="small"><b>指示で編集します。</b>MiniMax H3-Image は、元画像をプロンプトに書いた指示どおりに直します。
+          プロンプトの中では、元画像を &lt;Picture 1&gt; と書いて指せます（例: 「Change the jacket in &lt;Picture 1&gt; to red.」）。
+          出来上がりの大きさは元画像の縦横比に合わせて決まり（短い辺が 1024〜2048）、上の画像サイズと変化の強さは使いません。</div>`
+        : S.ig.edit ? `<div class="small"><b>指示で編集します。</b>編集用の LoRA（MOSS-Image）を選んでいるので、元画像をプロンプトに書いた指示どおりに直します。
           指示は英語で「Change the color of the car to blue.」「Remove the person on the left.」のように書きます。
           出来上がりの大きさは元画像の縦横比に合わせた約 100 万画素になり、上の画像サイズと変化の強さは使いません。
           ネガティブプロンプトは空にしておくのがおすすめです。</div>`
@@ -5425,6 +5703,7 @@ function igDrawInfo() {
       ${(m.notes || []).map((x) => `<div class="warntext">${esc(x)}</div>`).join("")}</div>` : ""}
     ${igWorkflowHtml()}`;
   const wfSet = async (id) => {
+    igSaveSoon.cancel();
     S.ig.form = { ...igRead(), workflow: id };
     await igSave();
     await renderImageGen();
@@ -5434,6 +5713,7 @@ function igDrawInfo() {
   $("#ig-info-pick").onclick = () => $("#ig-info-file").click();
   $("#ig-info-file").onchange = (e) => { if (e.target.files[0]) igLoadInfo(e.target.files[0]); };
   if ($("#ig-info-undo")) $("#ig-info-undo").onclick = async () => {
+    igSaveSoon.cancel();
     try { await api("/api/imagegen/form", { method: "PUT", body: m.undo }); } catch (e) { return fail(e); }
     S.igInfo = null;
     await renderImageGen();
@@ -5471,6 +5751,7 @@ function igWorkflowHtml() {
 }
 
 async function igLoadInfo(file) {
+  igSaveSoon.cancel();   // the form as typed is "before" below; a waiting save must not land over the loaded settings
   const before = igRead();
   let j;
   try {
@@ -5494,10 +5775,9 @@ async function igSetInit(file) {
     const r = await fetch("/api/imagegen/init", { method: "POST", body: file });
     const j = await r.json();
     if (!r.ok) throw new Error(j.detail || "画像を読み込めませんでした");
-    // the size follows the image's shape at about the model's own pixel count (multiples of 16)
+    // the size follows the image's shape at about the model's own pixel count (in the model's steps)
     const [w, h] = j.size, n = S.ig.native || 1024, k = Math.sqrt((n * n) / (w * h));
-    const fit = (v) => Math.max(512, Math.min(2048, Math.round((v * k) / 16) * 16));
-    $("#ig-w").value = fit(w); $("#ig-h").value = fit(h);
+    $("#ig-w").value = igFitSide(w * k); $("#ig-h").value = igFitSide(h * k);
     S.ig.form = { ...igRead(), init_image: j.name };
     igDrawInit(); igDrawSizes(); igSave();
     toast(`元画像を設定しました（${w}×${h}）。画像サイズを元画像の縦横比に合わせました`);
@@ -5525,7 +5805,8 @@ async function igSave() {
   try {
     const r = await api("/api/imagegen/form", { method: "PUT", body });
     if (!$("#ig-save")) { S.ig.form = body; return; }
-    S.ig.form = body; S.ig.native = r.native; S.ig.default_sampling = r.default_sampling;
+    S.ig.form = body; S.ig.native = r.native; S.ig.size = r.size; S.ig.default_sampling = r.default_sampling;
+    igSizeLimits();
     if ((r.edit || null) !== (S.ig.edit || null)) { S.ig.edit = r.edit || null; igDrawInit(); }
     st.textContent = "保存済み";
     igDrawCheck(r.check, r.notes);
@@ -5641,8 +5922,10 @@ function igDrawHistory() {
   igDrawStop();
   if (!hs.length) { el.innerHTML = `<div class="muted small">生成した画像は、ここに新しい順で並びます。</div>`; return; }
   const openBoxes = new Map($$("[data-ie]", el).map((b) => [b.dataset.ie, $("[data-icopybox]", b)]).filter(([, h]) => h && h.childElementCount));
-  el.innerHTML = hs.map((e) => {
+  const cards = hs.map((e) => {
     const s = e.settings, active = e.status === "queued" || e.status === "running";
+    // a model whose images cannot be LoRA material (MiniMax H3-Image) has no 「この設定で LoRA 素材を作る」
+    const fam = modelFamily(s.model_id), noMaterial = !!fam && !GEN_FAMILIES.includes(fam);
     return `<div class="panel" style="margin-bottom:10px" data-ie="${e.id}">
       <div class="row"><b>${IG_STATUS[e.status] || e.status}</b>${e.message && e.message !== IG_STATUS[e.status] ? `<span class="small muted">${esc(e.message)}</span>` : ""}
         <span class="small muted">${new Date(e.created * 1000).toLocaleString("ja-JP")}</span>
@@ -5652,7 +5935,7 @@ function igDrawHistory() {
             <button class="small">${e.images.length === 1 ? "ダウンロード" : `まとめてダウンロード（${e.images.length} 枚・zip）`}</button></a>
           <a class="btnlink" href="${e.images.length === 1 ? `/api/imagegen/img/${encodeURIComponent(e.images[0].file)}?jpg=1` : `/api/imagegen/${e.id}/download.zip?jpg=1`}" download>
             <button class="small" title="プロンプトや workflow などの生成の情報を入れずに、JPG で保存します">${e.images.length === 1 ? "JPG で保存（情報なし）" : `JPG でまとめて保存（情報なし・zip）`}</button></a>
-            ${s.workflow ? "" : `<button class="small primary" data-icopy>この設定で LoRA 素材を作る</button>`}` : ""}
+            ${s.workflow || noMaterial ? "" : `<button class="small primary" data-icopy>この設定で LoRA 素材を作る</button>`}` : ""}
           <button class="small" data-idel title="この結果の画像を消します">削除</button>`}</div>
       <div class="row" style="align-items:flex-start;margin:4px 0"><div class="small igshare">${esc(igShareText(s))}</div>
         <button class="small" data-ishare title="モデル・設定・プロンプトを、そのまま貼り付けられる文章でコピーします">コピー</button></div>
@@ -5663,7 +5946,19 @@ function igDrawHistory() {
         <a class="igdl" href="/api/imagegen/img/${encodeURIComponent(im.file)}?dl=1" download title="この画像をダウンロード">↓</a>
         <a class="igdl igjpg" href="/api/imagegen/img/${encodeURIComponent(im.file)}?jpg=1" download title="プロンプトや workflow などの生成の情報を入れずに、JPG で保存します">JPG</a></div>`).join("")}</div>
       <div data-icopybox></div></div>`;
-  }).join("") + (S.ig.history_more > 0 ? `<div class="row"><button class="small" data-imore>もっと見る（古い結果があと ${S.ig.history_more} 件あります）</button></div>` : "");
+  });
+  // This list is drawn again for every finished image.  A card whose content did not change stays the element it
+  // was: its images are not loaded again, the view does not jump and a button being pressed is still there.
+  const had = new Map([...el.children].filter((b) => b.dataset && b.dataset.ie).map((b) => [b.dataset.ie, b]));
+  const fromHtml = (html) => { const t = document.createElement("template"); t.innerHTML = html; return t.content; };
+  const nodes = hs.map((e, i) => {
+    const same = had.get(e.id);
+    if (same && same._html === cards[i]) return same;
+    const nb = fromHtml(cards[i]).firstElementChild;
+    nb._html = cards[i];
+    return nb;
+  });
+  el.replaceChildren(...nodes, ...fromHtml(S.ig.history_more > 0 ? `<div class="row"><button class="small" data-imore>もっと見る（古い結果があと ${S.ig.history_more} 件あります）</button></div>` : "").childNodes);
   const more = $("[data-imore]", el);
   if (more) more.onclick = () => { S.igShown = (S.igShown || IG_PAGE) + IG_PAGE; igReload(); };
   $$(".igimgs", el).forEach((row) => {
@@ -5694,7 +5989,7 @@ function igDrawHistory() {
     });
     on("[data-icopy]", () => igCopyBox(box, e));
     const old = openBoxes.get(id), host = $("[data-icopybox]", box);
-    if (old && host) host.replaceWith(old);   // keeps the chosen project and the typed name
+    if (old && host && old !== host) host.replaceWith(old);   // keeps the chosen project and the typed name
   });
 }
 

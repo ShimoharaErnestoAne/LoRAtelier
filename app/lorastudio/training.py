@@ -35,7 +35,17 @@ QUEUE_FILE = config.DATA_DIR / "queue.json"   # waiting runs, restored at startu
 
 
 def engine_cwd(engine: str) -> Path:
-    return {"sd-scripts": config.SD_SCRIPTS_DIR, "musubi-tuner": config.MUSUBI_DIR}.get(engine) or config.ENGINES_DIR / engine
+    """The engine's folder.  An optional engine's folder is the one engines.lock.json names ("path"): since sd-scripts
+    v0.13.0, sd-scripts-moss is the pinned sd-scripts itself (engines/sd-scripts), so runs recorded under that engine
+    name, and their resumes, use the one checkout."""
+    fixed = {"sd-scripts": config.SD_SCRIPTS_DIR, "musubi-tuner": config.MUSUBI_DIR}.get(engine)
+    if fixed:
+        return fixed
+    try:
+        from .addons import engine_dir
+        return engine_dir(engine)
+    except (KeyError, OSError, ValueError):   # not in the lock file (or it cannot be read): the folder of that name
+        return config.ENGINES_DIR / engine
 
 
 def engine_env(engine: str) -> dict:
@@ -54,7 +64,27 @@ def engine_env(engine: str) -> dict:
         # the newer sd-scripts (MOSS-Image) shares the train env with the pinned one, installed there as an
         # editable package: its own folder goes first so `library` / `networks` resolve to its code
         env["PYTHONPATH"] = str(engine_cwd(engine))
+    elif engine == AITK:
+        # ai-toolkit (toolkit/paths.py): MODELS_PATH is where it looks for (and would download) model files.  Every
+        # file is given to it by path (training.build_commands), so nothing is fetched; pointed at this tool's models
+        # folder all the same, never at a models folder inside the engine
+        env.update(MODELS_PATH=str(config.MODELS_DIR), NO_ALBUMENTATIONS_UPDATE="1")
     return env
+
+
+AITK = "ai-toolkit"   # MiniMax H3-Image training (engines.lock.json; its own env, envs/aitk)
+
+
+def aitk_python() -> Path:
+    from .addons import _lockfile, env_python
+    return env_python(_lockfile()["engines"][AITK])
+
+
+def run_out_dir(run_dir: Path, snap: dict) -> Path:
+    """Where the engine writes the run's LoRAs.  ai-toolkit writes into <training_folder>/<name>/ (its save_root),
+    with training_folder = <run>/output."""
+    out = Path(run_dir) / "output"
+    return out / snap["output_name"] if snap.get("engine") == AITK and snap.get("output_name") else out
 
 
 def engine_commit(engine: str) -> str:
@@ -115,11 +145,19 @@ def _family_file_errors(model: dict) -> list[str]:
                         "設定画面の「おすすめのモデル」から「Krea 2 RAW」を追加するか、モデルの「Krea 2 RAW DiT」に RAW 版のファイルを指定してください。")
         if "fp8" in Path(f.get("te", "")).name.lower():
             errs.append("Krea 2 の学習には bf16 のテキストエンコーダー（qwen3vl_4b_bf16.safetensors）が必要です。")
+    if fam == "h3_image":
+        from .addons import engine_ready
+        if not f.get("adapter"):
+            errs.append("MiniMax H3-Image の学習には学習アダプターが必要です。設定画面の「おすすめのモデル」から"
+                        "「MiniMax H3-Image 学習用ファイル」を追加してください。")
+        if not engine_ready(AITK):
+            errs.append("MiniMax H3-Image の学習エンジン（ai-toolkit）と、その専用の環境の準備ができていません。設定画面の「おすすめのモデル」から"
+                        "「MiniMax H3-Image 学習用ファイル」を追加すると準備されます（初回は数 GB の取得があります）。")
     if fam == "moss_image":
         from .addons import engine_ready
         if not engine_ready("sd-scripts-moss"):
-            errs.append("MOSS-Image の学習エンジン（sd-scripts v0.12.1）が入っていません。設定画面の「おすすめのモデル」から"
-                        "MOSS-Image を追加すると導入されます。")
+            errs.append("MOSS-Image の学習エンジン（sd-scripts v0.13.0）の準備ができていません。設定画面の「おすすめのモデル」から"
+                        "MOSS-Image を追加すると準備されます。")
         if "w4a8" in Path(f.get("te", "")).name.lower():
             errs.append("MOSS-Image の学習には、W4A8 版のテキストエンコーダーは使えません（生成には使えます）。"
                         "qwen3.5_9b_int8_convrot.safetensors か qwen3.5_9b_bf16.safetensors を text_encoders フォルダーに置いてください。")
@@ -245,6 +283,10 @@ def preflight(project, used_images: list[dict], values: dict) -> dict:
         kinds = {"zimage": "Turbo 系 / Base 系", "moss_image": "SFT 版 / Base 版"}.get(model.get("family"), "Illustrious / Pony など")
         errors.append(f"「{model['name']}」の系統（{kinds}）が未確認です。設定画面で選んでください。")
         return {"errors": errors, "warnings": warnings, "info": info}
+    from .models import UNAVAILABLE_NOTE, trainable
+    if not trainable(model["variant"]):   # a model no LoRA can be made on (MiniMax H3-Image): nothing else to check
+        errors.append(UNAVAILABLE_NOTE.get(model["variant"], "このモデル系列は現在対応していません。"))
+        return {"errors": errors, "warnings": warnings, "info": info}
     fam = model["family"]
     if model["missing"]:   # moved since the last scan of the model folders?
         library._repair_paths()
@@ -302,8 +344,14 @@ def preflight(project, used_images: list[dict], values: dict) -> dict:
         errors.append("NVIDIA GPU が見つかりません。素材の編集はできますが、学習は GPU が必要です（CPU 学習へは切り替えません）。")
     else:
         need = {"sdxl": 10000, "anima": 10000, "krea2": 12000, "qwen_image": 12000, "qwen_image21": 12000, "zimage": 12000,
-                "moss_image": 10000}[fam]
-        if fam == "moss_image" and gpus[0]["vram_total_mb"] < 10000:
+                "moss_image": 10000, "h3_image": H3_VRAM_GUESS_MB}[fam]
+        if fam == "h3_image" and gpus[0]["vram_total_mb"] < need:
+            # no figure in ai-toolkit or on the model page: a guess from the file sizes (INT8 DiT 21GB, NVFP4 text
+            # encoder 15.7GB), said as one
+            warnings.append(f"VRAM {gpus[0]['vram_total_mb'] // 1024}GB では、MiniMax H3-Image の学習が動かないか、非常に遅くなる可能性があります。"
+                            f"33B の大きなモデルのため、このツールでは {need // 1024}GB 以上を目安にしています（ファイルの大きさから決めた目安で、"
+                            "確かめた値ではありません）。")
+        elif fam == "moss_image" and gpus[0]["vram_total_mb"] < 10000:
             # sd-scripts docs: training fits 5.2GB, but caching the text encoder outputs needs about 8.3GB
             errors.append(f"VRAM {gpus[0]['vram_total_mb'] // 1024}GB では MOSS-Image の学習はできません（学習エンジンの資料でも"
                           "VRAM 8GB は未対応です。説明文の前処理だけで約 8.3GB 使います）。")
@@ -329,7 +377,11 @@ def preflight(project, used_images: list[dict], values: dict) -> dict:
     if werr:
         errors.append(f"書き込みできません: {project.runs_dir} ({werr})")
     errors += presets.validate(fam, values)
+    warnings += presets.setting_warnings(fam, values)
     return {"errors": errors, "warnings": warnings, "info": info}
+
+
+H3_VRAM_GUESS_MB = 24000   # MiniMax H3-Image: a guess (no engine figure), shown as one
 
 
 # ======================================================================== snapshot
@@ -526,7 +578,8 @@ def _ds_sdscripts(run_dir: Path, v: dict, image_dir: Path | None = None, name: s
         sub["alpha_mask"] = True
     ds = {"general": {"caption_extension": ".txt", "shuffle_caption": False, "keep_tokens": 1},
           "datasets": [{"resolution": v["resolution"], "batch_size": v["train_batch_size"], "enable_bucket": True,
-                        "min_bucket_reso": 512, "max_bucket_reso": 2048, "bucket_reso_steps": 64, "bucket_no_upscale": False,
+                        "min_bucket_reso": presets.min_bucket_reso(v["resolution"]), "max_bucket_reso": 2048,
+                        "bucket_reso_steps": 64, "bucket_no_upscale": False,
                         "subsets": [sub]}]}
     p = run_dir / name
     p.write_text(toml.dumps(ds), encoding="utf-8")
@@ -544,7 +597,7 @@ def _ds_musubi(run_dir: Path, v: dict) -> Path:
     return p
 
 
-STATE_ENGINES = ("sd-scripts", "sd-scripts-moss")   # the engines whose saved states this tool can resume from
+STATE_ENGINES = ("sd-scripts", "sd-scripts-moss", "ai-toolkit")   # the engines whose saved states this tool can resume from
 
 
 def saves_state(snap: dict) -> bool:
@@ -706,8 +759,9 @@ def build_commands(snap: dict, run_dir: Path, resume: str | None) -> list[tuple[
         cfg_path.write_text(toml.dumps(cfg), encoding="utf-8")
         cmds.append(("training", launch + [str(QWEN21_INT8), "qwen_image_21_train_network.py", "--config_file", str(cfg_path)], cwd))
     elif fam == "moss_image":
-        # sd-scripts v0.12.1 docs/moss_image_train_network.md (a separate checkout, sd-scripts-moss).  The timestep
-        # options reproduce the pre-training distribution (doc section 7.2).  INT8 / block swap follow the VRAM tier
+        # sd-scripts docs/moss_image_train_network.md (v0.13.0: the pinned sd-scripts itself; engine_cwd).  The timestep
+        # options reproduce the pre-training distribution (doc section 7.2: v0.13.0 also offers truncated_logit_normal,
+        # but says its own check of this script was made with sigma + logit_normal, which is kept).  INT8 / block swap follow the VRAM tier
         # (presets.py); a ConvRot INT8 file is loaded as INT8 by the engine itself.  The tokenizer (~20MB) is fetched
         # from Hugging Face first (cached after the first run).
         cwd = engine_cwd("sd-scripts-moss")
@@ -734,6 +788,8 @@ def build_commands(snap: dict, run_dir: Path, resume: str | None) -> list[tuple[
         cfg_path = run_dir / ("train_resume.toml" if resume else "train.toml")
         cfg_path.write_text(toml.dumps(cfg), encoding="utf-8")
         cmds.append(("training", launch + _sd_script("moss_image_train_network.py", resume) + ["--config_file", str(cfg_path)], cwd))
+    elif fam == "h3_image":
+        cmds.append(("training", _aitk_command(snap, run_dir), engine_cwd(AITK)))
     elif fam == "zimage":
         # musubi-tuner docs/zimage.md.  Turbo (distilled) is trained with ostris's training adapter merged into the
         # DiT (--base_weights); the LoRA is then used on Turbo without the adapter.  The tokenizer is loaded from
@@ -762,6 +818,64 @@ def build_commands(snap: dict, run_dir: Path, resume: str | None) -> list[tuple[
         cfg_path.write_text(toml.dumps(cfg), encoding="utf-8")
         cmds.append(("training", launch + ["zimage_train_network.py", "--config_file", str(cfg_path)], config.MUSUBI_DIR))
     return cmds
+
+
+def h3_qtypes(files: dict) -> dict:
+    """ai-toolkit's quantization settings that load the registered ComfyUI files as they are (ui.tsx, MiniMax-H3-Image
+    notes): qtype convrot8 for the INT8 ConvRot DiT, convrotw4a8 for the W4A8 one; text encoder nvfp4 for the NVFP4
+    file, convrot8 for the INT8 one.  A bf16 file is quantized on loading (qfloat8, the engine's own default)."""
+    dit, te = Path(files.get("ckpt") or "").name.lower(), Path(files.get("te") or "").name.lower()
+    qtype = "convrotw4a8" if "w4a8" in dit else "convrot8" if "int8_convrot" in dit else "qfloat8"
+    qtype_te = "nvfp4" if "nvfp4" in te else "convrot8" if "int8_convrot" in te else "qfloat8"
+    return {"quantize": True, "qtype": qtype, "quantize_te": True, "qtype_te": qtype_te}
+
+
+# ai-toolkit is started through this: the seed of the run goes in its SEED environment variable (run.py reads it;
+# its config has no training seed), then run.py runs as the engine's own entry point
+AITK_LAUNCH = ("import os, runpy, sys\n"
+               "os.environ['SEED'] = sys.argv[2]\n"
+               "sys.argv = ['run.py', sys.argv[1]]\n"
+               "runpy.run_path('run.py', run_name='__main__')\n")
+
+
+def aitk_config(snap: dict, run_dir: Path) -> dict:
+    """The job for ai-toolkit (MiniMax H3-Image), in the engine's own option names (config/examples, the arch's
+    ui.tsx defaults: rank / alpha 16, adaln_proj left out of the LoRA, flowmatch, text embeddings cached, the
+    training adapter as a live assistant LoRA).  Every model file is given by path (model_kwargs), so the engine
+    downloads none.  Its own preview images are off: the comparison images are made by this tool's ComfyUI."""
+    v, files = snap["values"], snap["model"]["files"]
+    steps, every = int(v["max_train_steps"]), max(1, int(v["save_every_n_steps"]))
+    proc = {
+        "type": "sd_trainer", "training_folder": str(Path(run_dir) / "output"), "device": "cuda:0",
+        "network": {"type": "lora", "linear": int(v["network_dim"]), "linear_alpha": float(v["network_alpha"]),
+                    "network_kwargs": {"ignore_if_contains": ["adaln_proj"]}},
+        # every save kept: they are compared on the results page (the engine keeps 5 by default)
+        "save": {"dtype": "float16", "save_every": every, "max_step_saves_to_keep": steps // every + 2},
+        "datasets": [{"folder_path": str(Path(run_dir) / "dataset"), "caption_ext": "txt",
+                      "caption_dropout_rate": float(v.get("caption_dropout_rate") or 0), "shuffle_tokens": False,
+                      "cache_latents_to_disk": True, "resolution": [int(v["resolution"])]}],
+        "train": {"batch_size": int(v["train_batch_size"]), "steps": steps, "gradient_accumulation": 1, "train_unet": True,
+                  "train_text_encoder": False, "gradient_checkpointing": True, "noise_scheduler": "flowmatch",
+                  "timestep_type": "shift", "optimizer": v["optimizer_type"], "lr": float(v["learning_rate"]),
+                  "lr_scheduler": v["lr_scheduler"], "dtype": "bf16", "cache_text_embeddings": True,
+                  "disable_sampling": True, "skip_first_sample": True},
+        "model": {"name_or_path": "Comfy-Org/MiniMax-H3-Image", "arch": "minimax_h3_image", **h3_qtypes(files),
+                  "low_vram": False, "assistant_lora_path": files.get("adapter"),
+                  "model_kwargs": {"dit_path": files["ckpt"], "text_encoder_path": files["te"], "video_vae_path": files["vae"]}},
+        "sample": {"sampler": "flowmatch", "sample_every": steps + 1, "width": 2048, "height": 2048,
+                   "prompts": [snap.get("trigger") or "a picture"], "neg": "", "seed": int(v["seed"]), "walk_seed": False,
+                   "guidance_scale": 1, "sample_steps": 6},
+    }
+    return {"job": "extension", "config": {"name": snap["output_name"], "process": [proc]},
+            "meta": {"name": "[name]", "version": "1.0"}}
+
+
+def _aitk_command(snap: dict, run_dir: Path) -> list[str]:
+    """A resumed run is started the same way: ai-toolkit itself continues from the newest save in its folder (the
+    LoRA's step in its metadata, the optimizer from optimizer.pt), so the same job is written and run again."""
+    cfg_path = Path(run_dir) / "train_aitk.json"   # the engine reads JSON as well as YAML (toolkit/config.py)
+    config.atomic_write_json(cfg_path, aitk_config(snap, run_dir))
+    return [str(aitk_python()), "-c", AITK_LAUNCH, str(cfg_path), str(int(snap["values"]["seed"]))]
 
 
 def _sdxl_network_cfg(snap: dict, v: dict, ckpt: str, ds: Path, out_dir: Path, out_name: str) -> dict:
@@ -853,12 +967,28 @@ ERROR_RULES = [
       "他の GPU を使うアプリを閉じる"]),
     (re.compile(r"No space left|not enough space on the disk|Errno 28", re.I), "disk",
      "ディスクの空き容量が不足して停止しました。", ["不要な保存版やキャッシュを削除する", "空きのあるドライブにプロジェクトを置く"]),
+    # system memory, not VRAM (torch's CPU allocator, Python's MemoryError, numpy's "Unable to allocate", and Windows'
+    # 1455 "the paging file is too small"); \b keeps torch.OutOfMemoryError (VRAM, the rule above) out
+    (re.compile(r"DefaultCPUAllocator: not enough memory|\bMemoryError\b|Unable to allocate|WinError 1455", re.I), "ram",
+     "メインメモリ（または Windows のページングファイル）が足りずに停止しました。",
+     ["ほかのアプリ（ブラウザーのタブなど）を閉じてから、もう一度始める",
+      "Windows の仮想メモリ（ページングファイル）を「システム管理」にするか、大きくする"]),
+    # the tokenizer (Z-Image, MOSS-Image ...) is fetched from Hugging Face on the first run; the messages are those of
+    # transformers / huggingface_hub when the Hub cannot be reached and the files are not in the local cache
+    (re.compile(r"We couldn't connect to|LocalEntryNotFoundError|cannot find the requested files in the local cache", re.I),
+     "network",
+     "学習に必要なファイル（トークナイザーなど）を Hugging Face から取得できずに停止しました。",
+     ["インターネットにつながっているか確かめてから、もう一度始める（一度取得できれば、次からは通信なしで学習できます）"]),
     (re.compile(r"FileNotFoundError|No such file or directory", re.I), "missing",
      "必要なファイルが見つかりませんでした。", ["設定画面でモデルファイルの場所を確認する"]),
     (re.compile(r"safetensors_rust\.SafetensorError|HeaderTooLarge|invalid load key|Error while deserializing", re.I), "badmodel",
      "モデルファイルを読み込めませんでした（破損または非対応形式）。", ["モデルを再ダウンロードする", "モデルの種類（系列）の指定を確認する"]),
-    (re.compile(r"KeyError|size mismatch|Missing key", re.I), "incompatible",
+    (re.compile(r"size mismatch|Missing key|Unexpected key", re.I), "incompatible",
      "モデルの構造が学習スクリプトと一致しません。", ["モデルの系列（SDXL / Anima）の指定を確認する"]),
+    # a KeyError alone does not say what was missing (a model key, but also a dataset or cache entry)
+    (re.compile(r"KeyError"), "key",
+     "学習エンジンが、必要な項目を見つけられずに停止しました。モデルの系列の指定が合っていないときに起きることがあります。",
+     ["モデルの系列の指定を確認する", "技術ログで、見つからなかった項目の名前を確認する"]),
 ]
 
 
@@ -873,6 +1003,15 @@ def translate_error(log_tail: str, rc: int | None) -> dict:
 STEP_RE = re.compile(r"steps:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([\d:]+)<([\d:?]+),\s*([\d.?]+)\s*(s/it|it/s)?(?:,\s*(?:avr_)?loss=([\d.eE+-]+|nan))?")
 CACHE_RE = re.compile(r"(caching latents|cache_latents|Caching latents|caching text encoder|Encoding|cache text encoder)", re.I)
 TQDM_RE = re.compile(r"(\d+)%\|[^|]*\|\s*(\d+)/(\d+)")
+
+
+def aitk_step_re(name: str):
+    """ai-toolkit's training bar (ToolkitProgressBar, a tqdm whose description is the job name, postfix
+    "lr: 1.0e-04 loss: 3.215e-01"), in the groups of STEP_RE (step, total, elapsed, left, rate, unit, loss).  Its
+    other bars (caching latents ...) have other descriptions."""
+    return re.compile(re.escape(name) + r":\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)\s*\[([\d:]+)<([\d:?]+),\s*([\d.?]+)\s*(s/it|it/s)?"
+                      r"(?:,[^\]]*?\bloss:\s*([\d.eE+-]+|nan))?")
+
 
 # Running out of VRAM on Windows shows up as a run that suddenly becomes many times slower (measured: 1.39 s/step
 # -> 410 s/step), not as an error.  The shared memory counter sees it directly; the step time is the fallback when
@@ -928,19 +1067,30 @@ def last_vram_short(project, model_id: str) -> dict | None:
     return None
 
 
+NAN_STEPS = 10   # reported steps in a row whose loss is nan before the training screen says so
+
+
 def update_vram_warning(job) -> None:
-    """The warning on the training screen from what was seen (shared memory, step time), and a mark kept with the run
-    so the next start can say the same settings will be slow again."""
+    """The warning on the training screen from what was seen (shared memory, step time, a loss that stays nan), and
+    for VRAM a mark kept with the run so the next start can say the same settings will be slow again.  Nothing is
+    stopped: the user decides."""
     pr = job.progress
     spill, slow = pr.get("spill_gb"), pr.get("slow_x")
-    if not (spill or slow):
+    parts = []
+    if spill or slow:
+        fam, values = getattr(job, "vram_ctx", ("", {}))
+        seen = (f"VRAM が足りず、メインメモリ（約 {spill:.1f}GB）で代用しているため大幅に遅くなっています。" if spill else
+                f"学習の速さが、この回でいちばん速かったときの約 {slow:.0f} 分の 1 に落ちています。VRAM が足りず、メインメモリで代用している可能性があります。")
+        parts.append(seen + "停止して、次のどれかを試してください: " + vram_advice(fam, values) + "。")
+        pr["vram_short"] = {k: values[k] for k in VRAM_KEYS if k in values}
+    if pr.get("loss_nan") is not None:
+        parts.append(f"ステップ {pr['loss_nan']} から、loss が nan（数値として計算できていない状態）のまま続いています。"
+                     "学習が壊れていて、これ以降の保存版は使えない LoRA になっている可能性があります。停止して、"
+                     "それより前の保存版を比較で確かめるか、学習率を下げてやり直すことを検討してください。")
+    if parts:
+        pr["warning"] = "".join(parts)
+    else:
         pr.pop("warning", None)
-        return
-    fam, values = getattr(job, "vram_ctx", ("", {}))
-    seen = (f"VRAM が足りず、メインメモリ（約 {spill:.1f}GB）で代用しているため大幅に遅くなっています。" if spill else
-            f"学習の速さが、この回でいちばん速かったときの約 {slow:.0f} 分の 1 に落ちています。VRAM が足りず、メインメモリで代用している可能性があります。")
-    pr["warning"] = seen + "停止して、次のどれかを試してください: " + vram_advice(fam, values) + "。"
-    pr["vram_short"] = {k: values[k] for k in VRAM_KEYS if k in values}
 
 
 def resume_block_reason(snap: dict, state_path) -> str | None:
@@ -953,6 +1103,15 @@ def resume_block_reason(snap: dict, state_path) -> str | None:
       checked on the pinned sources against a model of the engine's loop (test_sd_resume.py), not by a real resume."""
     if snap.get("enhance"):
         return "質感・補強 LoRA は途中からの再開に対応していません。"
+    if snap.get("engine") == AITK:
+        # ai-toolkit keeps one optimizer.pt, written over at every save: the run continues from its newest save only
+        # (an older saved LoRA has no optimizer of its own any more)
+        step = aitk_latest_step(Path(state_path).parent, snap["output_name"])
+        if step is None:
+            return "再開に使う保存版（LoRA と optimizer.pt）が見つかりません。"
+        if step >= int(snap["values"]["max_train_steps"]):
+            return "この保存地点は学習の最後です。続きはありません。"
+        return None
     if snap.get("engine") not in ("sd-scripts", "sd-scripts-moss"):
         return ("このモデルの学習エンジン（musubi-tuner）は、保存地点からの再開でステップ数が 0 から数え直され、"
                 "設定したステップ数を最初から学習し直してしまうため、再開できません。保存済みの LoRA は比較・書き出しに使えます。")
@@ -982,11 +1141,27 @@ def lora_file_complete(path: Path) -> bool:
         return False
 
 
+def aitk_latest_step(save_root: Path, name: str) -> int | None:
+    """The step of ai-toolkit's newest numbered save (<name>_000000250.safetensors) that is whole."""
+    best = None
+    try:
+        for p in Path(save_root).iterdir():
+            m = re.fullmatch(re.escape(name) + r"_(\d{9})\.safetensors", p.name)
+            if m and lora_file_complete(p):
+                best = max(best or 0, int(m.group(1)))
+    except OSError:
+        return None
+    return best
+
+
 def state_is_complete(path: Path) -> bool:
     """A resumable state dir must contain train_state.json, the model and a complete optimizer file.
-    torch.save writes zip archives; a file cut off mid-write has no central directory."""
+    torch.save writes zip archives; a file cut off mid-write has no central directory.  ai-toolkit's state is its
+    one optimizer.pt file (a torch zip archive as well)."""
     import zipfile
     path = Path(path)
+    if path.name == "optimizer.pt":
+        return path.is_file() and zipfile.is_zipfile(path)
     if not (path / "train_state.json").exists():
         return False
     bins = list(path.glob("*.bin"))
@@ -1017,6 +1192,7 @@ class Job:
         self.vram_ctx: tuple[str, dict] = ("", {})   # (family, values) of the run, for the VRAM advice
         self.stopped_at_save = False             # the safe stop reached its save point and ended the engine itself
         self.caches_done = False                 # the engine's separate cache commands all ended well
+        self.engine_tidied = False               # Runner._after_engine ran (once per run)
         self.progress = {"phase": "queued", "step": 0, "total": None, "loss": None, "speed": None, "eta_s": None,
                          "message": "待機中"}
 
@@ -1293,15 +1469,38 @@ class Runner:
             job.output_name = job.project.run(job.run_id)["config"]["output_name"]
         name = job.output_name
         found = []
+        aitk_opt = None   # ai-toolkit's optimizer.pt: the state of its newest save (written over at every save)
         for p in out_dir.iterdir():
             m = re.fullmatch(re.escape(name) + r"-step(\d+)(-state)?(\.safetensors)?", p.name)
+            a = re.fullmatch(re.escape(name) + r"_(\d{9})\.safetensors", p.name)   # ai-toolkit: <name>_000000250
             if m and (m.group(2) or m.group(3)):
                 found.append((int(m.group(1)), str(p), "state" if m.group(2) else "lora"))
+            elif a:
+                found.append((int(a.group(1)), str(p), "lora"))
+            elif p.name == "optimizer.pt":
+                aitk_opt = p
             elif p.name == name + ".safetensors":
                 found.append((None, str(p), "lora"))
             elif p.name == name + "-state":
                 found.append((None, str(p), "state"))
         new_steps = []
+        if aitk_opt is not None:
+            # it goes with the newest numbered save it is not older than (written right after that LoRA)
+            saves = [(s, p) for s, p, k in found if k == "lora" and s is not None]
+            try:
+                t_opt = aitk_opt.stat().st_mtime
+                newest = max(saves, key=lambda x: x[0]) if saves else None
+                if newest and t_opt >= os.path.getmtime(newest[1]) - 1:
+                    with job.project.tx() as db:
+                        row = db.execute("SELECT id, step FROM checkpoints WHERE run_id=? AND path=?",
+                                         (job.run_id, str(aitk_opt))).fetchone()
+                        if row and row["step"] != newest[0]:
+                            db.execute("UPDATE checkpoints SET step=?, created=? WHERE id=?", (newest[0], time.time(), row["id"]))
+                            new_steps.append((newest[0], "state"))
+                    if not row:
+                        found.append((newest[0], str(aitk_opt), "state"))
+            except OSError:
+                pass
         with job.project.tx() as db:
             known = {r["path"] for r in db.execute("SELECT path FROM checkpoints WHERE run_id=?", (job.run_id,))}
             for step, path, kind in found:
@@ -1335,7 +1534,7 @@ class Runner:
         run = job.project.run(job.run_id)
         snap = run["config"]
         run_dir = Path(run["run_dir"])
-        out_dir = run_dir / "output"
+        out_dir = run_out_dir(run_dir, snap)
         logs = run_dir / "logs"
         logs.mkdir(exist_ok=True)
         self._set(job.project, job.run_id, status="preparing", error=None,
@@ -1366,35 +1565,89 @@ class Runner:
         try:
             return self._run_cmds(job, snap, run_dir, out_dir, logs, cmds, total)
         finally:
-            if not traincache.keep():   # the user keeps no training caches: this run's go when it ends
-                try:
-                    traincache.clear_run(run_dir)
-                except Exception:
-                    pass
-            # caching is finished once training steps run, or (musubi-tuner) once its separate cache commands ended
-            # well: a run that then fails while loading the model must not make the next one encode everything again
-            elif (job.progress.get("step") or 0) > 0 or job.caches_done:
-                try:
-                    traincache.harvest(job.project.path, run_dir, snap)
-                except Exception:
-                    pass
-            merged = run_dir / "copy" / "merged.safetensors"   # texture LoRA from image pairs: ~7GB, only needed while training
-            if merged.exists():
-                try:
-                    merged.unlink()
-                except OSError:
-                    pass
+            self._after_engine(job, run_dir, snap)
+
+    def _drop_states(self, job: Job, out_dir: Path, name: str) -> dict:
+        """Remove the resume states of a finished run (the engine keeps several, each about the LoRA's size and
+        its optimizer's: GBs at a high rank).  Only the run's own state folders in its output folder are touched
+        (<name>-step########-state, <name>-state); the saved LoRAs stay.  A folder that cannot be removed now
+        (held by a virus scan) stays listed, as "学習データを破棄" can still remove it.  -> {"n", "bytes"}."""
+        pat = re.compile(re.escape(name) + r"(?:-step\d+)?-state")
+        out = Path(out_dir).resolve()
+        n = size = 0
+        try:
+            dirs = [p for p in Path(out_dir).iterdir() if p.is_dir() and pat.fullmatch(p.name)]
+        except OSError:
+            return {"n": 0, "bytes": 0}
+        gone = set()
+        opt = Path(out_dir) / "optimizer.pt"   # ai-toolkit's one state file
+        if opt.is_file() and not opt.is_symlink():
+            try:
+                b = opt.stat().st_size
+                opt.unlink()
+                n, size = n + 1, size + b
+                gone.add(str(opt))
+            except OSError:
+                pass
+        for d in dirs:
+            if d.resolve().parent != out:   # a link pointing elsewhere: never followed
+                continue
+            try:
+                b = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                shutil.rmtree(d)
+            except OSError:
+                continue
+            n, size = n + 1, size + b
+            gone.add(str(d))
+        if gone:
+            with job.project.tx() as db:
+                for r in db.execute("SELECT id, path FROM checkpoints WHERE run_id=? AND kind='state'", (job.run_id,)).fetchall():
+                    if r["path"] in gone or not Path(r["path"]).exists():
+                        db.execute("DELETE FROM checkpoints WHERE id=?", (r["id"],))
+        return {"n": n, "bytes": size}
+
+    def _after_engine(self, job: Job, run_dir: Path, snap: dict):
+        """What is done once the engine's commands have ended, however they ended.  A finished run does it before
+        its comparison images (_run_cmds), not after them: the app closed during the comparison would otherwise
+        leave the run's caches unstored (the next run encodes every image again) and the merged model on the disk."""
+        if job.engine_tidied:
+            return
+        job.engine_tidied = True
+        try:
+            keep = traincache.keep()
+        except Exception:
+            keep = True
+        if not keep:   # the user keeps no training caches: this run's go when it ends
+            try:
+                traincache.clear_run(run_dir)
+            except Exception:
+                pass
+        # caching is finished once training steps run, or (musubi-tuner) once its separate cache commands ended
+        # well: a run that then fails while loading the model must not make the next one encode everything again
+        elif (job.progress.get("step") or 0) > 0 or job.caches_done:
+            try:
+                traincache.harvest(job.project.path, run_dir, snap)
+            except Exception:
+                pass
+        merged = Path(run_dir) / "copy" / "merged.safetensors"   # texture LoRA from image pairs: ~7GB, only needed while training
+        if merged.exists():
+            try:
+                merged.unlink()
+            except OSError:
+                pass
 
     def _run_cmds(self, job: Job, snap, run_dir: Path, out_dir: Path, logs: Path, cmds, total: int):
         def is_cache(c) -> bool:
             return any("cache_latents" in Path(a).name or "cache_text_encoder_outputs" in Path(a).name for a in c[1][1:3])
 
+        ended_itself = False   # the last command ran to its end and exited with 0 (not ended by a stop)
         for i, cmd in enumerate(cmds):
             phase, argv, cwd = cmd[:3]
             if job.stop_requested_at:
                 break
             log_path = logs / f"{i:02d}_{phase}.log"
             rc, tail = self._exec(job, phase, argv, cwd, log_path, cmd[3] if len(cmd) > 3 and cmd[3] else total, out_dir, snap)
+            ended_itself = rc == 0 and i == len(cmds) - 1
             if rc == 0 and is_cache(cmd) and not any(is_cache(c) for c in cmds[i + 1:]):
                 job.caches_done = True
             # a safe stop ends the engine itself once the save point is written.  An engine that ended with an error
@@ -1409,24 +1662,33 @@ class Runner:
                           progress={**job.progress, "phase": "failed", "message": err["message"]})
                 return
         self._register_checkpoints(job, out_dir, final=True, last_step=total)
-        if job.stop_requested_at:
+        final = out_dir / (snap["output_name"] + ".safetensors")
+        # a safe stop was accepted, but the engine reached the end of the run by itself before the save point was seen
+        # (few steps were left): the LoRA is finished, so this is a finished run with its comparison, not a 中止
+        overtaken = bool(job.stop_requested_at and ended_itself and not job.force and not job.stopped_at_save and final.exists())
+        if job.stop_requested_at and not overtaken:
             msg = "強制停止しました。" if job.force else "保存地点で停止しました。"
             self._set(job.project, job.run_id, status="cancelled", ended=time.time(),
                       progress={**job.progress, "phase": "cancelled", "message": msg})
             return
-        final = out_dir / (snap["output_name"] + ".safetensors")
         if not final.exists():
             self._set(job.project, job.run_id, status="failed", ended=time.time(),
                       error={"code": "nooutput", "message": "学習は終了しましたが LoRA ファイルが見つかりません。", "fixes": ["技術ログを確認する"]},
                       progress={**job.progress, "phase": "failed"})
             return
+        # the run is finished: from here it can only end as done (also when the app is closed during the comparison,
+        # server._recover_project), and only a stopped or failed run is resumed - its resume states are dead weight
+        dropped = self._drop_states(job, out_dir, snap["output_name"])
+        if dropped["n"]:
+            job.progress["states_removed"] = dropped
         job.progress.update(phase="evaluating", step=total, total=total, eta_s=None, message="学習完了。比較画像を準備中")
         self._set(job.project, job.run_id, status="evaluating", progress=dict(job.progress))
+        self._after_engine(job, run_dir, snap)
         for fn in self.after_train_hooks:
             fn(job.project, job.run_id)
 
     def _exec(self, job: Job, phase, argv, cwd, log_path: Path, total: int, out_dir: Path, snap: dict | None = None):
-        engine = next((e for e in ("sd-scripts", "musubi-tuner", "musubi-tuner-qwen21", "sd-scripts-moss") if Path(cwd) == engine_cwd(e)), "")
+        engine = next((e for e in ("sd-scripts", "musubi-tuner", "musubi-tuner-qwen21", "sd-scripts-moss", AITK) if Path(cwd) == engine_cwd(e)), "")
         env = engine_env(engine)
         flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -1449,7 +1711,6 @@ class Runner:
         if snap is None:   # the run's snapshot holds every caption: the caller passes the one it has
             snap = job.project.run(job.run_id)["config"]
         job.vram_ctx = (snap["model"]["family"], snap["values"])
-        threading.Thread(target=watch_vram, daemon=True, name="vram-watch").start()
         # runs without optimizer states (texture LoRA, musubi-tuner) stop safely at the next saved LoRA file instead
         stop_kind = "state" if saves_state(snap) else "lora"
         if phase == "merge":
@@ -1459,17 +1720,21 @@ class Runner:
             logf.write(("$ " + " ".join(argv) + "\n").encode("utf-8"))
             job.proc = subprocess.Popen(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                         creationflags=flags)
+            # started only now: an engine that could not be started (Popen raised) never reaches watch_stop.set()
+            # below, and the watcher would wake every 20 s for the rest of the session
+            threading.Thread(target=watch_vram, daemon=True, name="vram-watch").start()
             if job.force:
                 kill_tree(job.proc.pid)   # force stop arrived while the previous command was ending
+            step_re = aitk_step_re(snap["output_name"]) if snap.get("engine") == AITK else STEP_RE
             try:
-                return self._read_engine(job, phase, total, out_dir, logf, stop_kind)
+                return self._read_engine(job, phase, total, out_dir, logf, stop_kind, step_re)
             finally:
                 watch_stop.set()
                 if job.proc.poll() is None:   # an exception while reading: the engine must not keep the GPU
                     kill_tree(job.proc.pid)
                 self._publish(job)
 
-    def _read_engine(self, job: Job, phase, total: int, out_dir: Path, logf, stop_kind: str):
+    def _read_engine(self, job: Job, phase, total: int, out_dir: Path, logf, stop_kind: str, step_re=STEP_RE):
         tail = []
         buf = b""
         last_pub = 0.0
@@ -1478,6 +1743,7 @@ class Runner:
         win = None          # (time, step) where the current speed window began
         best = None         # fastest window of this command (s/step)
         slow_n = 0          # slow windows in a row
+        nan_n, nan_from, nan_last = 0, None, None   # reported steps in a row with loss=nan, the first and the last of them
         last_poll = 0.0
         stream = job.proc.stdout
         while True:
@@ -1495,7 +1761,7 @@ class Runner:
                 tail.append(line)
                 if len(tail) > 300:
                     del tail[:100]
-                m = STEP_RE.search(line)
+                m = step_re.search(line)
                 if m and phase == "copy":
                     # texture LoRA from image pairs: the preparatory LoRA is not the result; report it as preparation
                     job.progress["message"] = f"準備中（下準備 1/2: 加工前の画像を覚え込ませています {m.group(1)}/{m.group(2)}）"
@@ -1513,6 +1779,17 @@ class Runner:
                         t_first, step_first = now, step
                     loss = m.group(7)
                     job.progress.update(step=step, total=tot, loss=float(loss) if loss and loss != "nan" else None)
+                    if loss == "nan":
+                        if step != nan_last:   # the bar is printed more than once for a slow step
+                            nan_n, nan_last = nan_n + 1, step
+                            nan_from = step if nan_from is None else nan_from
+                        if nan_n >= NAN_STEPS and job.progress.get("loss_nan") != nan_from:
+                            job.progress["loss_nan"] = nan_from
+                            update_vram_warning(job)
+                    elif loss:
+                        nan_n, nan_from, nan_last = 0, None, None
+                        if job.progress.pop("loss_nan", None) is not None:
+                            update_vram_warning(job)
                     if win is None or step < win[1]:
                         win = (now, step)
                     elif step - win[1] >= SLOW_WINDOW:

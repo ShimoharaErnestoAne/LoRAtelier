@@ -22,7 +22,7 @@ from . import config
 from .enginefetch import MARK as BUNDLE_MARK   # in a copy made without git: the commit the files are from
 from .enginefetch import fetch_archive, forget_mark, head_commit
 from .events import bus
-from .models import CATALOG, catalog_entry, registry
+from .models import CATALOG, catalog_entry, registry, trainable
 from .remote import NoAuthOffHost
 
 LOCK_FILE = config.ROOT / "engines.lock.json"
@@ -63,7 +63,8 @@ def _engine_ready(name: str) -> bool:
     d = engine_dir(name)
     # read from the folder, never by starting git: LoRAtelier is used on PCs without git, and this is asked on every
     # ComfyUI start and every redraw of the model list
-    return head_commit(d) == e["commit"] and (not e.get("patch") or _patch(e).applied(d))
+    return (head_commit(d) == e["commit"] and (not e.get("patch") or _patch(e).applied(d))
+            and (not e.get("env_lock") or env_ready(e)))
 
 
 def _patch(e: dict):
@@ -116,9 +117,10 @@ def _fetch_engine(e: dict, d: Path) -> None:
     fetch_archive(e["url"], e["commit"], d)
 
 
-def install_engine(name: str) -> None:
+def install_engine(name: str, st: dict | None = None) -> None:
     """Fetch an optional engine at its pinned commit and install its pinned pip packages into the env
-    it belongs to.  Idempotent.  Works on a PC without git."""
+    it belongs to.  Idempotent.  Works on a PC without git.  An engine with an env of its own ("env_lock": ai-toolkit)
+    gets that env made here (st: the download state, whose message says what is being done)."""
     _ready.pop(name, None)
     e = _lockfile()["engines"][name]
     d = engine_dir(name)
@@ -126,6 +128,8 @@ def install_engine(name: str) -> None:
         _fetch_engine(e, d)
     if e.get("patch"):
         _patch(e).apply(d)
+    if e.get("env_lock"):
+        ensure_env(e, st)
     if e.get("pip"):
         py = config.ENVS_DIR / e["env"] / "Scripts" / "python.exe"
         uv = shutil.which("uv") or (config.ROOT / "tools" / "uv" / "uv.exe")
@@ -134,6 +138,115 @@ def install_engine(name: str) -> None:
         else:   # the envs are created with pip seeded
             _run([py, "-m", "pip", "install", *e["pip"]])
     _ready.pop(name, None)   # a check made during the install is out of date
+
+
+# ------------------------------------------------------------------ an engine's own Python environment
+# ai-toolkit (MiniMax H3-Image training) needs torch 2.13 / transformers 5, which cannot share envs/train (torch 2.8).
+# Its env is made only when a model that needs it is added (several GB), never by setup.bat for everyone.
+ENV_MARK = ".lorastudio_env"   # in the env folder: what it was made from (lock file, CUDA build); written last
+
+
+def _uv() -> str:
+    """The uv setup.bat fetched (tools/uv), else one on PATH."""
+    local = config.ROOT / "tools" / "uv" / "uv.exe"
+    if local.exists():
+        return str(local)
+    found = shutil.which("uv")
+    if not found:
+        raise RuntimeError("uv（Python の環境を作る道具）が見つかりません。setup.bat を一度実行してから、もう一度追加してください。")
+    return found
+
+
+def _uv_env() -> dict:
+    """As setup_env.py: the uv-managed Python in tools/python, the package cache in tools/uv-cache."""
+    return dict(os.environ, UV_PYTHON_INSTALL_DIR=os.environ.get("UV_PYTHON_INSTALL_DIR", str(config.ROOT / "tools" / "python")),
+                UV_CACHE_DIR=os.environ.get("UV_CACHE_DIR", str(config.ROOT / "tools" / "uv-cache")))
+
+
+def env_python(e: dict) -> Path:
+    return config.ENVS_DIR / e["env"] / "Scripts" / "python.exe"
+
+
+def _env_mark(e: dict, flavor: str) -> str:
+    lock = (config.ENVS_DIR / e["env_lock"]).read_bytes()
+    raw = json.dumps([e.get("env_python"), e.get("env_torch"), flavor], sort_keys=True).encode() + b"\0" + lock
+    return hashlib.sha256(raw).hexdigest()
+
+
+def env_ready(e: dict) -> bool:
+    """The env was made from this lock file (a lock file changed by an update makes it out of date).  Read from the
+    mark file only: no Python is started (asked on every redraw of the model list)."""
+    try:
+        made = json.loads((config.ENVS_DIR / e["env"] / ENV_MARK).read_text(encoding="utf-8"))
+        return env_python(e).exists() and made.get("mark") == _env_mark(e, made.get("flavor", ""))
+    except (OSError, ValueError, KeyError, AttributeError):
+        return False
+
+
+def _nvidia_cuda() -> tuple[int, int] | None:
+    """The highest CUDA version the NVIDIA driver runs, from nvidia-smi's banner ("CUDA Version: 13.0", on recent
+    Windows drivers "CUDA UMD Version: 13.0"), as ai-toolkit's manager/detect.py reads it.  None: not known."""
+    import re
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return None
+    try:
+        out = subprocess.run([smi], capture_output=True, text=True, timeout=15,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"CUDA(?:\s+[A-Z]+)?\s+Version:\s*([0-9]+)\.([0-9]+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def aitk_flavor(cuda: tuple[int, int] | None) -> str:
+    """The CUDA build of torch for the driver, as ai-toolkit's manager/spec.py _cuda_flavor chooses it: cu130 from
+    CUDA 13.0 (and when the version is not known), cu126 from 12.6.  Older drivers cannot run the pinned torch.
+    (The engine also refuses cu126 for Blackwell GPUs; a driver new enough for those reports 13.0 or higher.)"""
+    if cuda is None or cuda >= (13, 0):
+        return "cu130"
+    if cuda >= (12, 6):
+        return "cu126"
+    raise RuntimeError(f"NVIDIA のドライバーが古いため、MiniMax H3-Image の学習エンジンを入れられません（このドライバーが対応する CUDA は "
+                       f"{cuda[0]}.{cuda[1]} で、12.6 以上が必要です）。ドライバーを更新してから、もう一度追加してください。")
+
+
+def ensure_env(e: dict, st: dict | None = None) -> Path:
+    """Make (or bring up to date) the engine's env from its lock file: Python of its own version (uv-managed, no
+    Python on the PC needed), the pinned packages, and torch in the CUDA build the driver runs.  Idempotent; an env
+    whose mark does not match is installed into again (uv only changes what differs).  -> the env's python.exe."""
+    py, d = env_python(e), config.ENVS_DIR / e["env"]
+    if env_ready(e):
+        return py
+    flavor = aitk_flavor(_nvidia_cuda())
+    uv, env = _uv(), _uv_env()
+
+    def say(msg):
+        if st is not None:
+            st["message"] = msg
+
+    def run(argv):
+        r = subprocess.run([str(a) for a in argv], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env=env, cwd=str(config.ROOT), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            raise RuntimeError(f"学習エンジンの環境（envs\{e['env']}）を作れませんでした: {(r.stderr or r.stdout)[-800:]}")
+        return r.stdout
+
+    (d / ENV_MARK).unlink(missing_ok=True)   # not ready until all of it is in
+    if py.exists() and subprocess.run([str(py), "-c", "pass"], capture_output=True).returncode:
+        shutil.rmtree(d, ignore_errors=True)   # e.g. the folder was moved: the env points at a Python that is gone
+    if not py.exists():
+        say(f"学習エンジンの環境を作っています（Python {e['env_python']}）")
+        run([uv, "venv", str(d), "--python", e["env_python"], "--python-preference", "only-managed", "--seed"])
+    pins = [f"{k}=={v}+{flavor}" for k, v in (e.get("env_torch") or {}).items()]
+    say(f"学習エンジンの部品を入れています（torch の {flavor} 版など。数 GB あり、時間がかかります）")
+    run([uv, "pip", "install", "--python", str(py), "-r", str(config.ENVS_DIR / e["env_lock"]), *pins,
+         "--extra-index-url", f"https://download.pytorch.org/whl/{flavor}", "--index-strategy", "unsafe-best-match"])
+    out = run([py, "-c", "import torch; print(torch.__version__)"]).strip()
+    if flavor not in out:
+        raise RuntimeError(f"学習エンジンの環境に入った torch が想定と違います（{out}、想定は {flavor} 版）。")
+    (d / ENV_MARK).write_text(json.dumps({"mark": _env_mark(e, flavor), "flavor": flavor, "torch": out}), encoding="utf-8")
+    return py
 
 
 PPM = "ComfyUI-ppm"
@@ -359,49 +472,66 @@ def _download(repo: str, path: str, dest: Path, token: str | None, st: dict, gb:
                 return dest
             dest = _free_name(dest)
         tmp = _part_file(url, dest)
-        have = tmp.stat().st_size if tmp.exists() else 0
-        req = urllib.request.Request(url)
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        if have:
-            req.add_header("Range", f"bytes={have}-")
-        expected = None
+        from .remote import drop_part, with_retries
+        base = st["done_bytes"]   # what the files before this one counted: each try counts this file from there
         try:
-            with _opener.open(req, timeout=60) as r:
-                if have and r.status != 206:   # server ignored the range: start over
-                    have = 0
-                length = r.headers.get("Content-Length")
-                expected = have + int(length) if length and length.isdigit() else None
-                st["done_bytes"] += have
-                with open(tmp, "ab" if have else "wb") as f:
-                    while chunk := r.read(8 << 20):
-                        if st.get("cancel"):
-                            raise Cancelled
-                        f.write(chunk)
-                        st["done_bytes"] += len(chunk)
+            # a connection that drops part way is continued from the .part by itself, a few times
+            with_retries(st, lambda: _fetch_part(url, tmp, dest, token, st, base), Cancelled,
+                         lambda: bus.publish("download", id=st.get("id"), state="running"))   # the countdown on the page
         except Cancelled:
-            tmp.unlink(missing_ok=True)
+            drop_part(tmp)
             raise
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                raise NeedLogin(str(e)) from e
-            if not (e.code == 416 and have):   # 416: the .part is already whole (the last try ended after the last byte)
-                raise
-        except OSError as e:   # timeout, reset: the .part is kept
-            from .remote import disk_full
-            if disk_full(e):
-                raise RuntimeError(f"空き容量がなくなったため、{dest.name} のダウンロードを中断しました。"
-                                   "空きを増やしてからもう一度追加すると、続きから取得します。") from e
-            raise RuntimeError(f"{dest.name} のダウンロード中に接続が切れました。もう一度追加すると続きから取得します。") from e
-        # read() returns b"" when the connection drops early: a short file must not be installed.  Without a length
-        # from the server, a safetensors file is checked against its own header
-        from .remote import _incomplete
-        short = _incomplete(tmp, dest.name, expected)
-        if short:
-            raise RuntimeError(f"{dest.name} のダウンロードが途中で切れました（{short}）。"
-                               "もう一度追加すると続きから取得します。")
         tmp.replace(dest)
+        drop_part(tmp)   # the ETag note of the .part
         return dest
+
+
+def _fetch_part(url: str, tmp: Path, dest: Path, token: str | None, st: dict, base: int) -> None:
+    """One try of a catalog file into its .part, continuing what is there.  remote.CutOff: it stopped part way."""
+    from .remote import CutOff, resume_headers, resumed, retryable_http
+    have = tmp.stat().st_size if tmp.exists() else 0
+    st["done_bytes"] = base
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    for k, v in resume_headers(tmp, have).items():   # Range, and If-Range with the ETag noted for this .part
+        req.add_header(k, v)
+    expected = None
+    try:
+        with _opener.open(req, timeout=60) as r:
+            # 0: the server sent the whole file (it ignored the range, or the file was replaced at the source
+            # since the .part was begun): start over
+            have = resumed(tmp, r, have)
+            length = r.headers.get("Content-Length")
+            expected = have + int(length) if length and length.isdigit() else None
+            st["done_bytes"] += have
+            with open(tmp, "ab" if have else "wb") as f:
+                while chunk := r.read(8 << 20):
+                    if st.get("cancel"):
+                        raise Cancelled
+                    f.write(chunk)
+                    st["done_bytes"] += len(chunk)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise NeedLogin(str(e)) from e
+        if e.code == 416 and have:   # 416: the .part is already whole (the last try ended after the last byte)
+            pass
+        elif retryable_http(e.code):
+            raise CutOff(f"{dest.name} の配布元のサーバーが一時的に応答できませんでした（HTTP {e.code}）。") from e
+        else:
+            raise
+    except OSError as e:   # timeout, reset: the .part is kept and continued
+        from .remote import disk_full
+        if disk_full(e):
+            raise RuntimeError(f"空き容量がなくなったため、{dest.name} のダウンロードを中断しました。"
+                               "空きを増やしてからもう一度追加すると、続きから取得します。") from e
+        raise CutOff(f"{dest.name} のダウンロード中に接続が切れました。") from e
+    # read() returns b"" when the connection drops early: a short file must not be installed.  Without a length
+    # from the server, a safetensors file is checked against its own header
+    from .remote import _incomplete
+    short = _incomplete(tmp, dest.name, expected)
+    if short:
+        raise CutOff(f"{dest.name} のダウンロードが途中で切れました（{short}）。")
 
 
 def cancel(cid: str) -> bool:
@@ -472,7 +602,8 @@ def _work(entry: dict, sources: dict, token: str | None, st: dict) -> None:
             if st.get("cancel"):
                 raise Cancelled
             st["message"] = f"追加の部品を準備中: {eng}"
-            install_engine(eng)
+            # (an engine with an env of its own is told the state, whose message then says what it installs)
+            install_engine(eng, st) if (_lockfile()["engines"].get(eng) or {}).get("env_lock") else install_engine(eng)
         if st.get("cancel"):
             raise Cancelled
         if needs.get("tokenizers"):
@@ -510,7 +641,7 @@ def catalog_view() -> list[dict]:
         rec = {k: recommend(c, k) for k in c.get("choices", {})}
         files = resolve_files(c, rec)
         out.append({**c, "files": files, "size_gb": round(sum(f[2] for f in files.values()), 1), "recommended": rec,
-                    "installed_model": m["id"] if m else None, "dl": _state.get(c["id"]),
+                    "installed_model": m["id"] if m else None, "dl": _state.get(c["id"]), "train": trainable(c["variant"]),
                     # what worked with it on this PC (an add-on to a model has no record of its own)
                     "checked": (m.get("checked") or {}) if m and not c.get("merge") else None})
     return out

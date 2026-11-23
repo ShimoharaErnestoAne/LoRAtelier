@@ -158,7 +158,32 @@ def _replace_with_link(target: Path, master: Path):
     if tmp.exists():
         tmp.unlink()
     os.link(master, tmp)
-    os.replace(tmp, target)
+    try:
+        os.replace(tmp, target)
+    except OSError:
+        # the target is in use (a generation has it open): it stays as it was, and so does the folder (no .lslink)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _remember_hash(p: Path, digest: str) -> None:
+    """A hash read just now, kept for the file as it is after it became a link: its time is now the master's, so
+    the key the hash was cached under no longer fits, and the next training or export would read all its GBs
+    again for the same hash."""
+    try:
+        st = p.stat()
+    except OSError:
+        return
+    _hash_cache[f"{p}|{st.st_size}|{st.st_mtime_ns}"] = digest
+    saved_key = f"{p}|{st.st_size}|{int(st.st_mtime)}"   # models.Hasher._key
+    with config.Settings._lock:
+        cache = dict(config.settings().get("hash_cache", {}))
+        if cache.get(saved_key) != digest:
+            cache[saved_key] = digest
+            config.settings().set("hash_cache", cache)
 
 
 def link_duplicates(items: list[dict]) -> dict:
@@ -173,12 +198,14 @@ def link_duplicates(items: list[dict]) -> dict:
             continue
         t, m = Path(it["tool"]), Path(it["comfy"])
         try:
-            if t.stat().st_size != m.stat().st_size or _sha256(t, fresh=True) != _sha256(m, fresh=True):
+            digest = _sha256(t, fresh=True)
+            if t.stat().st_size != m.stat().st_size or digest != _sha256(m, fresh=True):
                 errors.append(f"{t.name}: 確認後に内容が変わったため、そのままにしました")
                 continue
             old = t.stat()
             others = [s for s in staged if s.stat().st_ino == old.st_ino and s.stat().st_dev == old.st_dev and s != t]
             _replace_with_link(t, m)
+            _remember_hash(t, digest)
             for s in others:
                 _replace_with_link(s, m)
             done += 1

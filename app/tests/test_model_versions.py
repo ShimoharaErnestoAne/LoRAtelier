@@ -7,6 +7,7 @@ import json
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,8 @@ def _fake_fetch(monkeypatch):
             _st(dest, QWEN if "diffusion_models" in str(dest) and dest.suffix == ".safetensors" else {"x": "BF16"})
         return dest
     monkeypatch.setattr(addons, "_download", dl)
+    # the free-space check must not depend on the drive the tests happen to run on (the fake files are a few bytes)
+    monkeypatch.setattr(addons.shutil, "disk_usage", lambda p: SimpleNamespace(total=10 ** 13, used=0, free=10 ** 13))
     monkeypatch.setattr(addons, "install_engine", lambda name: None)
     monkeypatch.setattr(addons, "fetch_tokenizers", lambda repos: None)
 

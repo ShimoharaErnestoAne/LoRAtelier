@@ -36,10 +36,21 @@ def count_blocks(path: str | os.PathLike) -> int | None:
     return max(found) + 1 if found else None
 
 
+def engine_counts_blocks(anima_utils) -> bool:
+    """sd-scripts v0.13.0 builds the DiT at the block count of the checkpoint itself (PR #2486): nothing to patch then.
+    Told from the loader's source; when it cannot be read, the patch is applied (with the block count right it
+    changes nothing)."""
+    import inspect
+    try:
+        return 'dit_config["num_blocks"] = num_blocks' in inspect.getsource(anima_utils.load_anima_model)
+    except (OSError, TypeError):
+        return False
+
+
 def install() -> None:
     """Patch the engine's loader (library.anima_utils) in memory.  Call after the engine folder is on sys.path."""
     from library import anima_models, anima_utils
-    if getattr(anima_utils, "_loratelier_blocks", False):
+    if getattr(anima_utils, "_loratelier_blocks", False) or engine_counts_blocks(anima_utils):
         return
     load, init = anima_utils.load_anima_model, anima_models.Anima.__init__
     wanted: dict[str, int] = {}

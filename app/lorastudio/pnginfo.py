@@ -144,6 +144,19 @@ def parse_a1111(text: str) -> dict:
 
 
 # ------------------------------------------------------------------------------------------ ComfyUI
+TEXT_KEYS = ("text", "text_g", "text_l", "prompt", "string", "value", "t5xxl", "clip_l")
+
+
+def text_keys(inputs: dict, ref: Any, side: str) -> tuple:
+    """The inputs of a text node that hold the text of this link.  A node encoding the prompt and the negative together
+    (TextEncodeQwenImage21, MOSSImageEditTextEncode, TextEncodeFibo2 ...: outputs positive, negative) has both texts:
+    the one of the output the link takes is read (the second output is the negative), not its prompt for both sides."""
+    if "negative_prompt" not in inputs:
+        return TEXT_KEYS
+    out = ref[1] if isinstance(ref, list) and len(ref) > 1 and isinstance(ref[1], int) else None
+    return ("negative_prompt",) if (out == 1 if out is not None else side == "negative") else TEXT_KEYS
+
+
 def _comfy_texts(graph: dict, ref: Any, side: str, depth: int = 0) -> list[str]:
     """From a sampler's positive / negative input back to the text nodes (through ControlNet apply,
     Conditioning combine ... on the same side).  As i2t's _comfy_texts."""
@@ -154,7 +167,7 @@ def _comfy_texts(graph: dict, ref: Any, side: str, depth: int = 0) -> list[str]:
         return []
     inputs = node.get("inputs") or {}
     texts: list[str] = []
-    for key in ("text", "text_g", "text_l", "prompt", "string", "value", "t5xxl", "clip_l"):
+    for key in text_keys(inputs, ref, side):
         value = inputs.get(key)
         if isinstance(value, str) and value.strip():
             texts.append(value.strip())

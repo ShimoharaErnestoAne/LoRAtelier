@@ -21,6 +21,8 @@ import os
 import shutil
 from pathlib import Path
 
+from .presets import min_bucket_reso
+
 CACHE_VERSION = 1   # bump when the dataset settings written by training.py change
 _TE_SUFFIXES = ("_te.npz", "_te_outputs.npz", "_te.safetensors")
 _SD_ENGINES = ("sd-scripts", "sd-scripts-moss")
@@ -35,14 +37,25 @@ def _file_id(path: str) -> list:
 
 
 def group_key(snap: dict) -> str | None:
-    """None: this run does not share caches (texture LoRA runs build their own image pairs)."""
-    if snap.get("enhance"):
+    """None: this run does not share caches (texture LoRA runs build their own image pairs; ai-toolkit writes its
+    latents and text embeddings in its own layout, which this store does not know)."""
+    if snap.get("enhance") or snap.get("engine") == "ai-toolkit":
         return None
     m = snap["model"]
     v = snap.get("values") or {}
     # the encoders' inputs and precision; training-only settings (learning rate, rank, steps...) are left out so
     # runs that differ only in those share the caches
     enc = {k: v[k] for k in sorted(v) if k == "resolution" or "text_encoder" in k or "vae" in k}
+    # sd-scripts: the buckets follow the dataset's min_bucket_reso, which goes with the resolution below 1024
+    # (training._ds_sdscripts).  It is named only where it is not the 512 every run had before, so the caches made
+    # at 1024 and above keep their key; those of lower resolutions (made with other buckets) are made again once
+    if snap.get("engine") in _SD_ENGINES and "resolution" in v:
+        try:
+            mb = min_bucket_reso(v["resolution"])
+        except (TypeError, ValueError):
+            mb = 512
+        if mb != 512:
+            enc["min_bucket_reso"] = mb
     raw = [CACHE_VERSION, m.get("family"), m.get("variant"), snap.get("engine"), snap.get("engine_commit"),
            {k: _file_id(p) for k, p in sorted((m.get("files") or {}).items())}, enc]
     return hashlib.sha1(json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]

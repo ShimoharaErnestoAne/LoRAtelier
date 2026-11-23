@@ -33,17 +33,26 @@ class GPU:
         self._analysis_hooks.append(fn)
 
     # analysis side ---------------------------------------------------------
-    def begin_analysis(self, timeout=None) -> bool:
+    def _run_analysis_hooks(self):
         for fn in self._analysis_hooks:   # e.g. the ComfyUI kept loaded after image generation
             try:
                 fn()
             except Exception:
                 pass
+
+    def begin_analysis(self, timeout=None) -> bool:
+        self._run_analysis_hooks()
         with self._cond:
+            waited = self.owner is not None
             if not self._cond.wait_for(lambda: self.owner is None, timeout=timeout):
                 return False
             self._analyses += 1
-            return True
+        # the GPU was in use when the hooks ran above (an image generation: its hook leaves the ComfyUI of a running
+        # job alone), and that job has ended since with its model still in VRAM: asked again now that the analysis
+        # has its turn.  Outside the lock: a hook looks at the owner and may take a while (ComfyUI's /free).
+        if waited:
+            self._run_analysis_hooks()
+        return True
 
     def end_analysis(self):
         with self._cond:
@@ -80,7 +89,15 @@ class GPU:
                 self._cond.notify_all()
 
 
+_last_gpus: list[dict] | None = None   # what nvidia-smi answered last
+
+
 def query_gpus() -> list[dict]:
+    """The GPUs nvidia-smi lists.  A query that got no answer (it did not return within 5 s on a busy PC, or could
+    not be started) gives the last answer again instead of "no GPU": the callers cache the result, and an empty one
+    changed the initial training settings (no VRAM known) while the start check, with its own cache, still passed.
+    An answer that lists no GPU (driver lost) is still "no GPU"."""
+    global _last_gpus
     exe = shutil.which("nvidia-smi")
     if not exe:
         return []
@@ -89,7 +106,7 @@ def query_gpus() -> list[dict]:
                               "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
     except (OSError, subprocess.SubprocessError):
-        return []
+        return [dict(g) for g in _last_gpus or []]
     gpus = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
@@ -98,6 +115,7 @@ def query_gpus() -> list[dict]:
                 gpus.append({"name": parts[0], "vram_total_mb": int(parts[1]), "vram_used_mb": int(parts[2]), "driver": parts[3]})
             except ValueError:
                 continue   # e.g. memory shown as "[N/A]": that GPU cannot be planned for
+    _last_gpus = [dict(g) for g in gpus]
     return gpus
 
 

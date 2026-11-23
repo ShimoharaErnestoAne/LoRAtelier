@@ -407,11 +407,14 @@ def _analyze(rid: int, req: dict) -> None:
         vlm_kept = _kept_vlm()
         if engine.last_vlm:   # remembered per model for the next estimate (as the window does)
             model, secs = engine.last_vlm
-            with _cfg_lock:   # the settings page may save at the same moment: neither may lose the other's change
-                saved = i2t.load_config()
-                saved["vlm_seconds"] = {**(saved.get("vlm_seconds") or {}), model: secs}
-                i2t.save_config(saved)
             engine.last_vlm = None
+            try:
+                with _cfg_lock:   # the settings page may save at the same moment: neither may lose the other's change
+                    saved = i2t.load_config()
+                    saved["vlm_seconds"] = {**(saved.get("vlm_seconds") or {}), model: secs}
+                    i2t.save_config(saved)
+            except Exception as e:   # the estimate is a convenience: the finished analysis is shown either way
+                sys.stderr.write(f"vlm_seconds: {e}\n")
         hist = None
         try:
             from PIL import Image
@@ -540,7 +543,8 @@ def _translate(rid, req, cancel):
         with _dict_lock:
             table = i2t.load_translations()
             table.update(found)
-            _save_translations(table)
+            if found and not _save_translations(table):   # not kept: saying "translated" would be untrue
+                raise ValueError("辞書を保存できませんでした")
         # what it left untranslated: counted, so the same job does not start after every analysis (see missing_ja),
         # and told to the page (0 語 with nothing said looks as if translation did not work at all)
         left = _note_untranslated(str(cfg.get("translate_model") or ""), req["words"], found)

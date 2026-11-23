@@ -68,9 +68,34 @@ def _remove_later(path: Path):
     threading.Thread(target=shutil.rmtree, args=(path,), kwargs={"ignore_errors": True}, daemon=True).start()
 
 
+SNAPSHOT_MARK = "export_"   # data/export_*.db.tmp: the copy of project.db a project export is made from
+
+
 def empty_trash():
     """Remove what an earlier deletion could not (called at start-up, in the background)."""
     places = config.storage_dirs("projects")
+    # copies left by a move or an import the app was closed during (the original is removed only after its copy
+    # is complete and in place, so these are never the only copy).  They go into the trash first, one quick rename
+    # each, before the deleting below (which can take minutes): a move or an import the user starts meanwhile makes
+    # a working folder of its own in the same place, and that one must never be removed here.
+    for r in places:
+        try:
+            left = [d for d in r.iterdir() if d.is_dir() and d.name.startswith(".moving_")]
+            imp = r / ".importing"
+            if imp.is_dir():
+                left += list(imp.iterdir())
+        except OSError:
+            continue   # e.g. a drive that is not connected
+        for d in left:
+            try:
+                _to_trash(d)
+            except OSError:
+                shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink(missing_ok=True)
+    try:   # the database copy of a project export the app was closed during
+        for f in list(config.DATA_DIR.glob(f"{SNAPSHOT_MARK}*.db.tmp*")):
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass
     trashes = [TRASH_DIR, *(r / ".trash" for r in places)]
     for r in places:   # runs removed by an older version went to <project>/runs/.trash
         try:
@@ -84,15 +109,6 @@ def empty_trash():
             continue   # e.g. a drive that is not connected
         for d in items:
             shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink(missing_ok=True)
-    # copies left by a move or an import the app was closed during (the original is removed only after its copy
-    # is complete and in place, so these are never the only copy)
-    for r in config.storage_dirs("projects"):
-        try:
-            left = [d for d in r.iterdir() if d.is_dir() and (d.name.startswith(".moving_") or d.name == ".importing")]
-        except OSError:
-            continue
-        for d in left:
-            shutil.rmtree(d, ignore_errors=True)
 
 
 def delete_project(projects: ProjectManager, pid: str):
@@ -315,16 +331,26 @@ class _Pipe(io.RawIOBase):
 
 def _db_snapshot(project: Project, include_runs: bool) -> Path:
     """A consistent copy of project.db (the live one may have uncommitted WAL pages)."""
-    fd, tmp = tempfile.mkstemp(suffix=".db", dir=config.DATA_DIR)
+    fd, tmp = tempfile.mkstemp(prefix=SNAPSHOT_MARK, suffix=".db.tmp", dir=config.DATA_DIR)
     os.close(fd)
     dst = sqlite3.connect(tmp)
-    with project._lock:
-        project.db.backup(dst)
-    if not include_runs:
-        for t in ("checkpoints", "evals", "exports", "runs"):
-            dst.execute(f"DELETE FROM {t}")
-        dst.commit()
-    dst.execute("PRAGMA journal_mode=DELETE")
+    try:
+        with project._lock:
+            project.db.backup(dst)
+        if not include_runs:
+            for t in ("checkpoints", "evals", "exports", "runs"):
+                dst.execute(f"DELETE FROM {t}")
+            dst.commit()
+        dst.execute("PRAGMA journal_mode=DELETE")
+    except BaseException:
+        # a failed copy (the drive is full, the database is damaged) leaves neither an open file nor a copy in data
+        dst.close()
+        for name in (tmp, tmp + "-journal", tmp + "-wal", tmp + "-shm"):
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+        raise
     dst.close()
     return Path(tmp)
 
@@ -514,7 +540,12 @@ def _fix_db(db_path: Path, old_root: str | None, new_root: Path):
 
 
 def _fix_db_rows(db, old_root: str | None, new: str) -> str | None:
-    db.execute("SELECT COUNT(*) FROM meta").fetchone()
+    for t in ("meta", "images", "runs"):   # without these it is not a project's database (or only a part of one)
+        db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+    # a project of an older version (a zip made before a table was added, or an old folder zipped by hand): the
+    # tables added since are made empty, as opening the project does anyway, so the updates below find them
+    from .store import SCHEMA
+    db.executescript("BEGIN;" + SCHEMA + "COMMIT;")
     # runs that were in progress when exported cannot continue as they were
     db.execute("UPDATE runs SET status='failed', error=? WHERE status IN ('queued','preparing','training','evaluating')",
                (json.dumps({"code": "interrupted", "message": "書き出し時に実行中だったため中断扱いにしました。",

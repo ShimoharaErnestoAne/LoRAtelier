@@ -8,16 +8,45 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-import warnings
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps
 
-Image.MAX_IMAGE_PIXELS = 200_000_000
+MAX_PIXELS = 200_000_000   # larger images are refused here; keep in sync with worker/analysis_worker.py
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 SUPPORTED = {"JPEG", "PNG", "WEBP", "BMP", "TIFF", "GIF"}
-FASTCHECK_VERSION = 2
+FASTCHECK_VERSION = 3
 THUMB_SIZE = 320
+# grey images with more than 8 bits per pixel (scans, 16-bit PNG / TIFF)
+HIGH_BIT_MODES = ("I;16", "I;16L", "I;16B", "I;16N", "I", "F")
+# What each version changed, as a test on a stored result: when the version goes up, only the images the change
+# concerns are checked again (analysis.Analyzer.refresh_outdated), not every image of every project.
+_CHANGED = {3: lambda f: f.get("mode") in HIGH_BIT_MODES}   # 16-bit grey images were read as almost white
+
+
+def outdated(fast: dict | None) -> bool:
+    """The stored result was made by an older version that read this image differently."""
+    if not isinstance(fast, dict) or not fast.get("ok"):
+        return False
+    v = fast.get("version") or 0
+    return any(v < ver and test(fast) for ver, test in _CHANGED.items())
+
+
+def to_8bit(im: Image.Image) -> Image.Image:
+    """16-bit / 32-bit grey images: Pillow's convert("RGB") cuts their values off at 255, which turns nearly every
+    pixel white.  Scaled to 8 bits first (keep in sync with worker/analysis_worker.py)."""
+    if im.mode not in HIGH_BIT_MODES:
+        return im
+    a = np.asarray(im).astype(np.float64)
+    hi = float(a.max()) if a.size else 0.0
+    if im.mode == "F" and hi <= 1.0:
+        a = a * 255.0                 # floats 0..1
+    elif hi > 65535:
+        a = a * (255.0 / hi)          # 32-bit values: the brightest pixel becomes white
+    elif hi > 255 or im.mode.startswith("I;16"):
+        a = a / 257.0                 # 16-bit values
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
 
 def sha256_file(path: Path) -> str:
@@ -72,6 +101,11 @@ def _jpeg_quality(img: Image.Image) -> int | None:
     return int(max(1, min(100, round(quality))))
 
 
+def _too_large(size) -> str:
+    dims = f"{size[0]}×{size[1]} ピクセル、" if size else ""
+    return f"画像が大きすぎるため読み込みません（{dims}上限は {MAX_PIXELS // 100_000_000} 億画素です）。縮小した画像に差し替えてください。"
+
+
 def analyze(path: Path, thumb_path: Path) -> dict:
     """Return a dict of facts.  Never raises for bad images: returns {'ok': False, ...}."""
     out: dict = {"version": FASTCHECK_VERSION, "ok": False}
@@ -82,25 +116,31 @@ def analyze(path: Path, thumb_path: Path) -> dict:
         out["missing"] = True
         return out
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(path) as im:
-                fmt = im.format
-                # MPO: a JPEG with a second picture embedded (the preview many cameras add).  The first frame is
-                # the photograph itself, so it is a JPEG here - neither an unknown format nor an animation
-                mpo = fmt == "MPO"
-                if mpo:
-                    fmt = "JPEG"
-                out["format"] = fmt
-                out["animated"] = bool(getattr(im, "is_animated", False)) and not mpo
-                out["jpeg_quality"] = _jpeg_quality(im) if fmt == "JPEG" else None
-                out["mode"] = im.mode
-                im.load()  # full decode: detects truncated / corrupt data
-                im = ImageOps.exif_transpose(im)
-                has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
-                # full-size copies of a large image are costly: RGBA only for images with transparency
-                rgba = im.convert("RGBA") if has_alpha else im.convert("RGB")
-    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning) as e:
+        # the size is compared here, not by turning Pillow's size warning into an error: warnings.catch_warnings()
+        # changes the filters of the whole process, and this runs on several threads at once
+        with Image.open(path) as im:
+            if im.size[0] * im.size[1] > MAX_PIXELS:
+                out["error"] = _too_large(im.size)
+                return out
+            fmt = im.format
+            # MPO: a JPEG with a second picture embedded (the preview many cameras add).  The first frame is
+            # the photograph itself, so it is a JPEG here - neither an unknown format nor an animation
+            mpo = fmt == "MPO"
+            if mpo:
+                fmt = "JPEG"
+            out["format"] = fmt
+            out["animated"] = bool(getattr(im, "is_animated", False)) and not mpo
+            out["jpeg_quality"] = _jpeg_quality(im) if fmt == "JPEG" else None
+            out["mode"] = im.mode
+            im.load()  # full decode: detects truncated / corrupt data
+            im = ImageOps.exif_transpose(to_8bit(im))
+            has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+            # full-size copies of a large image are costly: RGBA only for images with transparency
+            rgba = im.convert("RGBA") if has_alpha else im.convert("RGB")
+    except Image.DecompressionBombError:   # Pillow itself refuses more than twice the limit when it opens the file
+        out["error"] = _too_large(None)
+        return out
+    except (OSError, SyntaxError, ValueError) as e:
         out["error"] = f"画像として読み込めません（破損または非対応形式）: {type(e).__name__}"
         return out
     if fmt not in SUPPORTED:

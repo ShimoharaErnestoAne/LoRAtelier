@@ -12,7 +12,9 @@ APP_DIR = ROOT / "app"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ENGINES_DIR = ROOT / "engines"
 ENVS_DIR = ROOT / "envs"
-MODELS_DIR = ROOT / "models"
+# LORASTUDIO_MODELS / LORASTUDIO_DATA: other places for the two folders that hold the user's own files (the tests
+# point both at a temporary folder, so that no test reads the LoRAs, projects or settings that are really there)
+MODELS_DIR = Path(os.environ.get("LORASTUDIO_MODELS", ROOT / "models"))
 DATA_DIR = Path(os.environ.get("LORASTUDIO_DATA", ROOT / "data"))
 PROJECTS_DIR = DATA_DIR / "projects"
 SETTINGS_FILE = DATA_DIR / "settings.json"
@@ -73,6 +75,10 @@ class Settings:
     def __init__(self, path: Path = SETTINGS_FILE):
         self.path = path
         self.data = {"models": [], "hash_cache": {}, "first_run_done": False}
+        # set when the file was broken at start: {"broken": where the broken file was put aside, "restored": True
+        # when the settings of the save before came back from settings.json.bak (False: started with defaults),
+        # "backup": the .bak file}.  The server tells the user; nothing is lost silently.
+        self.recovered: dict | None = None
         if path.exists():
             try:
                 loaded = json.loads(self._read(path))
@@ -92,6 +98,52 @@ class Settings:
                     except OSError as e:
                         raise RuntimeError(f"設定ファイル {path} が壊れていて、退避もできませんでした（{e}）。"
                                            "ほかのソフトがこのファイルを開いていないか確認してから、起動し直してください。") from e
+                # the settings as they were one save earlier (registered models, storage folders, LoRA settings)
+                # come back from the copy save() keeps; without a readable copy the start is with defaults, as before
+                back = self._backup()
+                self.recovered = {"broken": str(broken), "restored": back is not None, "backup": str(self.backup_path)}
+                if back is not None:
+                    self.data.update(back)
+                    try:
+                        atomic_write_json(path, self.data)
+                    except OSError:
+                        pass   # written by the first save instead
+
+    @property
+    def backup_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".bak")
+
+    def _backup(self) -> dict | None:
+        """The settings kept by the save before, or None (no copy, or it cannot be read either)."""
+        try:
+            back = json.loads(self.backup_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return back if isinstance(back, dict) else None
+
+    def _keep_previous(self) -> None:
+        """Before a save replaces settings.json, its current content (the last one read or written whole) stays as
+        settings.json.bak: a second name for the same file (a hard link, no copying), which the replace of
+        settings.json leaves untouched; a copy on drives without hard links.  Failing to keep it never stops the
+        save (no settings.json yet, or the file held for a moment): the older .bak stays."""
+        bak = self.backup_path
+        side = bak.with_name(f"{bak.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            try:
+                os.link(self.path, side)
+            except FileNotFoundError:
+                return
+            except OSError:
+                import shutil
+                shutil.copy2(self.path, side)
+            os.replace(side, bak)
+        except OSError:
+            pass
+        finally:
+            try:
+                side.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _read(path: Path, tries: int = 5) -> str:
@@ -112,6 +164,7 @@ class Settings:
 
     def save(self) -> None:
         with self._lock:
+            self._keep_previous()
             atomic_write_json(self.path, self.data)
 
     def get(self, key, default=None):

@@ -1,4 +1,4 @@
-"""ComfyUI v0.44.0 update (2026-11-09): the pins agree with each other, and the ComfyUI-GGUF fix patched in before the
+"""ComfyUI pins (v0.44.0 on 2026-11-09, v0.45.0 on 2026-11-11 for MiniMax H3-Image): the pins agree with each other, and the ComfyUI-GGUF fix patched in before the
 rename to LoRAtelier ("LoRA Studio patch") counts as applied (otherwise it is reported as missing, and patching it
 again fails because the original lines are gone)."""
 from __future__ import annotations
@@ -51,10 +51,13 @@ def test_bundled_copies_are_the_pinned_commits():
 
 
 def test_comfy_lock_matches_the_pinned_comfyui():
-    """envs/comfy.lock.txt carries the packages ComfyUI v0.44.0's requirements.txt pins exactly."""
-    assert LOCK["ComfyUI"]["commit"].startswith("2c75dc1b")
+    """envs/comfy.lock.txt carries the packages ComfyUI v0.45.0's requirements.txt pins exactly, and the parts
+    comfyui-workflow-templates 0.11.105 asks for."""
+    assert LOCK["ComfyUI"]["commit"].startswith("989d93d0") and LOCK["ComfyUI"]["version"] == "v0.45.0"
     lock = dict(ln.split("==", 1) for ln in (config.ROOT / "envs" / "comfy.lock.txt").read_text(encoding="utf-8").split()
                 if "==" in ln)
-    for pkg, ver in {"comfyui-frontend-package": "1.57.6", "comfyui-workflow-templates": "0.11.101",
-                     "comfyui-embedded-docs": "0.5.16", "comfy-aimdo": "0.6.0", "comfy-kitchen": "0.2.40"}.items():
+    for pkg, ver in {"comfyui-frontend-package": "1.58.5", "comfyui-workflow-templates": "0.11.105",
+                     "comfyui-embedded-docs": "0.5.16", "comfy-aimdo": "0.6.0", "comfy-kitchen": "0.2.41",
+                     "comfyui-workflow-templates-core": "0.3.396", "comfyui-workflow-templates-json": "0.1.131",
+                     "comfyui-workflow-templates-media-assets-02": "0.1.30"}.items():
         assert lock[pkg] == ver, pkg

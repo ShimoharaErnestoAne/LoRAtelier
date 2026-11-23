@@ -184,6 +184,12 @@ SIZE = {_F: (1024, 1024), _U: (896, 1152), _C: (896, 1152), _B: (832, 1216)}
 # Qwen-Image-2512 card: 1328x1328 / 3:4 1104x1472 / 2:3 1056x1584
 FAMILY_SIZE = {"qwen_image": {_F: (1328, 1328), _U: (1104, 1472), _C: (1104, 1472), _B: (1056, 1584)}}
 GEN_FAMILIES = ("sdxl", "anima", "qwen_image", "qwen_image21", "krea2", "zimage", "moss_image")
+# the image generation page also takes MiniMax H3-Image.  It is kept out of material generation: no LoRA can be trained
+# on it yet, and its license (V.3) does not allow its outputs to be used to improve another AI model.
+IMAGE_FAMILIES = (*GEN_FAMILIES, "h3_image")
+NO_MATERIAL = {"h3_image": "MiniMax H3-Image は、素材の生成には使えません。H3-Image で生成した画像をほかのモデルの学習に使うことは、"
+                           "H3-Image のライセンスで認められていないためです（H3-Image 自体の LoRA の学習には、まだ対応していません）。"
+                           "画像生成の画面では使えます。"}
 
 
 # ======================================================================== style material
@@ -466,7 +472,10 @@ def strip_background(positive: str, caption_style: str) -> tuple[str, list[str]]
             w = t.strip()
             if not w:
                 continue
-            bare = w.strip("()[]{} ").split(":")[0].strip().lower().replace("_", " ")
+            # "sophie (howl's moving castle)", "kyle broflovski (south park)": the brackets after a name say which
+            # work it is from, they are not a place (escaped ones too); "(castle:1.2)" is a weight around the tag
+            core = re.sub(r"(?<=[^\s(\[{\\])\s*\\?\([^()]*\\?\)\s*$", "", w)
+            bare = core.strip("()[]{} ").split(":")[0].strip().lower().replace("_", " ")
             if bare in BG_TAGS or bare.split(" ")[-1] in PLACE_NOUNS:
                 removed.append(w)
             else:
@@ -568,16 +577,18 @@ def check_recipe(recipe: dict, kind: str = "character", project=None) -> dict:
     return {"errors": errors, "notes": notes, "model": model}
 
 
-def check_model_loras(model_id: str | None, loras: list | None) -> tuple[list[str], dict | None]:
-    """Errors in the generation model and LoRAs (shared with the plain image generation page)."""
+def check_model_loras(model_id: str | None, loras: list | None, families: tuple = GEN_FAMILIES) -> tuple[list[str], dict | None]:
+    """Errors in the generation model and LoRAs (shared with the plain image generation page, which passes
+    IMAGE_FAMILIES)."""
     errors = []
     model = registry.get(model_id or "")
     if not model:
         errors.append("生成に使うモデルを選んでください。")
     elif model["missing"]:
         errors.append(f"生成モデルのファイルが見つかりません: {', '.join(model['missing'])}")
-    elif model["family"] not in GEN_FAMILIES:
-        errors.append(f"{FAMILY_LABEL.get(model['family'], model['family'])} での生成には対応していません。")
+    elif model["family"] not in families:
+        errors.append(NO_MATERIAL.get(model["family"]) if model["family"] in IMAGE_FAMILIES else
+                      f"{FAMILY_LABEL.get(model['family'], model['family'])} での生成には対応していません。")
     elif bad := [k for k in ("te", "vae") if model["files"].get(k) and library.fits(model["family"], k, model["files"][k]) is False]:
         # a fitting one is put in automatically when the folders have it (Library._repair_companions)
         label = FAMILY_LABEL.get(model["family"], model["family"])

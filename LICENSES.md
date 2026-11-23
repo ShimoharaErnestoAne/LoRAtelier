@@ -7,16 +7,17 @@
 | 名称 | 用途 | ライセンス | 組み込み方 |
 |---|---|---|---|
 | i2t（作者: ShimoharaErnestoAne。LoRAtelier と同じ） | 「画像からプロンプト」（`engines/i2t/` に版を固定して同梱、解析用環境で実行） | PolyForm Noncommercial 1.0.0 と追加の条件（LoRAtelier と同じ） | 同梱の訳の辞書 `assets/tags_ja.json` は WD Tagger v3 のタグ一覧（Apache-2.0, SmilingWolf）を Index-Translate-2B（Apache-2.0, IndexTeam）で訳し、手直ししたもの。実行時に取得するモデルとデータは、下の「「画像からプロンプト」が取得するモデル・データ」の表のとおりで、それぞれの利用条件に従う |
-| [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) | SDXL / Anima の LoRA 学習 | Apache-2.0 | 別プロセスで実行（`engines.lock.json` の commit に固定） |
+| [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) | SDXL / Anima / MOSS-Image の LoRA 学習（v0.13.0） | Apache-2.0 | 別プロセスで実行（`engines.lock.json` の commit に固定） |
 | [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) | Qwen-Image・Z-Image の LoRA 学習（Krea 2 用の部分は積み残し） | Apache-2.0 | 別プロセスで実行（commit 固定） |
 | [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) dev ブランチ | Qwen-Image-2.1 の LoRA 学習 | Apache-2.0 | PR #1145 を取り込んだ commit（9702b25）に固定。Qwen-Image-2.1 学習用ファイルを追加したときだけ取得します |
-| sd-scripts v0.12.1（[kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) 04ca541） | MOSS-Image の LoRA 学習（試験導入・未検証） | Apache-2.0 | 固定版とは別の場所（`engines/sd-scripts-moss`）に commit 固定で取得し、学習用環境を共用します。MOSS-Image を追加したときだけ取得し、高速化用の triton-windows（MIT）も学習用環境に入れます |
+| [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) 73c84b0（0.13.43） | MiniMax H3-Image の LoRA 学習（試験導入・未検証） | MIT | 別プロセスで実行。「MiniMax H3-Image 学習用ファイル」を追加したときだけ、GitHub の zip で `engines/ai-toolkit` に取得し、専用の環境 `envs/aitk`（`envs/aitk.lock.txt` で固定。torch 2.13、transformers 5.5.3、diffusers c943837 など）を作ります |
+| triton-windows 3.4.0.post21（[woct0rdho/triton-windows](https://github.com/woct0rdho/triton-windows)） | MOSS-Image の学習の高速化（試験導入・未検証） | MIT | MOSS-Image の学習は SDXL・Anima と同じ sd-scripts（v0.13.0）を使います。MOSS-Image を追加したときだけ、この部品を学習用環境に入れます |
 | [suigin10/MOSS-LoRA-Trainer](https://github.com/suigin10/MOSS-LoRA-Trainer) v0.1.2 | sd-scripts で途中から再開したときのステップ数の補正（`app/lorastudio/bridges/sd_resume.py`） | MIT（Copyright (c) 2026 suigin10） | `moss_trainer/resume_bridge.py` の補正部分を手直しして使っています。学習率の再計算と state の整理の部分は使っていません |
 | [leejet/ComfyUI-GGUF](https://github.com/leejet/ComfyUI-GGUF)（[city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) の派生） | Qwen-Image-2512 / 2.1 の GGUF 版での生成 | Apache-2.0 | ComfyUI のカスタムノードとして commit 固定（edd981b）で取得。本家は Qwen-Image-2.1 の GGUF を判別できないため、対応を足した派生版を使っています。ComfyUI-GGUF#487 の不具合への小さな修正を当てています（`engines/patches/`） |
 | [pamparamm/ComfyUI-ppm](https://github.com/pamparamm/ComfyUI-ppm) | 画像生成の NegPip（マイナスの強さ・MOSS-Image の強調）、左右で描き分ける（Attention Couple）、白飛びを抑える（RescaleCFGPost）、スケジューラー ays / gits | AGPL-3.0-or-later | commit 4826dfd のソースコードを、手を加えずにライセンス文（LICENSE）ごと配布用 zip の `engines/bundled/ComfyUI-ppm` に同梱しています（元のソースは上のリンク先）。ComfyUI を初めて起動するときに ComfyUI のカスタムノードの場所へコピーします（同梱分がなければ GitHub から zip で取得）。本ツールのコードとはリンクしていません（ComfyUI の別プロセスの中で動き、HTTP API 経由でノード名を指定して使うだけです） |
 | [PedroMarinhoDev/ComfyUI-Moss-Image-Edit-Native](https://github.com/PedroMarinhoDev/ComfyUI-Moss-Image-Edit-Native) | 画像生成で、MOSS-Image の編集用 LoRA を使って元画像をプロンプトの指示どおりに編集する（MOSSImageEditTextEncode） | GPL-3.0 | commit d5cd7b2 のソースコードを、手を加えずにライセンス文（LICENSE）ごと配布用 zip の `engines/bundled/ComfyUI-Moss-Image-Edit-Native` に同梱しています（README 用の画像・見本の画像は省いています。元のソースは上のリンク先）。ComfyUI を初めて起動するときに ComfyUI のカスタムノードの場所へコピーします（同梱分がなければ GitHub から zip で取得）。本ツールのコードとはリンクしていません（ComfyUI の別プロセスの中で動き、HTTP API 経由でノード名を指定して使うだけです）。編集用 LoRA（chinoll/Moss-Image-Edit、akhaliq/MOSS-Image-Edit-HQ など）は同梱せず、ダウンロードもしません |
 | [rgthree/rgthree-comfy](https://github.com/rgthree/rgthree-comfy) | 画像から読み込んだ workflow にある rgthree のノード（SDXL Empty Latent Image など）を、そのまま使う | MIT | commit bc48c6a を、ComfyUI を初めて起動するときに GitHub から zip で ComfyUI のカスタムノードの場所へ取得します（同梱はしていません）。本ツールのコードとはリンクしていません（ComfyUI の別プロセスの中で動き、HTTP API 経由でノード名を指定して使うだけです） |
-| [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | 比較画像の生成・読み込み確認 | GPL-3.0 | v0.44.0（commit 2c75dc1）を別プロセスとして HTTP API 経由で使用。本ツールのコードとはリンクしていません |
+| [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | 比較画像の生成・読み込み確認 | GPL-3.0 | v0.45.0（commit 989d93d）を別プロセスとして HTTP API 経由で使用。本ツールのコードとはリンクしていません |
 
 ## 素材解析（コード／モデル）
 
@@ -81,6 +82,9 @@ FastAPI (MIT), Uvicorn (BSD-3), Pillow (MIT-CMU), NumPy (BSD-3)。依存一覧�
 | Z-Image Turbo / Base（Comfy-Org/z_image_turbo、Comfy-Org/z_image、Tongyi-MAI/Z-Image のトークナイザー） | Apache-2.0 |
 | Z-Image Turbo 学習アダプター（ostris/zimage_turbo_training_adapter） | Apache-2.0 |
 | MOSS-Image SFT / Base、Qwen3.5-9B テキストエンコーダー、FLUX.2 small decoder VAE（Comfy-Org/MOSS-Image、OpenMOSS-Team/MOSS-Image-Base のトークナイザー） | Apache-2.0（VAE は Apache-2.0 の small decoder 版を使います。FLUX.2-dev の flux2-vae.safetensors は非商用ライセンスのため取得しません） |
+| MiniMax H3-Image、Qwen3-VL-32B テキストエンコーダー、H3-Image VAE（Comfy-Org/MiniMax-H3-Image。元のモデルは MiniMaxAI/MiniMax-H3-Image） | MiniMax-H3-Image Community License（EU・英国・韓国・米国は対象の地域外。生成した画像をほかの AI モデルの学習に使えない。年間の売上が 100 万米ドルを超える場合と、第三者に使わせるサービスにする場合は、MiniMax の書面の許可が必要） |
+| MiniMax H3-Image の学習アダプター（ostris/minimax_h3_training_adapter の minimax_h3_image_training_adapter_v1） | 記載なし（2026-11-23 に配布ページを確かめた時点で、説明とライセンスの記載がありません）。学習のときだけ使い、書き出す LoRA には含まれません |
+| MiniMax H3 のトークナイザーとテキストエンコーダーの設定（MiniMaxAI/MiniMax-H3 の FL2VA/ の小さいファイル。学習エンジンが読みます） | MiniMax-H3 Community License（モデルのページで確認してください） |
 | PLaMo 3 Translate 2B / 8B（pfnet/plamo-3-translate-2b-GGUF・8b-GGUF。「画像からプロンプト」の訳のモデルとして選んだときだけ Ollama に取得） | PLaMo Community License（個人・非商用は登録なしで無料。商用は Preferred Networks への登録または契約が必要） |
 | Krea 2 RAW / Turbo（積み残し・未対応） | Krea 2 Community License（Hugging Face でログインと同意が必要） |
 

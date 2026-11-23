@@ -3,8 +3,9 @@
   "engines": {
     "sd-scripts": {
       "url": "https://github.com/kohya-ss/sd-scripts.git",
-      "commit": "690ea7f96c23182352ec63def76d431c6120bd2f",
-      "license": "Apache-2.0"
+      "commit": "8c088eba9cd5d10a5d00dd58f0d83063fa9d57ca",
+      "license": "Apache-2.0",
+      "version": "v0.13.0"
     },
     "musubi-tuner": {
       "url": "https://github.com/kohya-ss/musubi-tuner.git",
@@ -13,9 +14,9 @@
     },
     "ComfyUI": {
       "url": "https://github.com/comfyanonymous/ComfyUI.git",
-      "commit": "2c75dc1b379a59e0880619d029607af5169a62ef",
+      "commit": "989d93d0d968e704c589ce0146bb18c77f6b50cc",
       "license": "GPL-3.0 (separate process, not linked)",
-      "version": "v0.44.0"
+      "version": "v0.45.0"
     },
     "ComfyUI-ppm": {
       "url": "https://github.com/pamparamm/ComfyUI-ppm.git",
@@ -24,7 +25,7 @@
       "optional": true,
       "path": "engines/ComfyUI/custom_nodes/ComfyUI-ppm",
       "env": "comfy",
-      "used_for": "NegPip（マイナスの強さ・MOSS-Image の強調）、左右で描き分ける（Attention Couple）、白飛びを抑える（RescaleCFGPost）、スケジューラー ays / gits。ComfyUI v0.44.0 で読み込めることを確かめた 11-07 の版（Anima と MOSS-Image の NegPip の修正を含む）"
+      "used_for": "NegPip（マイナスの強さ・MOSS-Image の強調）、左右で描き分ける（Attention Couple）、白飛びを抑える（RescaleCFGPost）、スケジューラー ays / gits。ComfyUI v0.45.0 で読み込めることを確かめた 11-07 の版（Anima と MOSS-Image の NegPip の修正を含む）"
     },
     "ComfyUI-Moss-Image-Edit-Native": {
       "url": "https://github.com/PedroMarinhoDev/ComfyUI-Moss-Image-Edit-Native.git",
@@ -33,7 +34,7 @@
       "optional": true,
       "path": "engines/ComfyUI/custom_nodes/ComfyUI-Moss-Image-Edit-Native",
       "env": "comfy",
-      "used_for": "MOSS-Image の編集用 LoRA（chinoll Moss-Image-Edit、akhaliq MOSS-Image-Edit-HQ）で、元画像をプロンプトの指示どおりに編集する。ComfyUI v0.44.0 は MOSS の参照画像を自分で扱うため、このパックはモデルには手を加えず（起動時にそう表示する）、ノードと LoRA の読み替えだけを受け持つ"
+      "used_for": "MOSS-Image の編集用 LoRA（chinoll Moss-Image-Edit、akhaliq MOSS-Image-Edit-HQ）で、元画像をプロンプトの指示どおりに編集する。ComfyUI v0.44.0 以降は MOSS の参照画像を自分で扱うため、このパックはモデルには手を加えず（起動時にそう表示する）、ノードと LoRA の読み替えだけを受け持つ"
     },
     "rgthree-comfy": {
       "url": "https://github.com/rgthree/rgthree-comfy.git",
@@ -66,14 +67,27 @@
     },
     "sd-scripts-moss": {
       "url": "https://github.com/kohya-ss/sd-scripts.git",
-      "commit": "04ca541746b7667b27eab230db067579f682895e",
+      "commit": "8c088eba9cd5d10a5d00dd58f0d83063fa9d57ca",
       "license": "Apache-2.0",
       "optional": true,
+      "path": "engines/sd-scripts",
       "env": "train",
       "pip": [
         "triton-windows==3.4.0.post21"
       ],
-      "used_for": "MOSS-Image の学習（試験導入）。sd-scripts v0.12.1。requirements.txt は固定版 690ea7f と同一のため学習環境を共用。triton-windows は ConvRot INT8 の高速化用（torch 2.8 に対応する版）"
+      "used_for": "MOSS-Image の学習（試験導入）。v0.13.0 からは通常の sd-scripts と同じ版・同じフォルダー（engines/sd-scripts）を使う。この項目は、MOSS-Image を追加したときに triton-windows（ConvRot INT8 の高速化用、torch 2.8 に対応する版）を学習環境に入れるためと、前の版の学習の記録（エンジン名 sd-scripts-moss）のために残している"
+    },
+    "ai-toolkit": {
+      "url": "https://github.com/ostris/ai-toolkit.git",
+      "commit": "73c84b091dd0f5647fc6a4b59122a2efc1c8147b",
+      "license": "MIT",
+      "version": "0.13.43",
+      "optional": true,
+      "env": "aitk",
+      "env_lock": "aitk.lock.txt",
+      "env_python": "3.12",
+      "env_torch": {"torch": "2.13.0", "torchvision": "0.28.0", "torchaudio": "2.11.0", "torchcodec": "0.15.0"},
+      "used_for": "MiniMax H3-Image の LoRA 学習（試験導入）。2026-11-18 の main。torch 2.13 / transformers 5 系で今の学習環境と混ぜられないため、専用の環境 envs/aitk（Python 3.12）を、H3-Image の学習用ファイルを追加したときにだけ作る。torch などの CUDA の版はドライバーに合わせて cu130 か cu126 を選ぶ（エンジン自身の manager/spec.py の判定と同じ）"
     }
   }
 }

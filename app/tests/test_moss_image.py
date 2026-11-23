@@ -1,4 +1,4 @@
-"""MOSS-Image (sd-scripts v0.12.1): the file is told apart from the other DiT families, the settings follow the
+"""MOSS-Image (sd-scripts v0.13.0, the same pin as SDXL / Anima): the file is told apart from the other DiT families, the settings follow the
 GPU (24 / 16 / 12 / 8GB), the training config uses the engine's own options, and the ComfyUI graph is the one
 of the official templates.  Nothing here runs the engine or ComfyUI (unverified on real files)."""
 from __future__ import annotations

@@ -94,7 +94,8 @@ async function renderI2t() {
   iUpdateButtons();
   if (I.job) iOnJob(I.job);
   iProbeOllama();
-  if (!I.c.tagger_models[I.cfg.tagger_model]?.ready) setTimeout(() => iTaggerDialog("first"), 400);
+  // (the page may have been left within the 400 ms: its dialog host is gone then)
+  if (!I.c.tagger_models[I.cfg.tagger_model]?.ready) setTimeout(() => { if ($("#i-root")) iTaggerDialog("first"); }, 400);
 }
 
 function iBindTop() {
@@ -705,7 +706,9 @@ async function iToImageGenI2I() {
     const src = await api("/api/imagegen/init_from", { body: { path: main.path } });
     const g = await api("/api/imagegen");
     const [w, h] = src.size, n = g.native || 1024, k = Math.sqrt((n * n) / (w * h));
-    const fit = (v) => Math.max(512, Math.min(2048, Math.round((v * k) / 16) * 16));
+    // the sides the chosen model takes (16 / 512 / 2048; MiniMax H3-Image 32 / 512 / 6272), as on the generation page
+    const lim = g.size || { step: 16, min: 512, max: 2048 };
+    const fit = (v) => Math.max(lim.min, Math.min(lim.max, Math.round((v * k) / lim.step) * lim.step));
     const layered = (main.refs || 0) > 0;
     const denoise = layered ? 0.7 : (g.form.denoise ?? 0.6);
     await api("/api/imagegen/form", { method: "PUT", body: { ...g.form, positive: iJoin("pos"), negative: iJoin("neg"),
@@ -730,7 +733,7 @@ function iShowOllama() {   // the 「Ollama: …」 line, on the i2t page and on
   }
   el.title = "";
   const has = o.models.includes(I.cfg.ollama_model);
-  el.textContent = `Ollama: 接続OK (画像対応 ${o.vision.length} / 全 ${o.models.length})` + (I.cfg.engine === "hybrid" && !has ? `　選んだモデル ${I.cfg.ollama_model} は未取得です（設定の「追加 (pull)」で取得できます）` : "");
+  el.textContent = `Ollama: 接続OK (画像対応 ${o.vision.length} / 全 ${o.models.length})` + (I.cfg.engine === "hybrid" && !has ? `　選んだモデル ${I.cfg.ollama_model} は未取得です（設定の「取得」で取得できます）` : "");
 }
 
 /* 訳のモデル on the settings page: a pull-down (app.js trModelPickerHtml), marked 取得済み／未取得 once Ollama answered */

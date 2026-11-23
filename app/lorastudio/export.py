@@ -23,7 +23,7 @@ from . import config
 from .captions import CONCEPT_TARGETS, concept_target
 from .evaluate import (COMFY_MODELS, CONVERTED_FAMILIES, MONO_NEGATIVE, comfy_lora_file, staged_lora,
                        trained_with_monochrome)
-from .models import FAMILY_LABEL, VARIANTS, hasher, read_safetensors_header
+from .models import FAMILY_LABEL, H3_LICENSE, VARIANTS, hasher, read_safetensors_header
 
 
 def _next_version_dir(dest_root: Path, name: str) -> Path:
@@ -81,7 +81,10 @@ def _write_package(project, run_id, run, snap, src, ckpt_path, strength, eval_su
         "format": "LoRA (safetensors) for ComfyUI",
         "kind": {"character": "キャラクター", "style": "スタイル", "enhance": "質感・補強"}.get(snap["kind"])
                 or CONCEPT_TARGETS[concept_target(snap)]["label"],
-        "trigger": None if snap["kind"] == "enhance" else f"{snap['trigger']} style" if snap["kind"] == "style" else snap["trigger"],
+        # a multi-character LoRA is called by its characters' words (below): the gathering project's own word is in
+        # no caption, so it is not recorded as a trigger
+        "trigger": None if snap["kind"] == "enhance" or snap.get("members")
+                   else f"{snap['trigger']} style" if snap["kind"] == "style" else snap["trigger"],
         "characters": [{"name": m["name"], "trigger": m["trigger"]} for m in snap["members"]] if snap.get("members") else None,
         "base_model": {"name": model["name"], "variant": VARIANTS[model["variant"]]["label"], "family": model["family"],
                        "files": {k: Path(p).name for k, p in model["files"].items()},
@@ -107,6 +110,8 @@ def _write_package(project, run_id, run, snap, src, ckpt_path, strength, eval_su
         "sdxl": f"ベースモデル: {model['name']}（SDXL 系）。別系列のモデル（SD1.5 / Anima など）では使えません。",
         "anima": f"ベースモデル: {model['name']}（Anima）。Anima 以外のモデルでは使えません。",
         "krea2": "ベースモデル: Krea 2。RAW で学習しており、Krea 2 Turbo での使用を想定しています。",
+        "h3_image": f"ベースモデル: {model['name']}（MiniMax H3-Image）。学習エンジン ai-toolkit で、学習アダプターを使って学習しています"
+                    "。使うときにアダプターは要りません。6 ステップ・CFG 1 で生成してください。" + H3_LICENSE,
         "zimage": f"ベースモデル: {model['name']}（Z-Image）。Z-Image 以外のモデルでは使えません。"
                   + ("Turbo 用の学習アダプターを使って学習しています。使うときにアダプターは要りません。"
                      if model.get("variant") == "zimage_turbo" else ""),

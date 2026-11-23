@@ -143,7 +143,14 @@ def fetch_archive(url: str, commit: str, dest: Path, log=None) -> None:
             p = (dest / n).resolve()
             if root in p.parents:
                 p.unlink(missing_ok=True)
-        shutil.copytree(work, dest, dirs_exist_ok=True)
+        try:
+            shutil.copytree(work, dest, dirs_exist_ok=True)
+        except OSError as e:
+            # shutil.Error carries a list of (source, destination, reason): the first reason says what went wrong
+            first = e.args[0][0] if isinstance(e, shutil.Error) and e.args and isinstance(e.args[0], list) and e.args[0] else None
+            why = first[2] if isinstance(first, (tuple, list)) and len(first) > 2 else e
+            raise RuntimeError(f"{dest.name} のファイルを新しい版に置き換えられませんでした（{why}）。{dest.name} を使う処理"
+                               "（画像の生成や学習）が動いている間は置き換えられません。終わってから、もう一度実行してください。") from None
         (dest / MARK).write_text(commit + "\n", encoding="utf-8")
     finally:
         z.unlink(missing_ok=True)

@@ -49,6 +49,17 @@ def clean_words(words) -> list[str]:
     return out
 
 
+def _own_info(path: Path) -> bool:
+    """The lora_info.json next to this file is about this file: an export is a folder of its own with the LoRA
+    under the folder's name.  Another LoRA put into that folder later does not take over its trigger word."""
+    if path.stem == path.parent.name:
+        return True
+    try:
+        return not any(f != path and f.suffix.lower() == ".safetensors" for f in path.parent.iterdir())
+    except OSError:
+        return False
+
+
 def _from_files(path: Path) -> dict:
     """Trigger words / strength the LoRA's own files state, and caption-frequency candidates."""
     st = path.stat()
@@ -57,11 +68,16 @@ def _from_files(path: Path) -> dict:
         return _cache[ck]
     found = {"words": [], "source": None, "strength": None, "candidates": [], "made": False}
     info = path.parent / "lora_info.json"
-    if info.exists():
+    if info.exists() and _own_info(path):
         try:
             d = json.loads(info.read_text(encoding="utf-8"))
             found["made"] = True   # exported by this tool (lora_info.json is written next to every export)
-            if d.get("trigger"):
+            chars = [c.get("trigger") for c in d.get("characters") or [] if isinstance(c, dict) and c.get("trigger")]
+            if chars:
+                # a multi-character LoRA: each character's own word (the gathering project's word, which exports
+                # before 2026-11-23 recorded as "trigger", is in no caption and calls nothing)
+                found.update(words=clean_words(chars), source="このツールで作った LoRA の呼び出し語（キャラクターごと）")
+            elif d.get("trigger"):
                 found.update(words=clean_words([d["trigger"]]), source="このツールで作った LoRA の呼び出し語")
             if isinstance(d.get("tested_strength"), (int, float)):
                 found["strength"] = float(d["tested_strength"])

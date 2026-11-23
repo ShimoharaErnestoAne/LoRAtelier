@@ -28,7 +28,31 @@ import numpy as np  # noqa: E402
 from PIL import Image, ImageOps  # noqa: E402
 
 ANALYZER_VERSION = "ai-4"
+# the same limit as the mechanical check (lorastudio/fastcheck.py MAX_PIXELS): an image that passed it must not be
+# refused here by Pillow's smaller default
+Image.MAX_IMAGE_PIXELS = 200_000_000
+HIGH_BIT_MODES = ("I;16", "I;16L", "I;16B", "I;16N", "I", "F")
 _out_lock = threading.Lock()
+
+
+class GpuUnavailable(RuntimeError):
+    """CUDA failed to start in this process: the work that needs the GPU is refused (reported with reason "gpu")."""
+
+
+def to_8bit(im):
+    """16-bit / 32-bit grey images: Pillow's convert("RGB") cuts their values off at 255, which turns nearly every
+    pixel white.  Scaled to 8 bits first (keep in sync with lorastudio/fastcheck.py)."""
+    if im.mode not in HIGH_BIT_MODES:
+        return im
+    a = np.asarray(im).astype(np.float64)
+    hi = float(a.max()) if a.size else 0.0
+    if im.mode == "F" and hi <= 1.0:
+        a = a * 255.0                 # floats 0..1
+    elif hi > 65535:
+        a = a * (255.0 / hi)          # 32-bit values: the brightest pixel becomes white
+    elif hi > 255 or im.mode.startswith("I;16"):
+        a = a / 257.0                 # 16-bit values
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
 
 def emit(obj):
@@ -44,7 +68,7 @@ def log(*a):
 def load_image(path, crop=None):
     with Image.open(path) as im:
         im.load()
-        im = ImageOps.exif_transpose(im)
+        im = ImageOps.exif_transpose(to_8bit(im))
         # a full-size RGBA copy of a large photo is costly: only images with transparency are put on white
         if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
             im = im.convert("RGBA")
@@ -185,8 +209,8 @@ class Models:
         if self.qwen is None:
             torch = self._torch()
             if self.gpu_error:   # a 4B VLM on the CPU takes minutes per image: say so instead of crawling
-                raise RuntimeError("GPU が使えないため、説明文の生成を止めました。しばらくして GPU が使えるようになると"
-                                   "自動で GPU に戻ります。続くときは PC を再起動してください。")
+                # (the app queues these captions again once this worker was restarted to try the GPU again)
+                raise GpuUnavailable("GPU が使えないため、説明文の生成を止めました。")
             from transformers import AutoModelForImageTextToText, AutoProcessor
             self.loading("Qwen3-VL-4B")
             name = "Qwen/Qwen3-VL-4B-Instruct"
@@ -481,6 +505,8 @@ def main():
                 break
             else:
                 emit({"rid": rid, "ok": False, "error": f"unknown op {op}"})
+        except GpuUnavailable as e:
+            emit({"rid": rid, "ok": False, "error": str(e), "reason": "gpu"})
         except Exception as e:  # report, never die silently
             log(traceback.format_exc())
             msg = f"{type(e).__name__}: {e}"

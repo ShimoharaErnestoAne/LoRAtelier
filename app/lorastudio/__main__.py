@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import time
 
-import uvicorn
+# GPU 0 is the first GPU nvidia-smi lists, for every process started from here (training engines, the analysis and
+# i2t workers, ComfyUI): CUDA's own order puts the fastest first, so on a PC with two GPUs the initial settings were
+# chosen for one GPU (nvidia-smi's first) while the training ran on the other.  Set before anything imports torch.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+import uvicorn  # noqa: E402
 
 from . import config
 

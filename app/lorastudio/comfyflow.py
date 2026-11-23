@@ -19,13 +19,13 @@ import re
 from pathlib import Path
 
 from . import config
+from .pnginfo import TEXT_KEYS, text_keys
 
 DIR = config.DATA_DIR / "imagegen" / "workflows"
 # loader inputs naming a model file -> the ComfyUI folder it is staged in
 FILE_INPUTS = {"ckpt_name": "checkpoints", "unet_name": "diffusion_models", "vae_name": "vae", "lora_name": "loras",
                "clip_name": "text_encoders", "clip_name1": "text_encoders", "clip_name2": "text_encoders",
                "clip_name3": "text_encoders", "clip_name4": "text_encoders"}
-TEXT_KEYS = ("text", "text_g", "text_l", "prompt", "string", "value", "t5xxl", "clip_l")
 _known: set[str] | None = None   # node classes of the last ComfyUI asked (for saying missing nodes when an image is read)
 
 
@@ -99,7 +99,7 @@ def _text_slots(graph: dict, ref, side: str, depth: int = 0) -> list[tuple[str, 
         return []
     inputs = node.get("inputs") or {}
     out = []
-    for key in TEXT_KEYS:
+    for key in text_keys(inputs, ref, side):   # a node with prompt + negative_prompt: the text of the output taken
         v = inputs.get(key)
         if isinstance(v, str):   # an empty one too: a workflow's blank negative is still where the negative goes
             out.append((nid, key, v.strip()))

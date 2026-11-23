@@ -92,6 +92,7 @@ def test_download_cut_short_is_kept_as_part_and_not_installed(env, monkeypatch):
         def __exit__(self, *a):
             return False
     monkeypatch.setattr(remote, "probe", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(remote, "RETRY_TRIES", 0)   # one try: the automatic continuation has its own tests
     monkeypatch.setattr(remote, "_open", lambda *a, **k: Resp(body))
     st = {"id": "abc", "name": "x.safetensors", "state": "running", "done_bytes": 0, "total_bytes": 0, "error": None}
     remote._download(st, "https://civitai.com/x", "x.safetensors", {}, None)

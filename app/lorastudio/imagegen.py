@@ -22,10 +22,11 @@ from types import SimpleNamespace
 
 from . import comfyflow, config, loraconf
 from .evaluate import ATTENTION_FLAGS, ATTENTION_PACKAGES, attention_installed
-from .evaluate import COUPLE_FAMILIES, KEEP_COMFY_OWNERS, NATIVE_SIZE, SAMPLING, comfy, comfy_user, take_output, wants_negpip
+from .evaluate import (COUPLE_FAMILIES, EDIT_H3, KEEP_COMFY_OWNERS, NATIVE_SIZE, SAMPLING, comfy, comfy_user, take_output,
+                       wants_negpip)
 from .events import bus
-from .generate import (FAST_SLOTS, _stage, build_graph, check_model_loras, check_seed, clamp_denoise, default_sampling, source_file,
-                       stage_comfy_input, save_source_image, stage_model_files, tuned_note)
+from .generate import (FAST_SLOTS, IMAGE_FAMILIES, _stage, build_graph, check_model_loras, check_seed, clamp_denoise,
+                       default_sampling, source_file, stage_comfy_input, save_source_image, stage_model_files, tuned_note)
 from .gpu import gpu
 from .models import EDIT_CHINOLL, detect_lora, experimental_note, registry
 
@@ -350,12 +351,37 @@ def native_size(model: dict | None) -> int:
     return NATIVE_SIZE.get((model or {}).get("family"), 1024)
 
 
-def _size(v, default: int) -> int:
+# MiniMax H3-Image: sides in multiples of 32 (the conditioning node's step), up to the longest side of the model
+# card's 16 MP sizes (21:9, 6272 x 2688)
+SIZE_LIMITS = {"h3_image": (32, 6272)}
+# ... and the area of those sizes (6272 x 2688 = 16.9 MP): both sides at the longest would be 39 MP
+AREA_LIMITS = {"h3_image": 6272 * 2688}
+
+
+def size_limits(model: dict | None) -> dict:
+    step, top = SIZE_LIMITS.get((model or {}).get("family"), (16, 2048))
+    return {"step": step, "min": 512, "max": top}
+
+
+def _size(v, default: int, model: dict | None = None) -> int:
     try:
         n = int(v)
     except (TypeError, ValueError):
         return default
-    return max(512, min(2048, round(n / 16) * 16))
+    lim = size_limits(model)
+    return max(lim["min"], min(lim["max"], round(n / lim["step"]) * lim["step"]))
+
+
+def fit_area(w: int, h: int, model: dict | None) -> tuple[int, int]:
+    """The size made smaller with its proportions kept when its area is over the model's limit (sides stay multiples
+    of the model's step, rounded down)."""
+    top = AREA_LIMITS.get((model or {}).get("family"))
+    if not top or w * h <= top:
+        return w, h
+    lim = size_limits(model)
+    k = (top / (w * h)) ** 0.5
+    return (max(lim["min"], int(w * k) // lim["step"] * lim["step"]),
+            max(lim["min"], int(h * k) // lim["step"] * lim["step"]))
 
 
 def save_init(data: bytes) -> dict:
@@ -376,7 +402,10 @@ EDIT_SAMPLING = {"steps": 30, "sampler": "euler", "scheduler": "simple"}
 
 
 def edit_format(model: dict | None, form: dict) -> str | None:
-    """The edit layout when the request edits its source image: MOSS-Image, a source image and an edit LoRA among the LoRAs."""
+    """The edit layout when the request edits its source image: MOSS-Image, a source image and an edit LoRA among the LoRAs;
+    MiniMax H3-Image with a source image (the model edits it itself: EDIT_H3)."""
+    if model and model["family"] == "h3_image" and form.get("init_image"):
+        return EDIT_H3
     if not model or model["family"] != "moss_image" or not form.get("init_image"):
         return None
     for lo in form.get("loras") or []:
@@ -395,6 +424,8 @@ def request_sampling(model: dict | None, form: dict) -> tuple[dict, str | None]:
     fast = (form.get("sampling") or {}).get("fast") or None
     # editing: the 8-step LoRA (made for text-to-image) only when switched on in 詳細
     ds = default_sampling(model, fast or ("off" if edit else None))
+    if edit == EDIT_H3:   # the model's own 6 steps, as for text-to-image
+        return ds, edit
     if edit and ds.get("fast") in (None, "off"):
         ds.update(EDIT_SAMPLING, cfg=5.0 if edit == EDIT_CHINOLL else 3.0)
     return ds, edit
@@ -437,7 +468,7 @@ def check(form: dict) -> dict:
         errors = [] if comfyflow.meta(form["workflow"]) else ["読み込んだ workflow が見つかりません。画像をもう一度読み込んでください。"]
         errors += check_extras({"attention": form.get("attention")}, None)
         return {"errors": errors, "notes": [], "model": None}
-    errors, model = check_model_loras(form.get("model_id"), form.get("loras"))
+    errors, model = check_model_loras(form.get("model_id"), form.get("loras"), IMAGE_FAMILIES)
     errors += check_extras(form, model)
     if not (form.get("positive") or "").strip():
         errors.append("プロンプトを入力してください。")
@@ -475,12 +506,15 @@ def submit(form: dict, runner) -> dict:
     regions = regions if any(regions) else []
     # the typed prompt is kept as typed (restored by "この設定に戻す"); trigger words are added when sent
     sent, added = loraconf.apply(form["positive"].strip(), loras)
+    asked = (_size(form.get("width"), n, model), _size(form.get("height"), n, model))
+    width, height = fit_area(*asked, model)
     settings = {
         "model_id": model["id"], "model_name": model["name"], "family": model["family"],
         "loras": loras,
         "positive": form["positive"].strip(), "prompt_sent": sent, "trigger_words": added,
         "negative": (form.get("negative") or "").strip(),
-        "width": _size(form.get("width"), n), "height": _size(form.get("height"), n),
+        "width": width, "height": height,
+        **({"size_asked": list(asked)} if (width, height) != asked else {}),   # made smaller (fit_area): said on the result
         "seed": check_seed(seed, count) if seed not in (None, "") else random.randint(1, 2**31 - 1000),
         "count": count,
         "sampling": {**ds, **over}, "sampling_overrides": over,
@@ -624,7 +658,8 @@ def run(eid: str):
         comfy.ensure_started(s.get("attention") or "")   # restarts only for unknown folders / custom nodes, or another attention
         _kept = True
         log0 = comfy.log_size()
-        if init and s.get("edit") and comfy.moss_edit:   # MOSS-Image edit LoRA: the source image edited as the prompt says
+        h3 = model["family"] == "h3_image"   # edits a source image itself (ComfyUI's own node): no edit pack needed
+        if init and s.get("edit") and (h3 or comfy.moss_edit):   # MOSS-Image edit LoRA: the source image edited as the prompt says
             init["edit"] = s["edit"]
         # what needs ComfyUI-ppm / ComfyUI-Moss-Image-Edit-Native is left out when it could not be fetched or loaded: said on the result
         no_ppm = [] if comfy.ppm or not (s.get("regions") or s["sampling"].get("rescale") == "on"
@@ -632,9 +667,17 @@ def run(eid: str):
             ["追加の部品（ComfyUI-ppm）を読み込めなかったため、左右の描き分け・白飛びの抑制・マイナスの強さの指定なしで生成しました。"]
         if fast_gone:
             no_ppm.append("高速化の LoRA が見つからなかったため、通常の手数で生成しました。")
-        if init and s.get("edit") and not comfy.moss_edit:
+        if init and s.get("edit") and not h3 and not comfy.moss_edit:
             no_ppm.append("編集用の部品（ComfyUI-Moss-Image-Edit-Native）を読み込めなかったため、指示での編集ではなく、"
                           "元画像を下地にする方法で生成しました。")
+        if h3 and s["sampling"].get("rescale") == "on":
+            no_ppm.append("MiniMax H3-Image では白飛びの抑制を使えないため、使わずに生成しました。")
+        if h3 and s["negative"]:
+            no_ppm.append("MiniMax H3-Image はネガティブプロンプトを使わないモデルのため、ネガティブプロンプトは使わずに生成しました。")
+        if s.get("size_asked") and model["family"] in AREA_LIMITS:
+            no_ppm.append(f"指定した画像サイズ {s['size_asked'][0]} × {s['size_asked'][1]} は、{model['name']} で作れる大きさ"
+                          f"（縦 × 横で約 {AREA_LIMITS[model['family']] // 10000:,} 万画素まで）を超えているため、"
+                          f"縦横比を保って {s['width']} × {s['height']} に縮めて生成しました。")
         if no_ppm:
             _update(eid, warnings=no_ppm)
         for i in range(s["count"]):
@@ -857,10 +900,15 @@ def copy_to_project(projects, eid: str, project_id: str | None, name: str | None
     """Copy a result's settings into a character project's material-generation recipe (a new project if
     none is given).  The project's own choices (number of images, excluded angles) are kept; the model the
     LoRA is trained on follows the generation model unless the user chose another one."""
-    from .generate import check_recipe
+    from .generate import NO_MATERIAL, check_recipe
     e = get_entry(eid)
     if not e:
         raise KeyError(eid)
+    # a model material generation cannot use (MiniMax H3-Image): said before a project is made or its recipe replaced
+    # (a project pointing at a model no LoRA can be made on was left behind, with the reason shown nowhere)
+    src = registry.get(e["settings"].get("model_id"))
+    if src and src["family"] in NO_MATERIAL:
+        raise ValueError(NO_MATERIAL[src["family"]])
     if project_id:
         p = projects.get(project_id)
         if p.meta("kind") != "character":
@@ -873,7 +921,10 @@ def copy_to_project(projects, eid: str, project_id: str | None, name: str | None
     recipe = {**old, **to_recipe(e["settings"])}
     p.set_meta(gen_recipe=recipe)
     cur = p.meta("model_id")
-    if registry.get(recipe["gen_model_id"]) and (not cur or cur == old.get("gen_model_id")):
+    changed = bool(registry.get(recipe["gen_model_id"]) and (not cur or cur == old.get("gen_model_id")) and cur != recipe["gen_model_id"])
+    if changed:
         p.set_meta(model_id=recipe["gen_model_id"])
     chk = check_recipe(recipe)
-    return {"project_id": p.id, "notes": chk["notes"], "check": chk["errors"]}
+    # model_changed: the model the LoRA is trained on followed the generation model (the caller resets what belongs
+    # to the previous model); previous_model_id: what it was before
+    return {"project_id": p.id, "notes": chk["notes"], "check": chk["errors"], "model_changed": changed, "previous_model_id": cur}

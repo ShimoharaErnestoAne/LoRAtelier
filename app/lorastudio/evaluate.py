@@ -328,6 +328,7 @@ QUALITY = {
     # Comfy-Org templates image_moss_image_(base_)t2i: recommended negative prompt
     "moss_image_sft": ("", "nsfw, worst quality, bad anatomy, watermark, jpeg artifact"),
     "moss_image_base": ("", "nsfw, worst quality, bad anatomy, watermark, jpeg artifact"),
+    "h3_image": ("", ""),   # no negative prompt (distilled without CFG)
 }
 SAMPLING = {
     "sdxl": {"steps": 28, "cfg": 6.0, "sampler": "euler_ancestral", "scheduler": "normal"},
@@ -357,6 +358,9 @@ SAMPLING = {
     "moss_image_fast": {"steps": 8, "cfg": 1.0, "sampler": "euler", "scheduler": "simple"},
     # akhaliq's 4-step LoRA (model card v2.0 and its ComfyUI workflow: euler / simple / 4 steps / CFG 1).  Unverified here.
     "moss_image_fast4": {"steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple"},
+    # MiniMax H3-Image, Comfy-Org template image_minimax_h3_image_t2i: 6 steps, cfg 1, euler / simple.  The checkpoint
+    # is distilled to these 6 steps (its output heads are made for that grid) and takes no negative prompt.  Unverified here.
+    "h3_image": {"steps": 6, "cfg": 1.0, "sampler": "euler", "scheduler": "simple"},
 }
 FAST_LORA_STRENGTH = 1.0   # lora.safetensors / lora_dmd2.safetensors at strength 1 (model card, commit note)
 FAST_LATEST_STRENGTH = 0.7   # lora_latest.safetensors at 0.7 (model card: the full strength is "probably overcooked")
@@ -365,9 +369,13 @@ FAST_LATEST_STRENGTH = 0.7   # lora_latest.safetensors at 0.7 (model card: the f
 def fast_lora_strength(name: str) -> float:
     """Strength of the 8-step LoRA by its file: lora_latest of the SFT repo (saved as ..._latest) is meant for 0.7."""
     return FAST_LATEST_STRENGTH if Path(name).stem.lower().endswith("_latest") else FAST_LORA_STRENGTH
-DEFAULT_STRENGTH = {"sdxl": 1.0, "anima": 1.0, "krea2": 1.0, "qwen_image": 1.0, "qwen_image21": 1.0, "zimage": 1.0, "moss_image": 1.0}
-# Image sizes of the families whose native resolution is not ~1MP (Qwen-Image card: 1328x1328 etc.)
-NATIVE_SIZE = {"qwen_image": 1328}
+DEFAULT_STRENGTH = {"sdxl": 1.0, "anima": 1.0, "krea2": 1.0, "qwen_image": 1.0, "qwen_image21": 1.0, "zimage": 1.0, "moss_image": 1.0,
+                    "h3_image": 1.0}
+# Image sizes of the families whose native resolution is not ~1MP (Qwen-Image card: 1328x1328 etc.; MiniMax H3-Image:
+# ComfyUI's conditioning node makes 2048x2048 by default, "tuned for 2048x2048 pixels of area")
+NATIVE_SIZE = {"qwen_image": 1328, "h3_image": 2048}
+# the edit layout name of MiniMax H3-Image (init["edit"]): the model edits its source image itself, no edit LoRA
+EDIT_H3 = "h3"
 # Other models to also make the comparison with (a LoRA trained on the base model is
 # usually used on merged / fine-tuned models).  Same family only; a few, because each one adds a model load.
 MAX_EXTRA_MODELS = 3
@@ -650,6 +658,7 @@ class Comfy:
                 raise RuntimeError(f"ポート {config.COMFY_PORT} を別のプログラム（別に起動した ComfyUI や、前回終了し損ねた ComfyUI など）が"
                                    "使っているため、評価用の ComfyUI を起動できません。そのプログラムを終了してから、もう一度実行してください。")
             self._close_log()
+            _rotate_log(config.DATA_DIR / "comfyui.log")
             log = self._log = open(config.DATA_DIR / "comfyui.log", "ab")
             # COMFYUI_DISABLE_PRODUCT_TIPS: ComfyUI 0.44 writes Comfy-Org product tips to the log otherwise (an env var,
             # not --disable-product-tips, which an older ComfyUI would refuse to start with)
@@ -660,7 +669,7 @@ class Comfy:
                 [str(config.COMFY_PYTHON), "main.py", "--listen", config.HOST, "--port", str(config.COMFY_PORT),
                  "--disable-auto-launch", "--extra-model-paths-config", str(extra), "--output-directory", str(out_dir),
                  "--input-directory", str(COMFY_INPUT),
-                 "--disable-all-custom-nodes", *self._custom_nodes(), "--preview-method", "none", *attn],
+                 "--disable-all-custom-nodes", *self._custom_nodes(), "--preview-method", "none", *attn, *_partner_flag()],
                 cwd=str(config.COMFY_DIR), stdout=log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
             t0 = time.time()
             while time.time() - t0 < timeout:
@@ -867,8 +876,13 @@ class Comfy:
             sock.done.clear()
             sock.prompt_id = pid
         t0 = time.time()
+        if sock:
+            sock.last = t0
         interrupted = False
-        while time.time() - t0 < timeout:
+        # with the progress socket the limit is on the time without any news of this prompt (a node started, a step
+        # done), not on the whole image: a large model read from a slow disk and then sampled slowly is not hung
+        # while its nodes and steps go on.  Without the socket: the whole image, as before.
+        while time.time() - (max(t0, sock.last) if sock else t0) < timeout:
             try:
                 h = self._get(f"/history/{pid}", timeout=30)
             except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError) as e:
@@ -876,6 +890,11 @@ class Comfy:
                     raise RuntimeError("生成の途中で ComfyUI が終了しました（data/comfyui.log を確認してください）") from None
                 if isinstance(e, urllib.error.URLError) and not isinstance(e.reason, (TimeoutError, socket.timeout, ConnectionError)):
                     raise
+                # a stop asked for while ComfyUI does not answer: the prompt cannot be taken out through its API, so
+                # the process is ended (the next job starts it again) instead of waiting out the whole time limit
+                if cancels is not None and self._cancels != cancels:
+                    self.stop()
+                    raise RuntimeError("中止しました") from None
                 time.sleep(1)
                 continue
             if pid not in h and cancels is not None and self._cancels != cancels and not interrupted:
@@ -906,6 +925,8 @@ class Comfy:
                 sock.done.wait(0.5)
             else:
                 time.sleep(0.15)
+        if sock:
+            raise RuntimeError(f"生成がタイムアウトしました（{int(timeout // 60)} 分以上、ComfyUI の処理が進みませんでした）")
         raise RuntimeError(f"生成がタイムアウトしました（1 枚に {int(timeout // 60)} 分以上かかりました）")
 
     def lora_warnings(self, since_bytes: int) -> list[str]:
@@ -957,6 +978,7 @@ class _ProgressSocket:
 
     def __init__(self, host: str, port: int, client_id: str, on_progress):
         self.prompt_id: str | None = None
+        self.last = time.time()         # when the last news of the prompt came (run_prompt's time limit counts from it)
         self.done = threading.Event()   # the prompt ended (ok, error or interrupted): its history is ready to read
         self._cb = on_progress
         self._s = socket.create_connection((host, port), timeout=5)
@@ -1015,6 +1037,10 @@ class _ProgressSocket:
                 except ValueError:
                     continue
                 d = m.get("data") or {}
+                if not isinstance(d, dict):
+                    continue
+                if self.prompt_id and (d.get("prompt_id") == self.prompt_id or m.get("type") == "progress"):
+                    self.last = time.time()   # a node started / ended or a step was done: ComfyUI is working on it
                 if m.get("type") == "progress" and self.prompt_id and d.get("prompt_id") in (None, self.prompt_id):
                     try:
                         self._cb(int(d.get("value") or 0), int(d.get("max") or 0))
@@ -1033,6 +1059,31 @@ class _ProgressSocket:
             self._s.close()
         except OSError:
             pass
+
+
+LOG_KEEP_BYTES = 20 * 1024 * 1024
+
+
+def _rotate_log(path: Path, limit: int = LOG_KEEP_BYTES) -> None:
+    """comfyui.log is only ever appended to: once it is over the limit when ComfyUI starts, it becomes comfyui.log.old
+    (replacing the one before) and a new file begins.  Never while ComfyUI runs: lora_warnings reads by offset."""
+    try:
+        if path.stat().st_size > limit:
+            os.replace(path, path.with_name(path.name + ".old"))
+    except OSError:
+        pass   # no log yet, or held by another program: appended to as before
+
+
+def _partner_flag() -> list[str]:
+    """--disable-partner-nodes for a ComfyUI that knows it (v0.45; an older one would refuse to start with it).
+    Partner nodes are the paid API nodes, which send their inputs to api.comfy.org: a workflow read from an image
+    must not reach them from here (everything stays on this PC).  Without them such a workflow is said to use nodes
+    this ComfyUI does not have, as for any other missing node."""
+    try:
+        text = (config.COMFY_DIR / "comfy" / "cli_args.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return ["--disable-partner-nodes"] if '"--disable-partner-nodes"' in text else []
 
 
 KEEP_COMFY_OWNERS: set[str] = set()   # GPU owners that reuse a ComfyUI left running for them (image generation)
@@ -1096,8 +1147,13 @@ def build_t2i(model: dict, staged: dict, loras: list[tuple[str, float]], prompt:
     MOSSImageEditTextEncode in that LoRA's layout, its edit_format); the output takes the image's size (about 1 MP).
     regions: [left, right] prompts drawn on each half (ComfyUI-ppm Attention Couple, SDXL / Anima).
     sampling["rescale"] == "on": RescaleCFGPost against blown-out colours at high CFG (ComfyUI-ppm).
-    The ComfyUI-ppm nodes are used only when they loaded in the running ComfyUI (staged["ppm"] overrides, for tests)."""
+    The ComfyUI-ppm nodes are used only when they loaded in the running ComfyUI (staged["ppm"] overrides, for tests).
+    MiniMax H3-Image: the prompt, the size and (with init) the source image go into ComfyUI's MiniMaxH3ImageConditioning,
+    which also makes the latent.  A source image is always edited as the prompt says (<Picture 1>), at the image's own
+    size; there is no negative prompt (the template zeroes the positive conditioning for it)."""
     fam = model["family"]
+    if fam == "h3_image":
+        return _build_h3(staged, loras, prompt, seed, width, height, sampling, prefix, init)
     edit = (init or {}).get("edit") if fam == "moss_image" else None
     g = {}
     if fam == "sdxl":
@@ -1203,6 +1259,38 @@ def build_t2i(model: dict, staged: dict, loras: list[tuple[str, float]], prompt:
     g["7"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": vae_ref}}
     g["8"] = {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": prefix}}
     return g
+
+
+def _build_h3(staged: dict, loras: list[tuple[str, float]], prompt: str, seed: int, width: int, height: int,
+              sampling: dict, prefix: str, init: dict | None) -> dict:
+    """MiniMax H3-Image, as the Comfy-Org templates image_minimax_h3_image_t2i / _edit (ComfyUI v0.45.0).  LoRAs go
+    on the DiT only (ComfyUI maps no text encoder keys for this model)."""
+    g = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": staged["dit"], "weight_dtype": staged.get("dtype", "default")}},
+         "1t": {"class_type": "CLIPLoader", "inputs": {"clip_name": staged["te"], "type": "minimax"}},
+         "1v": {"class_type": "VAELoader", "inputs": {"vae_name": staged["vae"]}}}
+    model_ref = ["1", 0]
+    for i, (name, strength) in enumerate(loras):
+        g[f"L{i}"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": model_ref, "lora_name": name,
+                                                                      "strength_model": float(strength)}}
+        model_ref = [f"L{i}", 0]
+    cond = {"clip": ["1t", 0], "vae": ["1v", 0], "prompt": prompt, "width": _h3_side(width), "height": _h3_side(height)}
+    if init:   # the picture to edit: with the VAE it is also anchored as a reference latent; the size follows the picture
+        g["5a"] = {"class_type": "LoadImage", "inputs": {"image": init["image"]}}
+        cond.update({"images.image_1": ["5a", 0], "width": 0, "height": 0})
+    g["3"] = {"class_type": "MiniMaxH3ImageConditioning", "inputs": cond}
+    g["4"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["3", 0]}}
+    g["6"] = {"class_type": "KSampler", "inputs": {"model": model_ref, "seed": int(seed), "steps": int(sampling["steps"]),
+                                                   "cfg": float(sampling["cfg"]), "sampler_name": sampling["sampler"],
+                                                   "scheduler": sampling["scheduler"], "positive": ["3", 0], "negative": ["4", 0],
+                                                   "latent_image": ["3", 1], "denoise": 1.0}}
+    g["7"] = {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1v", 0]}}
+    g["8"] = {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": prefix}}
+    return g
+
+
+def _h3_side(v: int) -> int:
+    """A side of a MiniMax H3-Image canvas: a multiple of 32 (the node's step)."""
+    return max(32, round(int(v) / 32) * 32)
 
 
 def graph_for(model: dict, lora_name: str | None, strength: float, prompt: str, negative: str, seed: int,
@@ -1452,12 +1540,22 @@ def run_eval(project, run_id: int, eval_id: int, progress_cb=None):
     spec = json.loads(row["spec"])
     model = dict(snap["model"])
     fam = model["family"]
-    if fam in ("krea2", "qwen_image", "qwen_image21"):   # light generation file registered after the run was created
-        from .models import registry
-        live = registry.get(model["id"])
+    from .models import registry
+    live = registry.get(model["id"])
+    notes = []
+    if live and fam in ("krea2", "qwen_image", "qwen_image21"):   # light generation file registered after the run was created
         for k in ("turbo", "gen"):
-            if live and live["files"].get(k):
+            if live["files"].get(k):
                 model["files"] = {**model["files"], k: live["files"][k]}
+    # the model's files were moved to another folder since the training: the registration was pointed at the new place
+    # (models._repair_paths), the run's snapshot still names the old one.  The same model's files of today are used.
+    moved = [k for k, f in (model.get("files") or {}).items()
+             if isinstance(f, str) and f and not Path(f).is_file()
+             and live and isinstance(live["files"].get(k), str) and Path(live["files"][k]).is_file()]
+    if moved:
+        model["files"] = {**model["files"], **{k: live["files"][k] for k in moved}}
+        notes.append("学習したときのモデルのファイルが元の場所に見つからないため、同じモデルのいまの登録にあるファイル（"
+                     + "、".join(dict.fromkeys(Path(live["files"][k]).name for k in moved)) + "）を使って比較画像を作りました。")
     out_dir = Path(run["run_dir"]) / "eval" / f"{eval_id:03d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     project.q("UPDATE evals SET status='running' WHERE id=?", (eval_id,))
@@ -1467,8 +1565,7 @@ def run_eval(project, run_id: int, eval_id: int, progress_cb=None):
         raise RuntimeError("評価用 ComfyUI が未導入です（初回セットアップを実行してください）")
     em = eval_model_files(model)
     # other models (merged / fine-tuned) of the same family, looked up now: their files may have moved
-    from .models import registry
-    extras, notes = [], []
+    extras = []
     for mid in spec.get("extra_models") or []:
         m = registry.get(mid)
         if not m or m["missing"] or m.get("family") != fam:
@@ -1594,6 +1691,12 @@ def _run_retrying(graph: dict) -> list[dict]:
     return comfy.run_prompt(graph)
 
 
+def strength_tag(strength: float) -> str:
+    """A strength in a file name: two decimals as always, more only when two decimals would not tell it from another
+    strength of the same comparison (0.333 and 0.334 both gave 0.33, and the second image replaced the first)."""
+    return f"{strength:.2f}" if round(strength, 2) == round(strength, 4) else f"{strength:.4f}"
+
+
 def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, model, fam, out_dir, em, lora_names, worker,
                      extras=(), notes=()):
     t_begin = time.time()
@@ -1633,9 +1736,9 @@ def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, mod
                         if progress_cb:
                             progress_cb(done, total, None)
                         raise
-                    name = f"p{pi}_s{seed}_{ck}_{strength:.2f}" + (f"_m{j}" if mid else "") + ".png"
+                    name = f"p{pi}_s{seed}_{ck}_{strength_tag(strength)}" + (f"_m{j}" if mid else "") + ".png"
                     take_output(imgs[0], out_dir / name)
-                    results.append({"prompt": pi, "seed": seed, "ckpt": ck, "strength": strength, "file": name,
+                    results.append({"prompt": pi, "seed": seed, "seed_used": seed + pi, "ckpt": ck, "strength": strength, "file": name,
                                     **({"model": mid} if mid else {})})
                     done += 1
                     # recorded before the progress callback, which raises when the user cancelled: the finished image stays
@@ -1664,8 +1767,11 @@ def _run_eval_images(project, run_id, eval_id, progress_cb, run, snap, spec, mod
     main = [i for i, r in enumerate(results) if not r.get("model")]
     info = {"images": results, "lora_key_warnings": warnings[:20], "n_lora_key_warnings": len(warnings), "scores": scores,
             "recommend": recommend(snap["kind"], [results[i] for i in main], subset_scores(scores, main, len(results))) if ok else None,
+            # "sampling" stays as it was (runs are matched by it, runcompare._cond): what else was fixed is beside it
             "conditions": {"base": em, "sampling": sampling_for(model, em), "negative": negative, "width": spec["width"],
-                           "height": spec["height"], "evaluated_on": em.get("on", "ckpt")},
+                           "height": spec["height"], "evaluated_on": em.get("on", "ckpt"),
+                           **({"clip_skip": 2} if model["variant"] == "pony" else {}),
+                           "seed_rule": "各画像の seed は、指定した seed にプロンプトの番号（1 つ目が 0）を足した値です（images の seed_used）。"},
             # how long it took (ComfyUI start, images and scores): the basis of the remaining-time estimate of the next
             # training run, whose comparison comes right after it
             "timing": {"seconds": round(time.time() - t_begin), "images": done}}

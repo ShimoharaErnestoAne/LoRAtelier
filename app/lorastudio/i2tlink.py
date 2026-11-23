@@ -91,25 +91,29 @@ class I2tClient:
                 msg = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
+            if not isinstance(msg, dict):
+                continue   # a library printed a bare number or list: not a message (and must not end this thread)
             ev = msg.get("event")
             if ev == "ready":
                 self.status = "ready"
                 continue
+            # read once: another thread ends the job (a cancel while it waits for the GPU) between two looks at it
+            job = self.job
             if ev:
-                if self.job and msg.get("rid") == self.job["rid"]:
+                if job and msg.get("rid") == job["rid"]:
                     if ev == "progress":
-                        self.job["message"] = msg["message"]
+                        job["message"] = msg["message"]
                         if msg.get("fraction", -1) >= 0:
-                            self.job["fraction"] = msg["fraction"]
+                            job["fraction"] = msg["fraction"]
                     elif ev == "fraction":
-                        self.job["fraction"], self.job["est"] = msg["value"], msg.get("est")
+                        job["fraction"], job["est"] = msg["value"], msg.get("est")
                     elif ev == "stop_state":
-                        self.job["cancellable"] = msg["cancellable"]
+                        job["cancellable"] = msg["cancellable"]
                 bus.publish("i2t", **msg)
                 continue
             rid = msg.get("rid")
-            if self.job and rid == self.job["rid"]:
-                done = {**msg, "op": self.job["op"], "finished": time.time()}
+            if job and rid == job["rid"]:
+                done = {**msg, "op": job["op"], "finished": time.time()}
                 self.last_done = done
                 self.job = None
                 if done["op"] == "analyze":
@@ -206,7 +210,15 @@ class I2tClient:
                 return
             job["waiting_gpu"] = False
             self._gpu_held = True
-        self._send_job(rid, op, kw)
+        if self._send_job(rid, op, kw) is None:
+            # paused while it waited: the worker lifts a pause whenever a job starts, so it is told again after the
+            # job (the page shows 一時停止中, and the job must not run on behind it)
+            job = self.job
+            if job and job["rid"] == rid and job.get("paused"):
+                try:
+                    self._send({"op": "pause"})
+                except (OSError, RuntimeError):
+                    pass
 
     def _send_job(self, rid, op, kw) -> str | None:
         """Sends the job to the worker.  When that fails the job is ended and the reason returned."""

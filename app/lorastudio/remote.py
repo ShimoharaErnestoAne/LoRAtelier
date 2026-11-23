@@ -225,7 +225,7 @@ def _resolve_hf(u, token) -> dict:
         rev = urllib.parse.unquote(parts[3])
         rest = "/".join(parts[4:])
         if parts[2] == "tree":
-            sub = rest
+            sub = urllib.parse.unquote(rest)   # quoted again below: "%20" in the link must not become "%2520"
         else:
             single = urllib.parse.unquote(rest)
     h = _hf_headers(token)
@@ -408,6 +408,171 @@ def disk_full(e: BaseException) -> bool:
     return isinstance(e, OSError) and (e.errno == errno.ENOSPC or getattr(e, "winerror", None) in (39, 112))
 
 
+class CutOff(RuntimeError):
+    """The transfer stopped part way (connection dropped or timed out, a 5xx / 429 answer, fewer bytes than the
+    server said): the .part is kept and can be continued.  with_retries continues it by itself a few times."""
+
+
+RETRY_TRIES = 5        # continuations of one cut-off download before it is given up (then the user can press again)
+RETRY_FIRST_S = 5      # the first wait; each next one is 3 times longer (5, 15, 45 s ...)
+RETRY_MAX_S = 120      # ... and never longer than this
+RETRY_TICK_S = 0.5     # how often a wait looks at the cancel button
+
+
+def retry_wait(n: int) -> int:
+    """Seconds before the n-th continuation (n = 1, 2 ...)."""
+    return int(min(RETRY_MAX_S, RETRY_FIRST_S * 3 ** (n - 1)))
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def with_retries(st: dict, attempt, cancelled: type[BaseException], publish=None):
+    """attempt() until it no longer ends with CutOff, at most RETRY_TRIES more times, waiting longer each time.
+    Only a cut-off transfer is tried again: no room on the drive, a missing file (404), a login that is needed, a file
+    replaced at the source and a cancel are said at once, as before.  While it waits, the download's message says when
+    it continues; the cancel button stops the wait at once (raises `cancelled`)."""
+    n = 0
+    while True:
+        try:
+            return attempt()
+        except CutOff as e:
+            n += 1
+            if n > RETRY_TRIES:
+                raise RuntimeError(f"{e}通信が切れるたびに自動で続きから取り直しましたが、{RETRY_TRIES} 回とも途中で切れました。"
+                                   "回線の具合を確かめてから、もう一度追加すると続きから取得します。") from e
+            if st.get("cancel"):
+                raise cancelled()
+            end = time.monotonic() + retry_wait(n)
+            before = st.get("message")
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                if st.get("cancel"):
+                    raise cancelled()
+                msg = f"通信が切れたため、{int(left + 0.999)} 秒後に続きから取り直します（{n} 回目 / {RETRY_TRIES} 回）"
+                if msg != st.get("message"):
+                    st["message"] = msg
+                    if publish:
+                        publish()
+                _pause(min(RETRY_TICK_S, left))
+            st["message"] = before
+
+
+def retryable_http(code: int) -> bool:
+    """A server answer worth waiting for (busy, or a passing fault at the site): not a missing file or a login."""
+    return code == 429 or 500 <= code <= 599
+
+
+class SourceChanged(RuntimeError):
+    def __init__(self):
+        super().__init__("配布元のファイルが、前回の取得のあとで差し替わっていました。途中まで取得した分は使えないので消しました。"
+                         "もう一度追加すると、最初から取得します。")
+
+
+def _etag_file(tmp: Path) -> Path:
+    return tmp.with_name(tmp.name + ".etag")
+
+
+def resume_headers(tmp: Path, have: int) -> dict:
+    """Headers that continue the .part from byte `have` (shared with addons).  With the ETag noted when the .part
+    was begun, If-Range: the server sends the rest (206) only while the file is still that one.  A file replaced
+    at the source meanwhile (a link to "main" can change) comes whole (200) and the .part is started over, instead
+    of becoming half the old file and half the new one, which the size checks cannot see."""
+    if not have:
+        return {}
+    h = {"Range": f"bytes={have}-"}
+    try:
+        tag = _etag_file(tmp).read_text(encoding="utf-8").strip()
+    except OSError:
+        tag = ""
+    if tag:
+        h["If-Range"] = tag
+    return h
+
+
+def resumed(tmp: Path, r, have: int) -> int:
+    """With the opened response: how many bytes of the .part are kept (0: the server sent the whole file, the .part
+    is written from the start).  A new .part notes the file's ETag for the next continuation.  A server that
+    continued (206) a file whose ETag is another one than the noted one ignored If-Range: the .part is dropped."""
+    tag = str(r.headers.get("ETag") or "").strip()
+    strong = tag if tag.startswith('"') else ""   # a weak one (W/"...") cannot be used with If-Range
+    note = _etag_file(tmp)
+    if have and getattr(r, "status", 200) == 206:
+        try:
+            old = note.read_text(encoding="utf-8").strip()
+        except OSError:
+            old = ""
+        if old and strong and old != strong:
+            tmp.unlink(missing_ok=True)
+            note.unlink(missing_ok=True)
+            raise SourceChanged
+        return have
+    try:
+        if strong:
+            note.write_text(strong, encoding="utf-8")
+        else:
+            note.unlink(missing_ok=True)
+    except OSError:
+        pass   # without the note the next continuation is as before (Range only)
+    return 0
+
+
+def drop_part(tmp: Path) -> None:
+    tmp.unlink(missing_ok=True)
+    _etag_file(tmp).unlink(missing_ok=True)
+
+
+UPLOAD_MARK = "up_"   # the .part of a file dropped in the browser
+
+
+def clean_uploads() -> int:
+    """At start: the files of drops that were being received when the app ended.  Nothing continues them (a file
+    dropped again is sent from the start, under a new name), so each would stay for good, GBs of it.  The .part
+    files of link and catalog downloads are kept: adding again continues them.  Returns the bytes freed."""
+    freed = 0
+    try:
+        files = list((config.MODELS_DIR / "_incoming").glob(f"{UPLOAD_MARK}*.part"))
+    except OSError:
+        return 0
+    for f in files:
+        try:
+            n = f.stat().st_size
+            f.unlink()
+            freed += n
+        except OSError:
+            pass
+    return freed
+
+
+def _move_into(tmp: Path, final: Path) -> None:
+    """Move the finished file to its folder.  A models folder that is a junction to another drive cannot take a
+    rename from models/_incoming (WinError 17 / EXDEV): the file is copied next to its final name, flushed, and
+    renamed there, so a half-copied file never has the final name."""
+    try:
+        os.replace(tmp, final)
+        return
+    except OSError as e:
+        if not (e.errno == errno.EXDEV or getattr(e, "winerror", None) == 17):
+            raise
+    side = final.with_name(final.name + ".moving")
+    try:
+        with open(tmp, "rb") as src, open(side, "wb") as dst:
+            shutil.copyfileobj(src, dst, 8 << 20)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(side, final)
+    except OSError as e:
+        side.unlink(missing_ok=True)
+        if disk_full(e):
+            raise RuntimeError(f"空き容量が足りないため、取得したファイルを {final.parent} へ移せませんでした。"
+                               "空きを増やしてから、もう一度追加してください。") from e
+        raise
+    tmp.unlink(missing_ok=True)
+
+
 _place_lock = threading.Lock()   # choosing a free final name and moving the file there is one step
 
 
@@ -458,54 +623,66 @@ def _download(st: dict, url: str, name: str, headers: dict, hint: str | None):
         cls = probe(url, name, headers)
         if not cls.get("ok"):
             raise ValueError(cls.get("reason") or "このツールで使える種類のファイルではありません")
-        free = shutil.disk_usage(tmp.parent).free
-        have = tmp.stat().st_size if tmp.exists() else 0
-        need = max(0, st["total_bytes"] - have)   # an interrupted download is continued: only the rest is needed
-        if st["total_bytes"] and free < need + (2 << 30):
-            raise RuntimeError(f"空き容量が不足しています（あと 約{need / 1e9:.1f}GB 必要 / 空き {free / 1e9:.1f}GB）")
-        h = dict(headers)
-        if have:
-            h["Range"] = f"bytes={have}-"
-        st["message"] = "ダウンロード中"
-        expect, listed = None, st["total_bytes"] or None   # listed: the size the site gave (Civitai's is rounded to KB)
-        try:
-            with _open(url, h, timeout=60) as r:
-                if have and r.status != 206:
-                    have = 0
-                total = r.headers.get("Content-Range", "").rsplit("/", 1)[-1] if have else r.headers.get("Content-Length")
-                if total and total.isdigit():
-                    st["total_bytes"] = expect = int(total) if have else have + int(total)
-                st["done_bytes"] = have
-                with open(tmp, "ab" if have else "wb") as f:
-                    while chunk := r.read(8 << 20):
-                        if st.get("cancel"):
-                            raise Cancelled
-                        f.write(chunk)
-                        st["done_bytes"] += len(chunk)
-        except urllib.error.HTTPError as e:
-            if not (e.code == 416 and have):   # 416: the .part is already whole (the last try ended after the last byte)
-                raise
-        except OSError as e:   # timeout, reset: the .part is kept, and pressing again continues it
-            if disk_full(e):
-                raise RuntimeError("空き容量がなくなったため、ダウンロードを中断しました。空きを増やしてからもう一度「追加する」を押すと、"
-                                   f"続きから取得します（{tmp.stat().st_size / 1e9 if tmp.exists() else 0:.2f}GB まで取得済み）。") from e
-            raise RuntimeError("接続が途中で切れました。もう一度「追加する」を押すと続きから取得します"
-                               f"（{tmp.stat().st_size / 1e9 if tmp.exists() else 0:.2f}GB まで取得済み）。") from e
-        # read() also ends quietly when the connection drops: the .part is kept, and pressing again continues it
-        short = _incomplete(tmp, name, expect, listed)
-        if short:
-            raise RuntimeError(f"ダウンロードが途中で切れました（{short}）。もう一度「追加する」を押すと続きから取得します")
+        listed = st["total_bytes"] or None   # the size the site gave (Civitai's is rounded to KB)
+        # a connection that drops part way is continued from the .part by itself, a few times (with_retries)
+        with_retries(st, lambda: _fetch_part(st, url, name, headers, tmp, listed), Cancelled,
+                     lambda: bus.publish("download", id=st["id"], state=st["state"]))
         if st.get("cancel"):
             raise Cancelled
-        _place(st, tmp, name, hint)
+        try:
+            _place(st, tmp, name, hint)
+        finally:
+            if not tmp.exists():   # placed, or refused and deleted: its ETag note goes with it
+                _etag_file(tmp).unlink(missing_ok=True)
     except Cancelled:
-        tmp.unlink(missing_ok=True)
+        drop_part(tmp)
         st.update(state="cancelled", message="キャンセルしました")
     except NeedToken:
         st.update(state="failed", message="失敗", error="このファイルの取得にはログイン（アクセストークン / API キー）が必要です。")
     except Exception as e:
         st.update(state="failed", message="失敗", error=str(e))
     bus.publish("download", id=st["id"], state=st["state"])
+
+
+def _fetch_part(st: dict, url: str, name: str, headers: dict, tmp: Path, listed: int | None) -> None:
+    """One try of a link download into its .part, continuing what is there.  CutOff: it stopped part way."""
+    free = shutil.disk_usage(tmp.parent).free
+    have = tmp.stat().st_size if tmp.exists() else 0
+    need = max(0, st["total_bytes"] - have)   # an interrupted download is continued: only the rest is needed
+    if st["total_bytes"] and free < need + (2 << 30):
+        raise RuntimeError(f"空き容量が不足しています（あと 約{need / 1e9:.1f}GB 必要 / 空き {free / 1e9:.1f}GB）")
+    h = {**headers, **resume_headers(tmp, have)}
+    st["message"] = "ダウンロード中"
+    expect = None
+    try:
+        with _open(url, h, timeout=60) as r:
+            have = resumed(tmp, r, have)   # 0: the server sent the whole file (range ignored, or another file now)
+            total = r.headers.get("Content-Range", "").rsplit("/", 1)[-1] if have else r.headers.get("Content-Length")
+            if total and total.isdigit():
+                st["total_bytes"] = expect = int(total) if have else have + int(total)
+            st["done_bytes"] = have
+            with open(tmp, "ab" if have else "wb") as f:
+                while chunk := r.read(8 << 20):
+                    if st.get("cancel"):
+                        raise Cancelled
+                    f.write(chunk)
+                    st["done_bytes"] += len(chunk)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have:   # 416: the .part is already whole (the last try ended after the last byte)
+            pass
+        elif retryable_http(e.code):
+            raise CutOff(f"配布元のサーバーが一時的に応答できませんでした（HTTP {e.code}）。") from e
+        else:
+            raise
+    except OSError as e:   # timeout, reset: the .part is kept and continued
+        if disk_full(e):
+            raise RuntimeError("空き容量がなくなったため、ダウンロードを中断しました。空きを増やしてからもう一度「追加する」を押すと、"
+                               f"続きから取得します（{tmp.stat().st_size / 1e9 if tmp.exists() else 0:.2f}GB まで取得済み）。") from e
+        raise CutOff(f"接続が途中で切れました（{tmp.stat().st_size / 1e9 if tmp.exists() else 0:.2f}GB まで取得済み）。") from e
+    # read() also ends quietly when the connection drops: the .part is kept and continued
+    short = _incomplete(tmp, name, expect, listed)
+    if short:
+        raise CutOff(f"ダウンロードが途中で切れました（{short}）。")
 
 
 def _incomplete(tmp: Path, name: str, expect: int | None, listed: int | None = None) -> str | None:
@@ -540,7 +717,7 @@ def _place(st: dict, tmp: Path, name: str, hint: str | None):
         raise ValueError(cls.get("reason") or "このツールで使える種類のファイルではありません")
     with _place_lock:
         final = _final_path(cls["dest"], name)
-        tmp.replace(final)
+        _move_into(tmp, final)
     if cls["kind"] == "lora" and st.get("trained_words"):
         from . import loraconf
         loraconf.record_found(final, st["trained_words"], "Civitai に書かれた呼び出し語")
@@ -575,7 +752,7 @@ def begin_upload(name: str) -> tuple[dict, Path]:
     st = {"id": key, "name": name, "state": "running", "done_bytes": 0, "total_bytes": 0, "error": None,
           "message": "受け取り中", "started": time.time(), "src": "upload"}
     _state[key] = st
-    tmp = config.MODELS_DIR / "_incoming" / f"{key}_{name}.part"
+    tmp = config.MODELS_DIR / "_incoming" / f"{UPLOAD_MARK}{key}_{name}.part"   # clean_uploads() knows it by the mark
     tmp.parent.mkdir(parents=True, exist_ok=True)
     return st, tmp
 

@@ -1,0 +1,3 @@
+# .bat files are read by cmd.exe, which needs CRLF line endings: git never converts them (they are stored and
+# handed out, also in the zip from GitHub, exactly as committed)
+*.bat -text

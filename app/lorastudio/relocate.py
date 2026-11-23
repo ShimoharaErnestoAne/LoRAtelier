@@ -7,8 +7,10 @@ the original as it was.  Project databases store absolute paths, so those are re
 """
 from __future__ import annotations
 
+import filecmp
 import json
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -262,14 +264,18 @@ def _forms(old: str, new: str) -> list[tuple[str, str]]:
 
 
 def _rebase_text(s: str, forms) -> str:
+    """Windows paths are the same path in any case ("d:\\data" for "D:\\Data"): a settings file of the engine that
+    names the folder in another case than the folder's own must not keep pointing at the old place."""
+    def swap(text: str, old: str, new: str) -> str:
+        return re.sub(re.escape(old), lambda m: new, text, flags=re.IGNORECASE)
+
     for o, n in forms:
-        if s == o:
+        if s.lower() == o.lower():
             return n
         for sep in ("\\\\", "\\", "/"):
-            if o + sep in s:
-                s = s.replace(o + sep, n + sep)
+            s = swap(s, o + sep, n + sep)
         for q in ('"', "'"):   # a path that is the whole value inside JSON or TOML
-            s = s.replace(q + o + q, q + n + q)
+            s = swap(s, q + o + q, q + n + q)
     return s
 
 
@@ -400,8 +406,10 @@ def move_images(kind: str, place: Path, target: Path):
         dst = target / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
-            if dst.stat().st_size == src.stat().st_size:
-                src.unlink()   # copied by an earlier move that stopped before removing the original
+            # copied by an earlier move that stopped before removing the original: only when the contents are the
+            # same (another image of the same name and size is not that copy; the original must stay)
+            if dst.stat().st_size == src.stat().st_size and filecmp.cmp(src, dst, shallow=False):
+                src.unlink()
             else:
                 with _lock:
                     state["notes"].append(f"移し先に同じ名前の別のファイルがあるため移していません: {src}")

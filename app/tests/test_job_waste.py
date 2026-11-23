@@ -113,9 +113,10 @@ def test_musubi_runs_save_no_resume_state_and_stop_at_a_lora(env):
     cfg = toml.load(training.build_commands(sd, run_dir, None)[-1][1][-1])
     assert cfg["save_state"] is True and cfg["save_last_n_steps_state"] == 50 and training.saves_state(sd)
     # the disk estimate leaves the states out where none are written
-    # (LoRA 9MB/rank x 16 x 5 saves + 1500MB caches) / 1024 + 1; the sdxl run keeps 2 states of 3x the LoRA size
+    # (LoRA 9MB/rank x 16 x 5 saves + 1500MB caches) / 1024 + 1; the sdxl run ends with 4 states of 3x the LoRA size
+    # (the last three save steps and the one written at the end of the run)
     assert presets.estimate_disk_gb("zimage", v) == round((9.0 * 16 * 5 + 1500) / 1024 + 1.0, 1)
-    assert presets.estimate_disk_gb("sdxl", v) == round((7.0 * 16 * 5 + 7.0 * 16 * 6 + 600) / 1024 + 1.0, 1)
+    assert presets.estimate_disk_gb("sdxl", v) == round((7.0 * 16 * 5 + 7.0 * 16 * 3 * 4 + 600) / 1024 + 1.0, 1)
 
 
 def test_export_copies_the_lora_the_comparison_converted(env, monkeypatch):

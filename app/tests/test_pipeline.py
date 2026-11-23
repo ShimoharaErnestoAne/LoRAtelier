@@ -129,9 +129,12 @@ def test_a_task_generates_waits_for_captions_then_trains_and_the_next_waits(pipe
 
 
 def test_a_stalled_analysis_does_not_block_forever(pipe, monkeypatch):
-    pl, a = pipe.pl, pipe.projs["a"]
+    """... nor trains images without their captions: the task stops with the reason, and the next task goes on."""
+    pl, a, b = pipe.pl, pipe.projs["a"], pipe.projs["b"]
     a.imgs = [_img(), _img(ai="pending")]
-    pl.add(a, 0)
+    b.imgs = [_img()]
+    ta = pl.add(a, 0)
+    pl.add(b, 0)
     pl.step()
     pl.step()
     assert not any(x[0] == "train" for x in pipe.log)
@@ -141,7 +144,12 @@ def test_a_stalled_analysis_does_not_block_forever(pipe, monkeypatch):
     assert not any(x[0] == "train" for x in pipe.log)
     pipe.busy["v"] = False
     pl.step()
-    assert pipe.log[-1] == ("train", "a", 1) and "1 枚" in pl.list()[0]["message"]
+    t = next(x for x in pl.list() if x["id"] == ta["id"])
+    assert t["status"] == "failed" and "1 枚" in t["message"] and "学習を始めませんでした" in t["message"]
+    assert not any(x[0] == "train" and x[1] == "a" for x in pipe.log)
+    for _ in range(3):
+        pl.step()
+    assert any(x[0] == "train" and x[1] == "b" for x in pipe.log)   # the stalled task does not hold up the others
 
 
 def test_failures_and_cancel(pipe):
